@@ -146,6 +146,7 @@ function goTo(index) {
   if (index >= 0) {
     const m = currentGame.moves[index];
     fetchAnalysis(m.fen_before, m.uci);
+    if (_activeTab === 'encoder') fetchEncoderAnalysis(m.fen_before, m.uci);
   } else {
     clearAnalysis();
   }
@@ -532,4 +533,215 @@ function clearAnalysis() {
     '<p class="placeholder">Select a move to see analysis.</p>';
   document.getElementById('analysis-content-base').innerHTML =
     '<p class="placeholder">Base model analysis will appear here.</p>';
+  document.getElementById('encoder-content').innerHTML =
+    '<p class="placeholder">Select a move to see encoder analysis.</p>';
 }
+
+// ── Analysis tabs (Tutor / Encoder) ───────────────────────────────────────────
+
+let _activeTab = 'llm';
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tab = btn.dataset.tab;
+      switchTab(tab);
+      // Trigger encoder fetch if switching to encoder and a move is selected
+      if (tab === 'encoder' && currentIndex >= 0 && currentGame) {
+        const m = currentGame.moves[currentIndex];
+        fetchEncoderAnalysis(m.fen_before, m.uci);
+      }
+    });
+  });
+});
+
+function switchTab(tab) {
+  _activeTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.getElementById('tab-content-llm').hidden = tab !== 'llm';
+  document.getElementById('tab-content-encoder').hidden = tab !== 'encoder';
+}
+
+// ── Encoder analysis ──────────────────────────────────────────────────────────
+
+let encoderCache = {};  // "fen|uci" → cached encoder result
+let _encoderStream = null;
+
+async function fetchEncoderAnalysis(fen, moveUci) {
+  const key = `${fen}|${moveUci}`;
+  const el = document.getElementById('encoder-content');
+
+  if (encoderCache[key]) {
+    renderEncoderAnalysis(encoderCache[key], el);
+    return;
+  }
+
+  el.innerHTML = '<span class="analysis-loading">Running encoder model…</span>';
+
+  if (_encoderStream) { try { _encoderStream.abort(); } catch (_) {} }
+  const ctrl = new AbortController();
+  _encoderStream = ctrl;
+
+  try {
+    const res = await fetch('/api/analyze_encoder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fen, move_uci: moveUci }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
+    let metaData = null;
+    let tokenText = '';
+    let thinkText = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, { stream: true });
+
+      let boundary;
+      while ((boundary = sseBuffer.indexOf('\n\n')) !== -1) {
+        const message = sseBuffer.slice(0, boundary);
+        sseBuffer = sseBuffer.slice(boundary + 2);
+
+        let eventType = 'message';
+        let dataStr = '';
+        for (const line of message.split('\n')) {
+          if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+          else if (line.startsWith('data: ')) dataStr = line.slice(6);
+        }
+        if (!dataStr) continue;
+
+        if (eventType === 'meta') {
+          metaData = JSON.parse(dataStr);
+          renderEncoderMeta(metaData, el);
+        } else if (eventType === 'token') {
+          tokenText += JSON.parse(dataStr);
+          updateEncoderToken(tokenText, el);
+        } else if (eventType === 'think') {
+          thinkText += JSON.parse(dataStr);
+          updateStreamThinking(thinkText, el);
+        } else if (eventType === 'done') {
+          const result = { ...metaData, completion: tokenText, thinking: thinkText };
+          encoderCache[key] = result;
+          const cur = currentIndex >= 0 ? currentGame?.moves[currentIndex] : null;
+          if (cur && `${cur.fen_before}|${cur.uci}` === `${fen}|${moveUci}`) {
+            renderEncoderAnalysis(result, el);
+          }
+          return;
+        } else if (eventType === 'error') {
+          const e = JSON.parse(dataStr);
+          el.innerHTML = `<span class="placeholder">Encoder error: ${escapeHtml(e.error ?? String(e))}</span>`;
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      el.innerHTML = `<span class="placeholder">Encoder unavailable: ${escapeHtml(err.message)}</span>`;
+    }
+  } finally {
+    if (_encoderStream === ctrl) _encoderStream = null;
+  }
+}
+
+/** Render key lines + placeholder for streaming completion. */
+function renderEncoderMeta(meta, el) {
+  const linesHtml = (meta.key_lines || []).map((line, i) =>
+    `<div class="encoder-line"><span class="line-num">Line ${i + 1}</span> <span class="line-sans">${escapeHtml(line)}</span></div>`
+  ).join('');
+
+  el.innerHTML = `
+    <div class="analysis-row">
+      <span class="source-badge source-encoder">Encoder ✦</span>
+      <span class="eval-pill">${escapeHtml(meta.eval_label || '')}</span>
+    </div>
+    <div class="encoder-lines-section">
+      <div class="encoder-lines-title">Engine Key Lines</div>
+      ${linesHtml}
+    </div>
+    <div class="encoder-completion streaming"></div>
+    <details class="thinking-block" hidden>
+      <summary>Thinking</summary>
+      <pre class="thinking-text"></pre>
+    </details>
+  `;
+}
+
+/** Stream completion text into the encoder output div. */
+function updateEncoderToken(text, el) {
+  const div = el.querySelector('.encoder-completion.streaming');
+  if (!div) return;
+  // Render <line>...</line> blocks with formatting
+  div.innerHTML = formatEncoderCompletion(text);
+}
+
+/** Final render of full encoder result. */
+function renderEncoderAnalysis(data, el) {
+  const linesHtml = (data.key_lines || []).map((line, i) =>
+    `<div class="encoder-line"><span class="line-num">Line ${i + 1}</span> <span class="line-sans">${escapeHtml(line)}</span></div>`
+  ).join('');
+
+  const thinkingBlock = data.thinking
+    ? `<details class="thinking-block"><summary>Thinking</summary><pre class="thinking-text">${escapeHtml(data.thinking)}</pre></details>`
+    : '';
+
+  el.innerHTML = `
+    <div class="analysis-row">
+      <span class="source-badge source-encoder">Encoder ✦</span>
+      <span class="eval-pill">${escapeHtml(data.eval_label || '')}</span>
+    </div>
+    <div class="encoder-lines-section">
+      <div class="encoder-lines-title">Engine Key Lines</div>
+      ${linesHtml}
+    </div>
+    <div class="encoder-completion">${formatEncoderCompletion(data.completion || '')}</div>
+    ${thinkingBlock}
+  `;
+}
+
+/**
+ * Format encoder completion text:
+ * - <line>LINE N: ...</line> blocks → styled annotation rows
+ * - remaining text → coaching comment paragraph
+ */
+function formatEncoderCompletion(text) {
+  const lineRe = /<line>(.*?)<\/line>/gs;
+  const lines = [];
+  let lastIndex = 0;
+  let match;
+
+  while ((match = lineRe.exec(text)) !== null) {
+    lines.push(match[1].trim());
+    lastIndex = lineRe.lastIndex;
+  }
+
+  const comment = text.slice(lastIndex).trim();
+
+  const linesHtml = lines.map(l => {
+    // Split "LINE N: content | eval: label" for styling
+    const evalMatch = l.match(/^(.*?)\|\s*eval:\s*(.+)$/s);
+    if (evalMatch) {
+      const content = evalMatch[1].trim();
+      const evalLabel = evalMatch[2].trim();
+      const evalClass = evalLabel.includes('white') ? 'eval-white'
+                      : evalLabel.includes('black') ? 'eval-black' : 'eval-equal';
+      return `<div class="annotated-line">
+        <span class="annotated-moves">${escapeHtml(content)}</span>
+        <span class="eval-label ${evalClass}">${escapeHtml(evalLabel)}</span>
+      </div>`;
+    }
+    return `<div class="annotated-line"><span class="annotated-moves">${escapeHtml(l)}</span></div>`;
+  }).join('');
+
+  const commentHtml = comment
+    ? `<p class="encoder-comment">${escapeHtml(comment)}</p>`
+    : '';
+
+  return linesHtml + commentHtml;
+}
+

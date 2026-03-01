@@ -841,3 +841,61 @@ async def get_board_svg(
         return Response(content=svg, media_type="image/svg+xml")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# Encoder model analysis — proxies to encoder_server.py (port 8200)
+# ---------------------------------------------------------------------------
+
+_ENCODER_SERVER_URL = os.environ.get("ENCODER_SERVER_URL", "http://localhost:8200")
+
+
+class EncoderAnalyzeRequest(BaseModel):
+    fen: str
+    move_uci: str
+    temperature: float = 0.7
+
+
+@app.post("/api/analyze_encoder")
+async def analyze_encoder(req: EncoderAnalyzeRequest) -> StreamingResponse:
+    """Proxy to encoder inference server. Streams SSE events:
+
+    event: meta   — {eval_label, key_lines, move_san}
+    event: think  — thinking chunk
+    event: token  — completion chunk
+    event: done   — end of stream
+    event: error  — error message
+    """
+    import httpx
+
+    async def _proxy() -> AsyncGenerator[str, None]:
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{_ENCODER_SERVER_URL}/api/encoder/analyze",
+                    json={
+                        "fen": req.fen,
+                        "move_uci": req.move_uci,
+                        "temperature": req.temperature,
+                    },
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        yield f"event: error\ndata: {body.decode()}\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if line:
+                            yield line + "\n"
+                        else:
+                            yield "\n"
+        except Exception as e:
+            import json as _json
+
+            yield f"event: error\ndata: {_json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        _proxy(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

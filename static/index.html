@@ -65,13 +65,28 @@
       <div class="panel-title-row">
         <span class="panel-title">AI Analysis</span>
         <span id="compare-mode-label" class="compare-label" hidden>Fine-tuned vs Base</span>
-      </div>
-      <div id="analysis-wrapper" class="analysis-wrapper">
-        <div id="analysis-content" class="analysis-content">
-          <p class="placeholder">Select a move to see analysis.</p>
+        <div class="analysis-tabs">
+          <button class="tab-btn active" id="tab-llm" data-tab="llm">Tutor</button>
+          <button class="tab-btn" id="tab-encoder" data-tab="encoder">Encoder ✦</button>
         </div>
-        <div id="analysis-content-base" class="analysis-content analysis-content-alt" hidden>
-          <p class="placeholder">Base model analysis will appear here.</p>
+      </div>
+
+      <!-- Standard LLM analysis tab -->
+      <div id="tab-content-llm" class="tab-content">
+        <div id="analysis-wrapper" class="analysis-wrapper">
+          <div id="analysis-content" class="analysis-content">
+            <p class="placeholder">Select a move to see analysis.</p>
+          </div>
+          <div id="analysis-content-base" class="analysis-content analysis-content-alt" hidden>
+            <p class="placeholder">Base model analysis will appear here.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Encoder model tab -->
+      <div id="tab-content-encoder" class="tab-content" hidden>
+        <div id="encoder-content" class="analysis-content">
+          <p class="placeholder">Select a move to see encoder analysis.</p>
         </div>
       </div>
     </div>
