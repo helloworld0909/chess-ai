@@ -19,10 +19,10 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     command: >
       Qwen/Qwen3.5-35B-A3B-FP8
-      --gpu-memory-utilization 0.75
+      --gpu-memory-utilization 0.78
       --max-model-len 32768
       --tensor-parallel-size 2
-      --max-num-seqs 64
+      --max-num-seqs 128
       --reasoning-parser qwen3
       --enable-auto-tool-choice
       --tool-call-parser qwen3_coder

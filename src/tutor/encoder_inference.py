@@ -97,6 +97,8 @@ def load_encoder_model(checkpoint_dir: str, config_path: str) -> tuple:
     if unexpected:
         _logger.warning("Unexpected keys: %s", unexpected[:5])
 
+    # Move CNN to the same device as the LLM
+    model.cnn.to(device=torch.device("cuda:0"), dtype=torch.bfloat16)
     model.eval()
     _logger.info("Model ready.")
     return model, tokenizer
@@ -111,17 +113,24 @@ def build_board_tensors(
     fen: str,
     move_san: str,
     key_lines: list[list[str]],
+    played_line_sans: list[str] | None = None,
 ) -> torch.Tensor:
-    """Build all board tensors for a phase 1 SFT prompt.
+    """Build all board tensors for a phase 2 SFT prompt.
 
-    Order matches the left-to-right order of <|vision_pad|> sentinels:
-      [student_move_tensor, line0_move0, line0_move1, ..., line1_move0, ...]
+    Order matches the left-to-right order of <|vision_pad|> sentinels in the prompt:
+      1. Student move sentinel ("Move: <|vision_pad|>san") — 1 tensor
+      2. Played line sentinels ("PLAYED LINE: <|vision_pad|>san → ...") — len(played_line) tensors
+      3. Engine line sentinels ("Line N: <|vision_pad|>san → ...") — sum(len(line)) tensors
+
+    The played line starts with the student's move (already in played_line_sans[0]) played
+    from the pre-move board, then continues with the opponent's moves from board_after.
+    The engine lines start from the pre-move board.
 
     Args:
         fen: Position FEN before the student's move
         move_san: Student's move in SAN notation
-        key_lines: list of lines, each a list of SAN strings
-                   e.g. [["Nd5", "e4", "Nc3"], ["Nf6", "g5"]]
+        key_lines: Engine alternative lines, each a list of SAN strings (starts from fen)
+        played_line_sans: PLAYED LINE SANs, starting with student's move, then continuation
 
     Returns:
         Tensor of shape (N, 38, 8, 8)
@@ -130,7 +139,7 @@ def build_board_tensors(
 
     board = chess.Board(fen)
 
-    # 1. Student move tensor
+    # 1. Student move tensor (for the "Move:" sentinel)
     student_move: chess.Move | None = None
     if move_san:
         try:
@@ -139,7 +148,18 @@ def build_board_tensors(
             pass
     tensors.append(boards_to_tensor(board, student_move))
 
-    # 2. Key line tensors — replay from pre-move board
+    # 2. Played line tensors — replay from pre-move board
+    if played_line_sans:
+        pl_board = board.copy()
+        for san in played_line_sans:
+            try:
+                mv = pl_board.parse_san(san)
+                tensors.append(boards_to_tensor(pl_board, mv))
+                pl_board.push(mv)
+            except Exception:
+                tensors.append(boards_to_tensor(pl_board, None))
+
+    # 3. Engine line tensors — replay from pre-move board
     for line_sans in key_lines:
         line_board = board.copy()
         for san in line_sans:
@@ -185,7 +205,8 @@ def inject_sentinels(messages: list[dict], move_san: str) -> list[dict]:
                     inner = m.group(1)
                     new_lines = []
                     for line in inner.split("\n"):
-                        lm = re.match(r"^(Line \d+:\s*)(.*)", line)
+                        # Match "PLAYED LINE: ..." or "Line N: ..."
+                        lm = re.match(r"^((?:PLAYED LINE|Line \d+):\s*)(.*)", line)
                         if lm:
                             prefix = lm.group(1)
                             moves_str = lm.group(2)
@@ -238,12 +259,17 @@ def generate_stream(
     device = next(model.parameters()).device
 
     # Tokenize
-    input_ids = tokenizer.apply_chat_template(
+    encoded = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
-    ).to(device)
+    )
+    # apply_chat_template may return a BatchEncoding or a raw tensor depending on version
+    if hasattr(encoded, "input_ids"):
+        input_ids = encoded.input_ids.to(device)
+    else:
+        input_ids = encoded.to(device)
     attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
     board_tensors = board_tensors.to(device)
@@ -267,10 +293,14 @@ def generate_stream(
 
     # Build inputs_embeds with CNN embeddings spliced in
     with torch.no_grad():
-        cnn_dtype = next(model.cnn.parameters()).dtype
+        cnn_param = next(model.cnn.parameters())
+        cnn_dtype = cnn_param.dtype
+        cnn_device = cnn_param.device
         embed_dtype = model.embed_tokens.weight.dtype
 
-        cnn_embs = model.cnn(board_tensors.to(dtype=cnn_dtype)).to(dtype=embed_dtype)
+        cnn_embs = model.cnn(board_tensors.to(device=cnn_device, dtype=cnn_dtype)).to(
+            dtype=embed_dtype
+        )
         text_embs = model.embed_tokens(input_ids)
 
         B, L, H = text_embs.shape

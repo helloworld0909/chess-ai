@@ -107,23 +107,52 @@ class AnalyzeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_key_lines(fen: str, depth: int, multipv: int) -> tuple[list[list[str]], str, int | None]:
-    """Run Stockfish and return (key_lines, eval_label, root_cp).
+def _line_params(spread_cp: int) -> tuple[int, int]:
+    """Return (line_depth_half_moves, n_engine_lines) based on position spread.
 
-    key_lines: list of SAN sequences, one per PV line.
-    eval_label: human label for the position eval (from side to move's perspective).
-    root_cp: centipawns from White's perspective (None if mate).
+    Depth is capped at 6 half-moves (the model cannot learn from deeper sequences).
+    """
+    if spread_cp >= 200:
+        return 6, 5
+    elif spread_cp >= 100:
+        return 6, 4
+    elif spread_cp >= 50:
+        return 5, 3
+    else:
+        return 4, 2
+
+
+def _get_analysis(
+    fen: str, move_uci: str, depth: int
+) -> tuple[list[str], list[list[str]], str, int | None, int | None, str, str]:
+    """Run Stockfish and return analysis for the position.
+
+    Returns:
+        played_line_sans: SAN list for the PLAYED LINE (student move + engine continuation)
+        engine_line_sans: list of SAN lists for engine alternative lines
+        eval_label: human label for position eval (White's perspective)
+        root_cp: centipawns from White's perspective before student move (None if mate)
+        student_cp: centipawns from White's perspective after student move (None if mate)
+        best_move_san: SAN of engine's top choice from pre-move position
+        played_line_str: plain SAN string for PLAYED LINE (for prompt)
     """
     assert _engine is not None
     board = chess.Board(fen)
+    move = chess.Move.from_uci(move_uci)
+    move_san = board.san(move)
+
+    # Analyse pre-move position (multipv=6 to get spread)
     result = _engine.analyse(
         board,
         chess.engine.Limit(depth=depth),
-        multipv=multipv,
+        multipv=6,
     )
 
-    key_lines: list[list[str]] = []
     root_cp: int | None = None
+    best_move_san: str = ""
+    all_lines: list[tuple[list[str], int | None]] = []  # (sans, cp_white)
+    cp_values_stm: list[int] = []  # side-to-move perspective
+    sign = 1 if board.turn == chess.WHITE else -1
 
     for i, info in enumerate(result):
         pv = info.get("pv", [])
@@ -131,42 +160,145 @@ def _get_key_lines(fen: str, depth: int, multipv: int) -> tuple[list[list[str]],
             continue
 
         score = info.get("score")
-        if i == 0 and score is not None:
+        cp_white: int | None = None
+        if score is not None:
             s = score.white()
             if s.mate() is not None:
-                root_cp = None
+                if i == 0:
+                    root_cp = None
             else:
-                root_cp = s.score()
+                cp_val = s.score()
+                if i == 0:
+                    root_cp = cp_val
+                    try:
+                        best_move_san = board.san(pv[0])
+                    except Exception:
+                        pass
+                cp_white = cp_val
+                cp_values_stm.append(sign * cp_val)
 
-        # Convert PV to SAN
+        # Convert PV to SAN (no depth cap here; we'll truncate later)
         b = board.copy()
         sans: list[str] = []
-        for mv in pv[:8]:  # cap at 8 half-moves
+        for mv in pv:
             try:
                 sans.append(b.san(mv))
                 b.push(mv)
             except Exception:
                 break
         if sans:
-            key_lines.append(sans)
+            all_lines.append((sans, cp_white))
 
-    # Eval label from side-to-move perspective
+    # Compute spread and adaptive params
+    spread_cp = (max(cp_values_stm) - min(cp_values_stm)) if len(cp_values_stm) >= 2 else 0
+    line_depth, n_engine_lines = _line_params(spread_cp)
+
+    # Eval label (White's perspective)
     if root_cp is None:
-        eval_label = "a forced mate sequence exists"
+        eval_label = "forced mate"
     else:
-        cp = root_cp if board.turn == chess.WHITE else -root_cp
+        cp = root_cp
         if cp >= 200:
-            eval_label = "winning for me"
+            eval_label = "winning for white"
         elif cp >= 60:
-            eval_label = "good for me"
+            eval_label = "good for white"
         elif cp >= -60:
-            eval_label = "roughly equal"
+            eval_label = "equal"
         elif cp >= -200:
-            eval_label = "good for my opponent"
+            eval_label = "good for black"
         else:
-            eval_label = "losing"
+            eval_label = "winning for black"
 
-    return key_lines, eval_label, root_cp
+    # Build PLAYED LINE: student's move + engine continuation from board_after
+    board_after = board.copy()
+    board_after.push(move)
+
+    played_sans: list[str] = [move_san]
+    try:
+        cont_result = _engine.analyse(
+            board_after,
+            chess.engine.Limit(depth=max(depth - 2, 6)),
+            multipv=1,
+        )
+        if cont_result:
+            pv_cont = cont_result[0].get("pv", [])
+            b = board_after.copy()
+            for mv in pv_cont:
+                try:
+                    played_sans.append(b.san(mv))
+                    b.push(mv)
+                except Exception:
+                    break
+    except Exception:
+        pass
+
+    played_sans_truncated = played_sans[:line_depth]
+
+    # Get student move cp
+    student_cp: int | None = None
+    try:
+        student_info = _engine.analyse(board_after, chess.engine.Limit(depth=max(depth - 2, 8)))
+        s = student_info.get("score")
+        if s is not None:
+            w = s.white()
+            student_cp = None if w.mate() is not None else w.score()
+    except Exception:
+        pass
+
+    # Select engine alternative lines (skip played move)
+    engine_line_sans: list[list[str]] = []
+    for sans, cp_w in all_lines:
+        if not sans:
+            continue
+        if sans[0] == move_san:
+            continue
+        engine_line_sans.append(sans[:line_depth])
+        if len(engine_line_sans) >= n_engine_lines:
+            break
+
+    played_line_str = " → ".join(played_sans_truncated)
+
+    return (
+        played_sans_truncated,
+        engine_line_sans,
+        eval_label,
+        root_cp,
+        student_cp,
+        best_move_san,
+        played_line_str,
+    )
+
+
+def _classify_move(
+    student_san: str,
+    best_san: str,
+    student_cp: int | None,
+    best_cp: int | None,
+    turn: chess.Color,
+) -> tuple[str, int]:
+    """Classify the student's move vs the engine best. Returns (classification, cp_loss)."""
+    if student_san == best_san:
+        return "Best", 0
+
+    if student_cp is None or best_cp is None:
+        return "Good", 0
+
+    # cp_loss from the side-to-move's perspective
+    sign = 1 if turn == chess.WHITE else -1
+    cp_loss = max(0, sign * (best_cp - student_cp))
+
+    if cp_loss == 0:
+        return "Best", 0
+    elif cp_loss <= 10:
+        return "Great", cp_loss
+    elif cp_loss <= 30:
+        return "Good", cp_loss
+    elif cp_loss <= 100:
+        return "Inaccuracy", cp_loss
+    elif cp_loss <= 300:
+        return "Mistake", cp_loss
+    else:
+        return "Blunder", cp_loss
 
 
 # ---------------------------------------------------------------------------
@@ -205,18 +337,46 @@ async def _stream(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
         return
 
-    # Stockfish key lines (run in thread to not block event loop)
+    # Stockfish analysis (run in thread to not block event loop)
     try:
-        key_lines, eval_label, root_cp = await asyncio.get_event_loop().run_in_executor(
-            None, _get_key_lines, req.fen, req.depth, req.multipv
+        (
+            played_line_sans,
+            engine_line_sans,
+            eval_label,
+            root_cp,
+            student_cp,
+            best_move_san,
+            played_line_str,
+        ) = await asyncio.get_event_loop().run_in_executor(
+            None, _get_analysis, req.fen, req.move_uci, req.depth
         )
     except Exception as e:
         yield f"event: error\ndata: {json.dumps({'error': f'Stockfish: {e}'})}\n\n"
         return
 
-    # Emit meta (key lines as plain SAN strings for the UI to display)
-    key_line_strs = [" → ".join(line) for line in key_lines]
-    meta = {"eval_label": eval_label, "key_lines": key_line_strs, "move_san": move_san}
+    # Classify the student's move
+    try:
+        # best_cp = root_cp (eval of position before the move from White's perspective)
+        # For classification we need best line's cp vs student's resulting cp
+        # _get_analysis already computed root_cp and student_cp
+        classification, cp_loss = _classify_move(
+            move_san, best_move_san, student_cp, root_cp, board.turn
+        )
+    except Exception:
+        classification, cp_loss = "Good", 0
+
+    # Emit meta (played + engine lines as plain SAN strings for the UI)
+    all_line_strs = [played_line_str] + [" → ".join(line) for line in engine_line_sans]
+    is_best = move_san == best_move_san
+    meta = {
+        "eval_label": eval_label,
+        "key_lines": all_line_strs,
+        "move_san": move_san,
+        "classification": classification,
+        "cp_loss": cp_loss,
+        "best_move": best_move_san,
+        "is_best": is_best,
+    }
     yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
 
     # Build board ascii
@@ -227,6 +387,7 @@ async def _stream(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
     board_after_str = board_ascii(board_after)
 
     # Build user prompt (plain SAN, no sentinels yet)
+    engine_line_strs = [" → ".join(line) for line in engine_line_sans]
     user_content = format_joint_user_prompt(
         board_ascii_str=board_before_str,
         fen=req.fen,
@@ -235,7 +396,8 @@ async def _stream(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
         facts=facts,
         board_after_str=board_after_str,
         fen_after=board_after.fen(),
-        key_lines=key_line_strs,
+        played_line=played_line_str,
+        key_lines=engine_line_strs,
     )
 
     messages = [
@@ -246,8 +408,8 @@ async def _stream(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
     # Inject <|vision_pad|> sentinels
     messages_with_sentinels = inject_sentinels(messages, move_san)
 
-    # Build board tensors
-    board_tensors = build_board_tensors(req.fen, move_san, key_lines)
+    # Build board tensors — played line and engine lines all start from pre-move board
+    board_tensors = build_board_tensors(req.fen, move_san, engine_line_sans, played_line_sans)
 
     # Stream generation in a thread (model.generate is synchronous)
     in_think = False
@@ -354,6 +516,124 @@ def _partial_tag(text: str, tag: str) -> int:
         if text.endswith(tag[:length]):
             return length
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Debug endpoint — returns exact prompt text and raw model output
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/encoder/debug")
+async def debug_encoder(req: AnalyzeRequest) -> dict:
+    """Return the exact tokenized prompt and raw model output for inspection."""
+    if _model is None or _tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    board = chess.Board(req.fen)
+    try:
+        move = chess.Move.from_uci(req.move_uci)
+        move_san = board.san(move)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    (
+        played_line_sans,
+        engine_line_sans,
+        eval_label,
+        _,
+        _,
+        _,
+        played_line_str,
+    ) = await asyncio.get_event_loop().run_in_executor(
+        None, _get_analysis, req.fen, req.move_uci, req.depth
+    )
+    engine_line_strs = [" → ".join(line) for line in engine_line_sans]
+    all_line_strs = [played_line_str] + engine_line_strs
+
+    board_before_str = board_ascii(board)
+    facts = move_facts(board, move)
+    board_after = board.copy()
+    board_after.push(move)
+    board_after_str = board_ascii(board_after)
+
+    user_content = format_joint_user_prompt(
+        board_ascii_str=board_before_str,
+        fen=req.fen,
+        move_san=move_san,
+        eval_str=eval_label,
+        facts=facts,
+        board_after_str=board_after_str,
+        fen_after=board_after.fen(),
+        played_line=played_line_str,
+        key_lines=engine_line_strs,
+    )
+
+    messages = [
+        {"role": "system", "content": JOINT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    messages_with_sentinels = inject_sentinels(messages, move_san)
+    board_tensors = build_board_tensors(req.fen, move_san, engine_line_sans, played_line_sans)
+
+    # Render the exact prompt text the tokenizer will see
+    prompt_text = _tokenizer.apply_chat_template(
+        messages_with_sentinels,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    # Count sentinels in tokenized form
+    from src.encoder import MOVE_TOKEN_ID
+
+    encoded = _tokenizer.apply_chat_template(
+        messages_with_sentinels,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
+    input_ids = encoded.input_ids if hasattr(encoded, "input_ids") else encoded
+    n_sentinels = int((input_ids == MOVE_TOKEN_ID).sum().item())
+    n_tokens = int(input_ids.shape[-1])
+
+    # Run non-streaming generation to get raw output
+    import queue as _queue
+    import threading
+
+    from transformers import TextIteratorStreamer
+
+    device = next(_model.parameters()).device
+    input_ids_dev = input_ids.to(device)
+    attention_mask = (input_ids_dev != _tokenizer.pad_token_id).long()
+    bt = board_tensors.to(device)
+
+    import torch as _torch
+
+    from src.encoder import MOVE_TOKEN_ID as _MTID
+    from src.tutor.encoder_inference import generate_stream
+
+    raw_chunks = []
+    for chunk in generate_stream(
+        _model,
+        _tokenizer,
+        messages_with_sentinels,
+        board_tensors,
+        max_new_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+    ):
+        raw_chunks.append(chunk)
+    raw_output = "".join(raw_chunks)
+
+    return {
+        "move_san": move_san,
+        "eval_label": eval_label,
+        "played_line": played_line_str,
+        "engine_lines": engine_line_strs,
+        "n_input_tokens": n_tokens,
+        "n_sentinel_tokens": n_sentinels,
+        "n_board_tensors": int(board_tensors.shape[0]),
+        "prompt_text": prompt_text,
+        "raw_output": raw_output,
+    }
 
 
 # ---------------------------------------------------------------------------

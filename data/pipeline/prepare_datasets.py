@@ -1022,8 +1022,8 @@ async def _coach_one(
                     model=llm_model,
                     messages=messages,
                     max_tokens=16384,
-                    temperature=0.7,
-                    extra_body={"chat_template_kwargs": {"thinking_budget": 16384}},
+                    temperature=1.0,
+                    extra_body={"thinking_token_budget": 1024},
                 ),
                 timeout=900.0,
             )
@@ -1101,8 +1101,8 @@ async def _coach_one(
                     tools=CHESS_TOOLS,
                     tool_choice="auto",
                     max_tokens=16384,
-                    temperature=0.7,
-                    extra_body={"chat_template_kwargs": {"thinking_budget": 16384}},
+                    temperature=1.0,
+                    extra_body={"thinking_token_budget": 1024},
                 ),
                 timeout=300.0,
             )

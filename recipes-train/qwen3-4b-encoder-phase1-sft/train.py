@@ -25,7 +25,11 @@ _logger = logging.getLogger(__name__)
 
 
 def _extract_line_sans(user_content: str) -> list[list[str]]:
-    """Parse ## Engine Key Lines section from user content."""
+    """Parse ## Engine Key Lines section from user content.
+
+    Handles both "PLAYED LINE: ..." and "Line N: ..." formats.
+    Returns all lines in order (PLAYED LINE first if present).
+    """
     lines_section_re = re.search(
         r"## Engine Key Lines\n\n(.*?)(?=\n\n##|\Z)", user_content, re.DOTALL
     )
@@ -35,7 +39,7 @@ def _extract_line_sans(user_content: str) -> list[list[str]]:
     result = []
     lines_text = lines_section_re.group(1).strip().split("\n")
     for line in lines_text:
-        m = re.match(r"^Line \d+:\s*(.*)", line.strip())
+        m = re.match(r"^(?:PLAYED LINE|Line \d+):\s*(.*)", line.strip())
         if m:
             parts = m.group(1).split("→")
             sans = []
@@ -74,7 +78,8 @@ def _inject_move_tokens(
                     inner = m.group(1)
                     new_lines = []
                     for line in inner.split("\n"):
-                        line_m = re.match(r"^(Line \d+:\s*)(.*)", line)
+                        # Match PLAYED LINE or Line N
+                        line_m = re.match(r"^((?:PLAYED LINE|Line \d+):\s*)(.*)", line)
                         if line_m:
                             prefix = line_m.group(1)
                             moves_str = line_m.group(2)

@@ -33,19 +33,19 @@ SYSTEM_PROMPT = (
     "- Write in second person ('You centralise the knight') — never use "
     "first-person ('I recommend', 'I suggest', 'I think').\n\n"
     "Depth by game phase:\n"
-    "OPENING (moves 1–12, most pieces on board): Be concise. Name the opening "
+    "OPENING (moves 1-12, most pieces on board): Be concise. Name the opening "
     "or variation (e.g. 'Ruy Lopez Berlin Defense', 'King's Indian Attack'). "
     "State whether the move is recognized opening theory or a deviation. "
     "Use web_search to verify the exact opening name or look up theoretical lines "
     "if you are not certain. Skip deep engine analysis — opening knowledge trumps "
-    "engine lines here. 2–3 sentences max.\n\n"
+    "engine lines here. 2-3 sentences max.\n\n"
     "MIDDLEGAME: Explain the key tactical or strategic idea. Reference the "
     "engine's top candidates when relevant. Use analyze_position to verify "
-    "critical variations before asserting concrete lines. 3–5 sentences.\n\n"
+    "critical variations before asserting concrete lines. 3-5 sentences.\n\n"
     "ENDGAME: Analyze in depth. Use analyze_position to explore the key lines "
     "before writing. Focus on king activity, pawn advancement, piece "
     "coordination, and conversion technique. Cite specific variations. "
-    "4–6 sentences.\n\n"
+    "4-6 sentences.\n\n"
     "Calibrate length to complexity — a simple recapture needs 2 sentences, "
     "a deep positional sacrifice needs 6.\n\n"
     "Write your coaching comment directly — no preamble, no meta-commentary, "
@@ -143,17 +143,16 @@ def board_ascii(board: chess.Board) -> str:
 
 JOINT_SYSTEM_PROMPT = (
     "You are an expert chess coach analysing a student's game move by move.\n\n"
-    "You will receive the board position, the student's move, and the engine's top 5 key lines "
+    "You will receive the board position, the student's move, and a set of engine key lines "
     "as sequences of board positions. Each move in the key lines is shown as a board embedding "
-    "followed by the SAN notation.\n\n"
+    "followed by the SAN notation. The first line (PLAYED LINE) shows what happens when the "
+    "student's move is played; the remaining lines are the engine's top alternatives.\n\n"
     "Your task has two parts:\n\n"
     "PART 1 — Annotate the engine lines:\n"
-    "Output exactly 5 lines in this format:\n"
+    "Output one annotated <line> block per key line shown, in the same order, using this format:\n"
     "<line>LINE 1: move (purpose) → move (purpose) → ... | eval: <label></line>\n"
     "<line>LINE 2: move (purpose) → move (purpose) → ... | eval: <label></line>\n"
-    "<line>LINE 3: move (purpose) → move (purpose) → ... | eval: <label></line>\n"
-    "<line>LINE 4: move (purpose) → move (purpose) → ... | eval: <label></line>\n"
-    "<line>LINE 5: move (purpose) → move (purpose) → ... | eval: <label></line>\n\n"
+    "... (one block per line provided)\n\n"
     "Rules for annotation:\n"
     "- Copy the moves exactly as shown in the Engine Key Lines — do not invent or change them\n"
     "- Add a purpose annotation in parentheses for each move explaining the idea\n"
@@ -161,16 +160,17 @@ JOINT_SYSTEM_PROMPT = (
     "  winning for white | good for white | equal | good for black | winning for black\n"
     "- Do not include raw centipawn numbers anywhere\n\n"
     "PART 2 — Coaching comment:\n"
-    "After the 5 annotated lines, write a 2–4 sentence coaching comment directly to the student. "
+    "After the annotated lines, write a 2-8 sentence coaching comment directly to the student. "
     "The comment must:\n"
-    "- Address the quality of the student's move (agree with the engine classification)\n"
-    "- Reference the key ideas from the engine lines you just annotated\n"
+    "- Be grounded in the lines you just annotated — reference specific moves or ideas from them\n"
+    "- Address the quality of the student's move relative to the engine alternatives\n"
+    "- Explain what the key strategic or tactical idea is in this position\n"
     "- Be written in second person ('You play Nd5…') — never use first person\n"
     "- Not parrot the classification label or raw eval numbers\n\n"
     "Output format (after your thinking):\n"
     "<line>LINE 1: ...</line>\n"
     "...\n"
-    "<line>LINE 5: ...</line>\n\n"
+    "<line>LINE N: ...</line>\n\n"
     "[coaching comment]"
 )
 
@@ -183,11 +183,14 @@ def format_joint_user_prompt(
     facts: list[str] | None = None,
     board_after_str: str = "",
     fen_after: str = "",
+    played_line: str | None = None,
     key_lines: list[str] | None = None,
 ) -> str:
     """Build the user message for the joint annotation + coaching task (Phase 2).
 
-    key_lines: list of plain SAN line strings, e.g.:
+    played_line: SAN line string starting from the student's move, e.g.:
+        "Ne5 → d4 → Nc6 → Bxe5"  (student move first, then engine response)
+    key_lines: list of plain SAN alternative line strings, e.g.:
         ["Nd5 → e4 → Nc3 → d5", "Nf6 → g5 → Bg2 → h4", ...]
     Sentinels are injected later by _inject_move_tokens in the train script.
     """
@@ -205,9 +208,14 @@ def format_joint_user_prompt(
         facts_section = "## Verified Move Facts\n\n" + "\n".join(f"- {f}" for f in facts) + "\n\n"
 
     lines_section = ""
+    all_lines = []
+    if played_line:
+        all_lines.append(f"PLAYED LINE: {played_line}")
     if key_lines:
-        line_strs = "\n".join(f"Line {i + 1}: {l}" for i, l in enumerate(key_lines))
-        lines_section = f"## Engine Key Lines\n\n{line_strs}\n\n"
+        for i, l in enumerate(key_lines):
+            all_lines.append(f"Line {i + 1}: {l}")
+    if all_lines:
+        lines_section = "## Engine Key Lines\n\n" + "\n".join(all_lines) + "\n\n"
 
     task_section = (
         "## Task\n\n"
@@ -236,7 +244,7 @@ TEXTBOOK_SYSTEM_PROMPT = (
     "Do not drop, weaken, or contradict any point the expert makes.\n"
     "- Do NOT introduce new chess claims or analysis beyond what the expert wrote or "
     "what Stockfish directly supports.\n"
-    "- Rewrite in direct, concise coaching language (3–6 sentences).\n"
+    "- Rewrite in direct, concise coaching language (3-6 sentences).\n"
     "- If the expert's wording is already clear and well-structured, a light rewrite is fine; "
     "do not pad or dilute it.\n\n"
     "FILTERING RULE — respond with exactly the word SKIP (nothing else) when the annotation:\n"

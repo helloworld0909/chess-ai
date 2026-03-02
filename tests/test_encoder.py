@@ -30,15 +30,12 @@ def _load_module(path: str, name: str):
 
 
 _sft = _load_module(
-    os.path.join(_REPO, "recipes-train", "encoder-sft", "train.py"), "encoder_sft_train"
+    os.path.join(_REPO, "recipes-train", "qwen3-4b-encoder-phase1-sft", "train.py"),
+    "encoder_sft_train",
 )
 _inject_move_tokens = _sft._inject_move_tokens
-
-_p2 = _load_module(
-    os.path.join(_REPO, "recipes-train", "encoder-phase2", "train.py"), "encoder_phase2_train"
-)
-_extract_line_sans = _p2._extract_line_sans
-_inject_move_tokens_p2 = _p2._inject_move_tokens
+_extract_line_sans = _sft._extract_line_sans
+_inject_move_tokens_p2 = _sft._inject_move_tokens
 
 _pre = _load_module(
     os.path.join(_REPO, "recipes-train", "encoder-pretrain", "train.py"), "encoder_pretrain_train"
@@ -228,6 +225,40 @@ def test_inject_move_tokens_phase2_key_lines(mock_tokenizer):
     assert text.count(MOVE_TOKEN) == 6
     # Assistant untouched
     assert MOVE_TOKEN not in new_msgs[2]["content"]
+
+
+def test_extract_line_sans_with_played_line():
+    """_extract_line_sans includes PLAYED LINE as the first entry."""
+    content = (
+        "## Engine Key Lines\n\n"
+        "PLAYED LINE: Ne5 → d4 → Nc6\n"
+        "Line 1: Nd5 → e4\n"
+        "Line 2: Nf6 → g5\n\n"
+        "## Task\n\nAnnotate."
+    )
+    result = _extract_line_sans(content)
+    assert result == [["Ne5", "d4", "Nc6"], ["Nd5", "e4"], ["Nf6", "g5"]]
+
+
+def test_inject_move_tokens_played_line(mock_tokenizer):
+    """PLAYED LINE: sentinels are injected for all moves in the played line."""
+    user_content = (
+        "Move: Ne5\nBoard: ...\n\n"
+        "## Engine Key Lines\n\n"
+        "PLAYED LINE: Ne5 → d4 → Nc6\n"
+        "Line 1: Nd5 → e4\n\n"
+        "## Task\n\nAnnotate."
+    )
+    msgs = [
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": "<line>LINE 1: Nd5 (knight) | eval: equal</line>"},
+    ]
+    new_msgs, line_sans = _inject_move_tokens(msgs, "Ne5")
+    text = mock_tokenizer.apply_chat_template(new_msgs, tokenize=False, add_generation_prompt=False)
+    # 1 (student "Move:") + 3 (PLAYED LINE) + 2 (Line 1) = 6
+    assert line_sans == [["Ne5", "d4", "Nc6"], ["Nd5", "e4"]]
+    expected_count = 1 + sum(len(ls) for ls in line_sans)
+    assert text.count(MOVE_TOKEN) == expected_count
 
 
 # ---------------------------------------------------------------------------
