@@ -60,11 +60,19 @@ class AnalysisLine:
     time_ms: int
     pv: list[str]  # Principal variation (list of moves in UCI notation)
     multipv: int = 1
+    wdl: tuple[int, int, int] | None = None  # Win/Draw/Loss in permille from Stockfish
 
     @property
     def best_move(self) -> str:
         """Return the best move from this line."""
         return self.pv[0] if self.pv else ""
+
+    @property
+    def win_probability(self) -> float:
+        """Win probability using native WDL if available, else Score sigmoid fallback."""
+        if self.wdl is not None:
+            return self.wdl[0] / 1000.0
+        return self.score.win_probability
 
 
 @dataclass
@@ -80,6 +88,11 @@ class Analysis:
     def score(self) -> Score:
         """Return the score of the best line."""
         return self.lines[0].score if self.lines else Score(ScoreType.CENTIPAWNS, 0)
+
+    @property
+    def win_probability(self) -> float:
+        """Win probability using native WDL if available, else sigmoid fallback."""
+        return self.lines[0].win_probability if self.lines else 0.5
 
     @property
     def pv(self) -> list[str]:
@@ -134,6 +147,7 @@ class Stockfish:
         await self._send(f"setoption name Threads value {self.threads}")
         await self._send(f"setoption name Hash value {self.hash_mb}")
         await self._send("setoption name UCI_AnalyseMode value true")
+        await self._send("setoption name UCI_ShowWDL value true")
 
         await self._send("isready")
         await self._wait_for("readyok")
@@ -214,6 +228,14 @@ class Stockfish:
         except (ValueError, IndexError):
             pass
 
+        # Parse WDL (Win/Draw/Loss in permille, e.g. "wdl 140 859 1")
+        wdl: tuple[int, int, int] | None = None
+        try:
+            wdl_idx = parts.index("wdl")
+            wdl = (int(parts[wdl_idx + 1]), int(parts[wdl_idx + 2]), int(parts[wdl_idx + 3]))
+        except (ValueError, IndexError):
+            pass
+
         # Parse PV
         pv: list[str] = []
         try:
@@ -231,6 +253,7 @@ class Stockfish:
             time_ms=get_value("time"),
             pv=pv,
             multipv=get_value("multipv") or 1,
+            wdl=wdl,
         )
 
     async def analyze(
@@ -288,10 +311,21 @@ class Stockfish:
         analysis = await self.analyze(fen, depth)
         return analysis.best_move
 
-    async def get_eval(self, fen: str, depth: int | None = None) -> Score:
-        """Get the evaluation of a position."""
+    async def get_eval(self, fen: str, depth: int | None = None) -> AnalysisLine:
+        """Get the evaluation of a position (includes native WDL when available)."""
         analysis = await self.analyze(fen, depth)
-        return analysis.score
+        if analysis.lines:
+            return analysis.lines[0]
+        # Fallback: empty line with zero score
+        return AnalysisLine(
+            depth=0,
+            seldepth=0,
+            score=Score(ScoreType.CENTIPAWNS, 0),
+            nodes=0,
+            nps=0,
+            time_ms=0,
+            pv=[],
+        )
 
     async def compare_moves(
         self,
@@ -316,6 +350,7 @@ class Stockfish:
         analysis = await self.analyze(fen, depth, multipv=3)
         best_move = analysis.best_move
         best_score = analysis.score
+        wdl_before = analysis.lines[0].wdl if analysis.lines else None
 
         # Apply user move and get resulting position eval
         board.push(move)
@@ -326,11 +361,19 @@ class Stockfish:
             user_analysis.score.type,
             -user_analysis.score.value,
         )
+        # WDL is also from opponent's perspective — swap W and L
+        raw_wdl = user_analysis.lines[0].wdl if user_analysis.lines else None
+        wdl_after = (raw_wdl[2], raw_wdl[1], raw_wdl[0]) if raw_wdl is not None else None
 
         # Calculate centipawn loss
         cp_loss = 0
         if best_score.centipawns is not None and user_score.centipawns is not None:
             cp_loss = best_score.centipawns - user_score.centipawns
+
+        # Win probability loss (WDL-based when available, else sigmoid)
+        wp_before = wdl_before[0] / 1000.0 if wdl_before is not None else best_score.win_probability
+        wp_after = wdl_after[0] / 1000.0 if wdl_after is not None else user_score.win_probability
+        wp_loss = round(wp_before - wp_after, 4)
 
         # Classify move
         if user_move == best_move:
@@ -352,6 +395,9 @@ class Stockfish:
             "user_score": str(user_score),
             "best_score": str(best_score),
             "cp_loss": cp_loss,
+            "wp_loss": wp_loss,
+            "wdl_before": wdl_before,
+            "wdl_after": wdl_after,
             "classification": classification,
             "pv": analysis.pv[:5],  # Top 5 moves of best line
             "is_best": user_move == best_move,

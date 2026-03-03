@@ -150,7 +150,7 @@ class ChessToolHandler:
         result = {
             "best_move": analysis.best_move,
             "score": str(score),
-            "win_probability": f"{score.win_probability:.1%}",
+            "win_probability": f"{analysis.win_probability:.1%}",
             "principal_variation": analysis.pv[:5],
         }
 
@@ -163,11 +163,12 @@ class ChessToolHandler:
         fen = args["fen"]
         depth = args.get("depth", 15)
 
-        score = await self.stockfish.get_eval(fen, depth=depth)
+        line = await self.stockfish.get_eval(fen, depth=depth)
+        score = line.score
 
         result: dict[str, str | int] = {
             "score": str(score),
-            "win_probability": f"{score.win_probability:.1%}",
+            "win_probability": f"{line.win_probability:.1%}",
         }
 
         if score.centipawns is not None:

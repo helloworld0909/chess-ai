@@ -51,7 +51,7 @@ class ChessTools:
                     "score": str(analysis.score),
                     "score_type": analysis.score.type.value,
                     "score_value": analysis.score.value,
-                    "win_probability": round(analysis.score.win_probability, 3),
+                    "win_probability": round(analysis.win_probability, 3),
                     "depth": analysis.depth,
                     "pv": analysis.pv[:10],
                 },
@@ -75,11 +75,12 @@ class ChessTools:
             except ValueError as e:
                 return ToolResult(success=False, data={}, error=f"Invalid FEN: {e}")
 
-            score = await self.stockfish.get_eval(fen, depth)
+            line = await self.stockfish.get_eval(fen, depth)
+            score = line.score
 
             result_data = {
                 "score": str(score),
-                "win_probability": round(score.win_probability, 3),
+                "win_probability": round(line.win_probability, 3),
             }
 
             if score.centipawns is not None:

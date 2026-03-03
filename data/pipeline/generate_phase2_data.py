@@ -16,14 +16,15 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import multiprocessing
-import os
 import random
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import chess
 import chess.engine
@@ -78,7 +79,14 @@ def _line_params(spread_cp: int) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def _analyze_full_lines(fen: str, depth: int, multipv: int = 6):
+def _analyze_full_lines(
+    fen: str, depth: int, multipv: int = 6
+) -> tuple[
+    int | None,
+    list[tuple[str, str, int | None]],
+    list[tuple[list[tuple[str, str]], str, int | None]],
+    int,
+]:
     """Run Stockfish multipv and return full PV lines.
 
     Returns:
@@ -114,6 +122,7 @@ def _analyze_full_lines(fen: str, depth: int, multipv: int = 6):
                     root_cp = None
             else:
                 cp_val = score.white().score()
+                assert cp_val is not None  # not mate, so score() is always int
                 if i == 0:
                     root_cp = cp_val
                 cp = cp_val
@@ -154,7 +163,8 @@ def _analyze_full_lines(fen: str, depth: int, multipv: int = 6):
             else:
                 eval_label = "winning for black"
         elif score and score.is_mate():
-            if score.white().mate() > 0:
+            mate_val = score.white().mate()
+            if mate_val is not None and mate_val > 0:
                 eval_label = "winning for white"
             else:
                 eval_label = "winning for black"
@@ -169,7 +179,7 @@ def _analyze_full_lines(fen: str, depth: int, multipv: int = 6):
 
 
 def _build_played_line(
-    board: chess.Board, move: chess.Move, depth: int, engine
+    board: chess.Board, move: chess.Move, depth: int, engine: chess.engine.SimpleEngine
 ) -> list[tuple[str, str]]:
     """Run Stockfish from the position AFTER the student's move to get engine response line.
 
@@ -312,7 +322,9 @@ def _build_comment_from_lines(
     return " ".join(parts)
 
 
-def convert_sample(args_tuple: tuple) -> dict | None:
+def convert_sample(
+    args_tuple: tuple[dict[str, Any], int, int, str | None],
+) -> dict[str, Any] | None:
     sample, depth, seed_offset, llm_comment = args_tuple
     metadata = sample.get("metadata", {})
     fen = metadata.get("fen")
@@ -547,15 +559,14 @@ def main() -> None:
 
     log.info("Split: %d train / %d eval", len(train_samples), len(eval_samples))
 
-    def _get_llm_comment(rec: dict) -> str | None:
+    def _get_llm_comment(rec: dict[str, Any]) -> str | None:
         if not comments_cache:
             return None
-        import hashlib as _hashlib
 
         meta = rec.get("metadata", {})
         fen = meta.get("fen", "")
         move_uci = meta.get("move_uci", "")
-        k = _hashlib.md5(f"llm10:{fen}:{move_uci}".encode()).hexdigest()
+        k = hashlib.md5(f"llm10:{fen}:{move_uci}".encode()).hexdigest()
         return comments_cache.get(k)
 
     train_tagged = [(s, args.depth, args.seed, _get_llm_comment(s), "train") for s in train_samples]
