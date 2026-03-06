@@ -91,7 +91,12 @@ def load_jsonl_lines(path: str) -> Dataset:
                 sample = json.loads(line)
                 total_found += 1
                 if "messages" in sample:
-                    data.append({"messages": sample["messages"]})
+                    data.append(
+                        {
+                            "messages": sample["messages"],
+                            "metadata": sample.get("metadata", {}),
+                        }
+                    )
             except json.JSONDecodeError:
                 continue
     logger.info(
@@ -259,12 +264,16 @@ def run_training(config_path: str, model, tokenizer, resume_from_checkpoint=None
     packing = train_cfg.get("packing", False)
 
     logger.info("Loading training data from %s", train_cfg["train_file"])
-    train_dataset = format_dataset(Dataset.from_list(load_jsonl(train_cfg["train_file"])), tokenizer)
+    train_dataset = format_dataset(
+        Dataset.from_list(load_jsonl(train_cfg["train_file"])), tokenizer
+    )
 
     eval_dataset = None
     if train_cfg.get("eval_file"):
         logger.info("Loading eval data from %s", train_cfg["eval_file"])
-        eval_dataset = format_dataset(Dataset.from_list(load_jsonl(train_cfg["eval_file"])), tokenizer)
+        eval_dataset = format_dataset(
+            Dataset.from_list(load_jsonl(train_cfg["eval_file"])), tokenizer
+        )
 
     training_args = make_training_args(config)
 

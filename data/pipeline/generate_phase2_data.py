@@ -516,105 +516,6 @@ def _build_played_line(
     return result_line
 
 
-def _build_comment_from_lines(
-    board: chess.Board,
-    move_san: str,
-    played_line_info: list[tuple[str, str]],
-    engine_lines: list[tuple[list[tuple[str, str]], str, int | None]],
-    root_cp: int | None,
-    best_cp: int | None,
-    student_cp: int | None,
-) -> str:
-    """Generate a coaching comment grounded in the Stockfish lines.
-
-    This replaces the textbook cache lookup — the comment is derived deterministically
-    from the engine analysis, so it accurately reflects what happens in the lines.
-    """
-    turn = board.turn
-    sign = 1 if turn == chess.WHITE else -1
-
-    # Classify the student's move
-    classification = "good"
-    cp_loss = 0
-    if student_cp is not None and best_cp is not None:
-        cp_loss = max(0, sign * (best_cp - student_cp))
-        if cp_loss == 0:
-            classification = "best"
-        elif cp_loss <= 10:
-            classification = "great"
-        elif cp_loss <= 30:
-            classification = "good"
-        elif cp_loss <= 100:
-            classification = "inaccuracy"
-        elif cp_loss <= 300:
-            classification = "mistake"
-        else:
-            classification = "blunder"
-
-    phase = _game_phase(board)
-    turn_str = "White" if turn == chess.WHITE else "Black"
-
-    # Build comment parts
-    parts = []
-
-    # Part 1: quality of the played move
-    if classification in ("best", "great"):
-        parts.append(
-            f"You play {move_san}, which is the engine's top choice — "
-            f"a {'strong' if classification == 'best' else 'very good'} move in this {phase}."
-        )
-    elif classification == "good":
-        parts.append(f"You play {move_san}, a solid move that keeps the position balanced.")
-    elif classification == "inaccuracy":
-        best_san = (
-            engine_lines[0][0][0][0]
-            if engine_lines and engine_lines[0][0]
-            else "the engine's suggestion"
-        )
-        parts.append(
-            f"You play {move_san}, but {best_san} was slightly stronger — "
-            f"you lose about {cp_loss} centipawns compared to the best continuation."
-        )
-    else:  # mistake or blunder
-        best_san = (
-            engine_lines[0][0][0][0]
-            if engine_lines and engine_lines[0][0]
-            else "the engine's suggestion"
-        )
-        parts.append(
-            f"You play {move_san}, which is a {classification} — "
-            f"{best_san} was the correct idea here, saving approximately {cp_loss} centipawns."
-        )
-
-    # Part 2: key idea from the best engine line
-    if engine_lines:
-        best_line_moves, best_eval_label, _ = engine_lines[0]
-        if best_line_moves:
-            first_move_san, first_purpose = best_line_moves[0]
-            if len(best_line_moves) >= 2:
-                second_move_san, second_purpose = best_line_moves[1]
-                parts.append(
-                    f"The engine's top line starts with {first_move_san} ({first_purpose}) "
-                    f"followed by {second_move_san} ({second_purpose}), "
-                    f"leaving the position {best_eval_label}."
-                )
-            else:
-                parts.append(
-                    f"The engine's top line starts with {first_move_san} ({first_purpose}), "
-                    f"leaving the position {best_eval_label}."
-                )
-
-    # Part 3: comparison if student's line differs from engine best
-    if classification not in ("best", "great") and played_line_info and len(played_line_info) >= 2:
-        response_san, response_purpose = played_line_info[1]
-        parts.append(
-            f"After your {move_san}, the opponent's best response is {response_san} "
-            f"({response_purpose})."
-        )
-
-    return " ".join(parts)
-
-
 def convert_sample(
     args_tuple: tuple[dict[str, Any], int, int, str | None],
 ) -> dict[str, Any] | None:
@@ -712,7 +613,6 @@ def convert_sample(
         played_line_from_pv = [(board.san(move), _move_purpose(board, move))]
 
     played_line_truncated = played_line_from_pv[:line_depth]
-    played_line_moves = played_line_from_pv  # kept for _build_comment_from_lines
 
     # Select engine alternative lines (skip if first move == student's move)
     engine_lines_selected = []

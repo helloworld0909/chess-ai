@@ -44,7 +44,9 @@ def _extract_line_sans(user_content: str) -> list[list[str]]:
             parts = m.group(1).split("→")
             sans = []
             for part in parts:
+                # Strip sentinel token and SF15 bracket annotations like "[mobility +0.15; ...]"
                 clean = part.replace(MOVE_TOKEN, "").strip()
+                clean = re.sub(r"\s*\[.*?\]", "", clean).strip()
                 if clean:
                     sans.append(clean)
             if sans:
@@ -282,7 +284,7 @@ def main() -> None:
 
     train_dataset = (
         Dataset.from_list(raw_train)
-        .map(_fmt, num_proc=4)
+        .map(_fmt, num_proc=1)
         .select_columns(
             ["input_ids", "attention_mask", "labels", "fen", "move_san", "line_sans_json"]
         )
@@ -293,16 +295,19 @@ def main() -> None:
         raw_eval = load_jsonl_lines(train_cfg["eval_file"])
         if args.dry_run:
             raw_eval = raw_eval[:20]
-        eval_dataset = (
-            Dataset.from_list(raw_eval)
-            .map(_fmt, num_proc=4)
-            .select_columns(
-                ["input_ids", "attention_mask", "labels", "fen", "move_san", "line_sans_json"]
+        if raw_eval:
+            eval_dataset = (
+                Dataset.from_list(raw_eval)
+                .map(_fmt, num_proc=1)
+                .select_columns(
+                    ["input_ids", "attention_mask", "labels", "fen", "move_san", "line_sans_json"]
+                )
             )
-        )
 
     training_args = make_training_args(config)
     training_args.remove_unused_columns = False
+    if eval_dataset is None:
+        training_args.eval_strategy = "no"
 
     data_collator = EncoderDataCollator(tokenizer=tokenizer)
 
