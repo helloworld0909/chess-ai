@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import multiprocessing
+import os
 import random
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -28,6 +29,13 @@ from typing import Any
 
 import chess
 import chess.engine
+
+# Resolve Stockfish paths before importing modules that read them at import time.
+# Supports both explicit env vars and tilde expansion.
+_DEFAULT_SF_PATH = str(Path("~/.local/bin/stockfish").expanduser())
+_DEFAULT_SF15_PATH = str(Path("~/.local/bin/stockfish-15").expanduser())
+os.environ.setdefault("STOCKFISH_PATH", _DEFAULT_SF_PATH)
+os.environ.setdefault("SF15_PATH", _DEFAULT_SF15_PATH)
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from tutor.prompts import (
@@ -57,19 +65,22 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _sf15_annotation(term_diffs: dict[str, float]) -> str:
-    """Convert notable SF15 term diffs into a compact annotation string.
+def _sf15_terms(term_diffs: dict[str, float]) -> list[tuple[str, float]]:
+    """Return notable (term, delta) pairs sorted by absolute magnitude.
 
-    Only terms with |diff| >= 0.10 are included.  Terms are sorted by
-    absolute magnitude so the most impactful appear first.
-    Example output: "king safety −0.45, mobility +0.21"
+    Only includes terms with |diff| >= 0.10, capped at 3.
     """
     notable = [(abs(d), term, d) for term, d in term_diffs.items() if abs(d) >= 0.10]
     if not notable:
-        return ""
+        return []
     notable.sort(reverse=True)
+    return [(term, d) for _, term, d in notable[:3]]
+
+
+def _fmt_terms(terms: list[tuple[str, float]]) -> str:
+    """Format term list as 'king safety −0.45; mobility +0.21' for user prompt brackets."""
     parts = []
-    for _, term, d in notable[:3]:  # cap at 3 terms to keep annotations concise
+    for term, d in terms:
         sign = "+" if d >= 0 else "−"
         parts.append(f"{term.lower()} {sign}{abs(d):.2f}")
     return "; ".join(parts)
@@ -79,29 +90,28 @@ def _annotate_line_with_sf15(
     moves: list[tuple[str, str]],
     start_fen: str,
     white_to_move_at_start: bool,
-) -> list[tuple[str, str, str]]:
+) -> list[tuple[str, str, list[tuple[str, float]]]]:
     """Walk a line of (san, purpose) pairs and attach SF15 term annotations.
 
-    Returns list of (san, purpose, sf15_annotation) triples.
-    sf15_annotation is empty string when SF15 is unavailable or diff is tiny.
+    Returns list of (san, purpose, terms) triples where terms is a list of
+    (term_name, delta) pairs sorted by absolute magnitude (empty if SF15
+    unavailable or all diffs below threshold).
     """
-    result: list[tuple[str, str, str]] = []
+    result: list[tuple[str, str, list[tuple[str, float]]]] = []
     board = chess.Board(start_fen)
     try:
         eval_before = get_sf15_eval(start_fen)
     except Exception:
-        # SF15 not available — return unannotated
-        return [(san, purpose, "") for san, purpose in moves]
+        return [(san, purpose, []) for san, purpose in moves]
 
     for san, purpose in moves:
-        # Push the move to get fen_after
         try:
             move = board.parse_san(san)
             white_moved = board.turn == chess.WHITE
             board.push(move)
             fen_after = board.fen()
         except Exception:
-            result.append((san, purpose, ""))
+            result.append((san, purpose, []))
             continue
 
         try:
@@ -116,11 +126,11 @@ def _annotate_line_with_sf15(
                 if not white_moved:
                     delta = -delta
                 diffs[term] = round(delta, 2)
-            annotation = _sf15_annotation(diffs)
+            terms = _sf15_terms(diffs)
         except Exception:
-            annotation = ""
+            terms = []
 
-        result.append((san, purpose, annotation))
+        result.append((san, purpose, terms))
         eval_before = eval_after  # chain: next move's "before" is this move's "after"
 
     return result
@@ -246,6 +256,219 @@ def _analyze_full_lines(
         spread_cp = max(cp_values) - min(cp_values)
 
     return root_cp, candidates, full_lines, spread_cp
+
+
+# Phrase pools per SF15 term × direction (positive delta, negative delta).
+# Each pool has 3-4 distinct English phrases; one is chosen via seeded RNG for diversity.
+_TERM_PHRASES: dict[str, tuple[list[str], list[str]]] = {
+    "Material": (
+        ["wins material", "gains a material edge", "captures for free"],
+        ["loses material", "gives up material", "concedes a piece"],
+    ),
+    "Imbalance": (
+        [
+            "creates a favourable piece imbalance",
+            "reaches a better piece configuration",
+            "engineers a beneficial exchange",
+        ],
+        [
+            "accepts an unfavourable imbalance",
+            "trades into a worse structure",
+            "concedes the exchange quality",
+        ],
+    ),
+    "Pawns": (
+        [
+            "strengthens the pawn structure",
+            "solidifies the pawn chain",
+            "creates a solid pawn formation",
+        ],
+        [
+            "creates a pawn weakness",
+            "weakens the pawn structure",
+            "leaves a backward pawn",
+            "isolates a pawn",
+        ],
+    ),
+    "Knights": (
+        ["centralises the knight", "places the knight on an outpost", "activates the knight"],
+        ["leaves the knight passive", "pushes the knight to the rim", "misplaces the knight"],
+    ),
+    "Bishops": (
+        [
+            "opens the bishop's diagonal",
+            "activates the bishop pair",
+            "improves long-range bishop scope",
+        ],
+        ["blocks the bishop's diagonal", "concedes the bishop pair", "buries the bishop"],
+    ),
+    "Rooks": (
+        ["opens a file for the rook", "activates the rook", "doubles rooks on an open file"],
+        ["leaves the rook passive", "keeps the rook bottled up", "closes the rook's file"],
+    ),
+    "Queens": (
+        ["activates the queen", "brings the queen into the game", "centralises the queen"],
+        ["restricts the queen", "misplaces the queen", "drives the queen offside"],
+    ),
+    "Mobility": (
+        ["gains piece activity", "frees the pieces", "improves piece coordination"],
+        ["restricts piece freedom", "reduces mobility", "cramps the position"],
+    ),
+    "King safety": (
+        ["improves king shelter", "shelters the king behind pawns", "tucks the king away safely"],
+        ["exposes the king", "weakens king cover", "opens lines toward the king"],
+    ),
+    "Threats": (
+        ["creates concrete threats", "sets up tactical threats", "generates dangerous counterplay"],
+        ["allows opponent threats", "permits tactical shots", "ignores a key threat"],
+    ),
+    "Passed": (
+        ["creates a passed pawn", "advances the passed pawn", "sets up a dangerous passer"],
+        ["neutralises the passed pawn", "blockades the passer", "eliminates the passed pawn"],
+    ),
+    "Space": (
+        ["gains central space", "advances in the centre", "claims more space"],
+        ["cedes space", "surrenders central control", "yields territory"],
+    ),
+    "Winnable": (
+        ["makes the position more decisive", "creates winning chances", "sharpens the position"],
+        ["steers toward a draw", "reduces winning chances", "simplifies toward equality"],
+    ),
+}
+
+
+def _interpret_terms(san: str, terms: list[tuple[str, float]], seed: int = 0) -> str:
+    """Turn SF15 term deltas into a one-line English interpretation for the thinking block."""
+    if not terms:
+        return ""
+    rng = random.Random(seed)
+    dom_term, dom_val = terms[0]
+    pos_phrases, neg_phrases = _TERM_PHRASES.get(
+        dom_term,
+        ([f"improves {dom_term.lower()}"], [f"reduces {dom_term.lower()}"]),
+    )
+    phrase_pool = pos_phrases if dom_val >= 0 else neg_phrases
+    interp = rng.choice(phrase_pool)
+    if len(terms) >= 2:
+        sec_term, sec_val = terms[1]
+        sp, sn = _TERM_PHRASES.get(
+            sec_term,
+            ([f"improves {sec_term.lower()}"], [f"reduces {sec_term.lower()}"]),
+        )
+        interp += ", " + rng.choice(sp if sec_val >= 0 else sn)
+    return interp
+
+
+def _build_thinking_v3(
+    fen: str,
+    root_cp: int | None,
+    board: chess.Board,
+    played_line_ann: list[tuple[str, str, list[tuple[str, float]]]],
+    played_eval_label: str,
+    engine_lines_ann: list[tuple[list[tuple[str, str, list[tuple[str, float]]]], str, int | None]],
+    best_cp: int | None,
+    student_cp: int | None,
+    classification: str,
+    cp_loss: int,
+    move_san: str,
+    candidates: list[tuple[str, str, int | None]],
+) -> str:
+    """Build structured per-line thinking block for RL reward verification.
+
+    Format is designed so key facts (CLASSIFICATION, VERDICT, per-line eval labels)
+    are extractable by regex without re-running the engine.
+    """
+    phase = _game_phase(board)
+    turn_str = "white" if board.turn == chess.WHITE else "black"
+
+    def _cp_to_wb_label(cp: int | None) -> str:
+        if cp is None:
+            return "forced mate"
+        if cp >= 200:
+            return "winning for white"
+        if cp >= 60:
+            return "good for white"
+        if cp >= -60:
+            return "equal"
+        if cp >= -200:
+            return "good for black"
+        return "winning for black"
+
+    eval_label_str = _cp_to_wb_label(root_cp)
+    lines = [
+        f"POSITION: {phase} | {turn_str} to move | eval: {eval_label_str}",
+        f"CLASSIFICATION: {move_san} is {classification}",
+        "",
+        "LINE analysis:",
+    ]
+
+    # Helper: render one annotated line block
+    def _render_line(
+        label: str,
+        ann_moves: list[tuple[str, str, list[tuple[str, float]]]],
+        eval_lbl: str,
+    ) -> None:
+        moves_str = " → ".join(san for san, _, _ in ann_moves)
+        lines.append(f"  {label}: {moves_str} | eval: {eval_lbl}")
+        for san, purpose, terms in ann_moves:
+            if terms:
+                terms_str = ", ".join(
+                    f"{t.lower()} {'+' if v >= 0 else '−'}{abs(v):.2f}" for t, v in terms
+                )
+                interp = _interpret_terms(san, terms, seed=hash(fen + san) & 0xFFFFFFFF)
+                lines.append(f"    {san}: {terms_str} → {interp}")
+            else:
+                lines.append(f"    {san}: (no notable term changes)")
+        # Net impact: summarise dominant theme from first move of line
+        if ann_moves:
+            first_san, _, first_terms = ann_moves[0]
+            if first_terms:
+                net = _interpret_terms(
+                    first_san, first_terms, seed=hash(fen + first_san + "net") & 0xFFFFFFFF
+                )
+                lines.append(f"    net: {net}")
+        lines.append("")
+
+    _render_line("PLAYED", played_line_ann, played_eval_label)
+
+    for idx, (ann_moves, eval_lbl, cp) in enumerate(engine_lines_ann):
+        _render_line(f"LINE {idx + 1}", ann_moves, eval_lbl)
+
+    # VERDICT line — extractable by regex
+    if best_cp is not None and engine_lines_ann:
+        best_ann = engine_lines_ann[0]
+        best_san = best_ann[0][0][0] if best_ann[0] else "?"
+        if cp_loss == 0:
+            verdict = f"{move_san} best."
+        else:
+            best_eval = (
+                _cp_to_wb_label(engine_lines_ann[0][2])
+                if engine_lines_ann[0][2] is not None
+                else ""
+            )
+            verdict = f"{move_san} is {classification}. {best_san} was better"
+            if best_eval:
+                verdict += f" ({best_eval})"
+            verdict += "."
+    else:
+        verdict = f"{move_san} is {classification}."
+    lines.append(f"VERDICT: {verdict}")
+
+    # COACHING FOCUS
+    if classification in ("best", "great"):
+        focus = f"reinforce the idea behind {move_san} — student played well."
+    elif classification == "good":
+        focus = f"note {move_san} is solid; briefly mention what {engine_lines_ann[0][0][0][0] if engine_lines_ann and engine_lines_ann[0][0] else 'the engine'} achieves differently."
+    else:
+        best_san_focus = (
+            engine_lines_ann[0][0][0][0]
+            if engine_lines_ann and engine_lines_ann[0][0]
+            else "the engine's suggestion"
+        )
+        focus = f"explain why {best_san_focus} is stronger and what concept {move_san} misses."
+    lines.append(f"COACHING FOCUS: {focus}")
+
+    return "\n".join(lines)
 
 
 def _build_played_line(
@@ -427,43 +650,69 @@ def convert_sample(
     if not candidates or not full_lines:
         return None
 
-    eval_str = (
-        "a forced mate sequence exists" if root_cp is None else _cp_to_label(root_cp, board.turn)
-    )
+    # Use white/black perspective for eval_str (not side-to-move relative)
+    def _wb_label(cp: int | None) -> str:
+        if cp is None:
+            return "a forced mate sequence exists"
+        if cp >= 200:
+            return "winning for white"
+        if cp >= 60:
+            return "good for white"
+        if cp >= -60:
+            return "roughly equal"
+        if cp >= -200:
+            return "good for black"
+        return "winning for black"
+
+    eval_str = _wb_label(root_cp)
 
     # Determine adaptive depth and number of engine lines
     line_depth, n_engine_lines = _line_params(spread_cp)
 
-    # Get the student's move cp (to classify it)
+    # Get the student's move cp and continuation from the already-computed full_lines PV.
+    # This avoids a second Stockfish call in the common case (student's move in top-6).
     student_cp = None
     best_cp = None
+    played_line_from_pv: list[tuple[str, str]] | None = None
     sign = 1 if board.turn == chess.WHITE else -1
     if full_lines:
-        _, _, best_cp = full_lines[0]  # best line cp
-    # Find student's move in the engine lines
+        _, _, best_cp = full_lines[0]
     for moves_info, eval_label, cp in full_lines:
         if moves_info and moves_info[0][0] == move_san:
             student_cp = cp
+            played_line_from_pv = moves_info
             break
-    # If not found, run a separate analysis for the student's move eval
+
+    # Fallback: shallow analysis only when student's move not in top-6
     if student_cp is None and root_cp is not None:
         engine = _get_engine()
-        board_after_copy = board_after.copy()
         try:
-            # Analyse from board_after to get side-to-move eval, then flip
-            res = engine.analyse(board_after_copy, chess.engine.Limit(depth=max(depth - 4, 8)))
+            res = engine.analyse(board_after.copy(), chess.engine.Limit(depth=8))
             sc = res.get("score")
             if sc and not sc.is_mate():
-                # After student's move, it's opponent's turn; flip to get White's perspective
                 student_cp = sc.white().score()
+            # Build played line from this shallow PV
+            pv = res.get("pv", [])
+            move_san_str = board.san(move)
+            move_purpose_str = _move_purpose(board, move)
+            played_fallback = [(move_san_str, move_purpose_str)]
+            lb = board_after.copy()
+            for mv in pv:
+                try:
+                    played_fallback.append((lb.san(mv), _move_purpose(lb, mv)))
+                    lb.push(mv)
+                except Exception:
+                    break
+            played_line_from_pv = played_fallback
         except Exception:
             pass
 
-    # Build PLAYED LINE: student's move + engine continuation
-    engine = _get_engine()
-    played_line_moves = _build_played_line(board, move, depth, engine)
-    played_line_truncated = played_line_moves[:line_depth]
-    played_line_str = " → ".join(m for m, p in played_line_truncated)
+    # If still no played line (very rare), build minimal one from the move itself
+    if not played_line_from_pv:
+        played_line_from_pv = [(board.san(move), _move_purpose(board, move))]
+
+    played_line_truncated = played_line_from_pv[:line_depth]
+    played_line_moves = played_line_from_pv  # kept for _build_comment_from_lines
 
     # Select engine alternative lines (skip if first move == student's move)
     engine_lines_selected = []
@@ -478,7 +727,7 @@ def convert_sample(
             break
 
     # Annotate each move in each line with SF15 classical eval term diffs.
-    # This is the core RL reward signal: rule-generated, grounded, human-readable.
+    # Terms go into the USER PROMPT as ground truth; model reasons over them in thinking.
     white_to_move = board.turn == chess.WHITE
     played_line_annotated = _annotate_line_with_sf15(played_line_truncated, fen, white_to_move)
     engine_lines_annotated = [
@@ -486,61 +735,76 @@ def convert_sample(
         for moves_info, eval_label, cp in engine_lines_selected
     ]
 
-    # Build prompt key_lines (plain SAN, no sentinels yet)
-    key_lines_for_prompt = []
-    assistant_lines_list = []
+    # Compute played eval label — white/black perspective (consistent with engine lines)
+    def _cp_to_wb(cp: int | None) -> str:
+        if cp is None:
+            return "equal"
+        if cp >= 200:
+            return "winning for white"
+        if cp >= 60:
+            return "good for white"
+        if cp >= -60:
+            return "equal"
+        if cp >= -200:
+            return "good for black"
+        return "winning for black"
 
-    # LINE 1 is always the PLAYED LINE
-    def _fmt_move(san: str, purpose: str, sf15: str) -> str:
-        base = f"{san} ({purpose}"
-        return f"{base}; {sf15})" if sf15 else f"{base})"
+    played_eval_label = _cp_to_wb(student_cp)
 
-    played_annotated = " → ".join(
-        _fmt_move(san, purpose, sf15) for san, purpose, sf15 in played_line_annotated
-    )
-    # Eval label for played line: use student_cp
-    played_eval_label = "equal"
-    if student_cp is not None:
-        if student_cp >= 200:
-            played_eval_label = "winning for white"
-        elif student_cp >= 60:
-            played_eval_label = "good for white"
-        elif student_cp >= -60:
-            played_eval_label = "equal"
-        elif student_cp >= -200:
-            played_eval_label = "good for black"
+    # Classify student move
+    classification = "good"
+    cp_loss = 0
+    sign = 1 if board.turn == chess.WHITE else -1
+    if student_cp is not None and best_cp is not None:
+        cp_loss = max(0, sign * (best_cp - student_cp))
+        if cp_loss == 0:
+            classification = "best"
+        elif cp_loss <= 10:
+            classification = "great"
+        elif cp_loss <= 30:
+            classification = "good"
+        elif cp_loss <= 100:
+            classification = "inaccuracy"
+        elif cp_loss <= 300:
+            classification = "mistake"
         else:
-            played_eval_label = "winning for black"
+            classification = "blunder"
 
-    assistant_lines_list.append(
-        f"<line>LINE 1: {played_annotated} | eval: {played_eval_label}</line>"
+    # Build user prompt with SF15 annotations inline — "san [term1 +val; term2 −val]"
+    def _fmt_user_move(san: str, terms: list[tuple[str, float]]) -> str:
+        if terms:
+            return f"{san} [{_fmt_terms(terms)}]"
+        return san
+
+    played_prompt_str = " → ".join(
+        _fmt_user_move(san, terms) for san, _, terms in played_line_annotated
+    )
+    key_lines_for_prompt = [
+        " → ".join(_fmt_user_move(san, terms) for san, _, terms in ann_moves)
+        for ann_moves, _, _ in engine_lines_annotated
+    ]
+
+    # Build thinking block: per-line structured analysis
+    thinking = _build_thinking_v3(
+        fen=fen,
+        root_cp=root_cp,
+        board=board,
+        played_line_ann=played_line_annotated,
+        played_eval_label=played_eval_label,
+        engine_lines_ann=engine_lines_annotated,
+        best_cp=best_cp,
+        student_cp=student_cp,
+        classification=classification,
+        cp_loss=cp_loss,
+        move_san=move_san,
+        candidates=candidates,
     )
 
-    # Engine alternative lines
-    for idx, (ann_moves, eval_label, cp) in enumerate(engine_lines_annotated):
-        sans_only = " → ".join(san for san, _, _ in ann_moves)
-        key_lines_for_prompt.append(sans_only)
-
-        annotated_moves = " → ".join(
-            _fmt_move(san, purpose, sf15) for san, purpose, sf15 in ann_moves
-        )
-        assistant_lines_list.append(
-            f"<line>LINE {idx + 2}: {annotated_moves} | eval: {eval_label}</line>"
-        )
-
-    # Use LLM-grounded comment if available, else fall back to deterministic comment
-    if llm_comment:
-        comment = llm_comment
-    else:
-        comment = _build_comment_from_lines(
-            board,
-            move_san,
-            played_line_moves,
-            [(moves_info, eval_label, cp) for moves_info, eval_label, cp in engine_lines_selected],
-            root_cp,
-            best_cp,
-            student_cp,
-        )
+    # Skip samples without an LLM-generated coaching comment — deterministic fallbacks
+    # are low quality and pollute the training set.
+    if not llm_comment:
+        return None
+    comment = llm_comment
 
     user_content = format_joint_user_prompt(
         board_str,
@@ -550,15 +814,11 @@ def convert_sample(
         facts,
         board_after_str,
         fen_after,
-        played_line=played_line_str,
+        played_line=played_prompt_str,
         key_lines=key_lines_for_prompt,
     )
 
-    thinking = _build_thinking(fen, root_cp, candidates, rng)
-
-    assistant_content = f"<think>\n{thinking}\n</think>\n"
-    assistant_content += "\n".join(assistant_lines_list)
-    assistant_content += f"\n\n{comment}"
+    assistant_content = f"<think>\n{thinking}\n</think>\n\n{comment}"
 
     return {
         "messages": [
@@ -570,9 +830,10 @@ def convert_sample(
             "source": "textbook_joint_sft",
             "fen": fen,
             "move_san": move_san,
-            "classification": "best" if student_cp == best_cp else "other",
+            "classification": classification,
+            "cp_loss": cp_loss,
             "spread_cp": spread_cp,
-            "n_lines": len(assistant_lines_list),
+            "n_lines": 1 + len(engine_lines_annotated),
         },
     }
 
@@ -582,14 +843,14 @@ def main() -> None:
     parser.add_argument("--train-data", default="data/processed/train.jsonl")
     parser.add_argument(
         "--comments-cache",
-        default=None,
+        default="data/processed/.phase2_comments_cache.jsonl",
         help="Path to .phase2_comments_cache.jsonl from generate_phase2_comments.py",
     )
     parser.add_argument("--output", default="data/processed/lines_joint_sft.jsonl")
     parser.add_argument("--eval-output", default="data/processed/lines_joint_sft_eval.jsonl")
     parser.add_argument("--eval-split", type=float, default=0.05)
-    parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--depth", type=int, default=18)
+    parser.add_argument("--workers", type=int, default=20)
+    parser.add_argument("--depth", type=int, default=14)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--include-mate", action="store_true", help="Include MATE dataset positions"
@@ -731,7 +992,7 @@ def main() -> None:
         meta = rec.get("metadata", {})
         fen = meta.get("fen", "")
         move_uci = meta.get("move_uci", "")
-        k = hashlib.md5(f"llm10:{fen}:{move_uci}".encode()).hexdigest()
+        k = hashlib.md5(f"llm19:{fen}:{move_uci}".encode()).hexdigest()
         return comments_cache.get(k)
 
     train_tagged = [(s, args.depth, args.seed, _get_llm_comment(s), "train") for s in train_samples]
@@ -749,7 +1010,7 @@ def main() -> None:
     written = {"train": 0, "eval": 0}
     failed = {"train": 0, "eval": 0}
 
-    ctx = multiprocessing.get_context("spawn")
+    ctx = multiprocessing.get_context("fork")
     with (
         train_out.open("w", encoding="utf-8") as f_train,
         eval_out.open("w", encoding="utf-8") as f_eval,

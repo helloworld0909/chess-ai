@@ -54,13 +54,13 @@ def _send(proc: subprocess.Popen, cmd: str) -> None:
 
 
 def _read_eval_output(proc: subprocess.Popen) -> str:
-    """Read until the eval table sentinel line."""
+    """Read until SF15 eval output sentinel line."""
     assert proc.stdout
     lines: list[str] = []
     for line in proc.stdout:
         lines.append(line)
-        # SF15 eval ends with a blank line after the total row
-        if "Total evaluation" in line:
+        # SF15 ends with "Final evaluation" after the classical+NNUE breakdown
+        if "Final evaluation" in line:
             break
     return "\n".join(lines)
 
@@ -71,19 +71,19 @@ _TERMS = [
     "Imbalance",
     "Pawns",
     "Knights",
-    "Bishop",
+    "Bishops",
     "Rooks",
     "Queens",
     "Mobility",
     "King safety",
     "Threats",
-    "Passed pawns",
+    "Passed",
     "Space",
     "Winnable",
 ]
 
 _ROW_RE = re.compile(
-    r"^\s*(?P<term>[A-Za-z ]+?)\s*\|"
+    r"^\|\s*(?P<term>[A-Za-z ]+?)\s*\|"
     r"\s*(?P<wm>[-0-9.]+|-+)\s+(?P<we>[-0-9.]+|-+)\s*\|"
     r"\s*(?P<bm>[-0-9.]+|-+)\s+(?P<be>[-0-9.]+|-+)\s*\|",
 )

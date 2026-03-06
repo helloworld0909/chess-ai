@@ -143,34 +143,39 @@ def board_ascii(board: chess.Board) -> str:
 
 JOINT_SYSTEM_PROMPT = (
     "You are an expert chess coach analysing a student's game move by move.\n\n"
-    "You will receive the board position, the student's move, and a set of engine key lines "
-    "as sequences of board positions. Each move in the key lines is shown as a board embedding "
-    "followed by the SAN notation. The first line (PLAYED LINE) shows what happens when the "
-    "student's move is played; the remaining lines are the engine's top alternatives.\n\n"
-    "Your task has two parts:\n\n"
-    "PART 1 — Annotate the engine lines:\n"
-    "Output one annotated <line> block per key line shown, in the same order, using this format:\n"
-    "<line>LINE 1: move (purpose) → move (purpose) → ... | eval: <label></line>\n"
-    "<line>LINE 2: move (purpose) → move (purpose) → ... | eval: <label></line>\n"
-    "... (one block per line provided)\n\n"
-    "Rules for annotation:\n"
-    "- Copy the moves exactly as shown in the Engine Key Lines — do not invent or change them\n"
-    "- Add a purpose annotation in parentheses for each move explaining the idea\n"
-    "- The eval label covers the final position from White's perspective:\n"
-    "  winning for white | good for white | equal | good for black | winning for black\n"
-    "- Do not include raw centipawn numbers anywhere\n\n"
-    "PART 2 — Coaching comment:\n"
-    "After the annotated lines, write a 2-8 sentence coaching comment directly to the student. "
-    "The comment must:\n"
-    "- Be grounded in the lines you just annotated — reference specific moves or ideas from them\n"
+    "You will receive the board position, the student's move, and a set of engine key lines. "
+    "Each move in the key lines is shown as a board embedding (representing that board state) "
+    "followed by the SAN notation and SF15 classical eval term changes in brackets, e.g.:\n"
+    "  Nd5 [mobility +0.32; king safety −0.15]\n"
+    "The first line (PLAYED LINE) shows what happens when the student's move is played; "
+    "the remaining lines are the engine's top alternatives.\n\n"
+    "Your task:\n\n"
+    "THINKING — analyse every line:\n"
+    "In your thinking block, work through each line systematically:\n"
+    "  POSITION: <phase> | <side> to move | eval: <label> (<N> cp)\n"
+    "  CLASSIFICATION: <san> is <class> (<N> cp loss)\n"
+    "  LINE analysis:\n"
+    "    PLAYED: <moves> | eval: <label>\n"
+    "      <san>: <term> <sign><val>, <term> <sign><val> → <one-line interpretation>\n"
+    "      ...\n"
+    "      net: <overall impact in one phrase>\n"
+    "    LINE 1: <moves> | eval: <label>\n"
+    "      <san>: <terms> → <interpretation>\n"
+    "      net: <impact>\n"
+    "    ... (one entry per line provided)\n"
+    "  VERDICT: <san> <class> (<N> cp loss). <alt_san> was <description> (−<N> cp).\n"
+    "  COACHING FOCUS: <one sentence on what to emphasise to the student>\n\n"
+    "COACHING COMMENT — after your thinking:\n"
+    "Write one paragraph (3-5 sentences) as a coaching comment directly to the student. The comment must:\n"
+    "- Be grounded in the line analysis above — reference specific moves or ideas\n"
     "- Address the quality of the student's move relative to the engine alternatives\n"
-    "- Explain what the key strategic or tactical idea is in this position\n"
+    "- Explain the key strategic or tactical idea in this position\n"
     "- Be written in second person ('You play Nd5…') — never use first person\n"
-    "- Not parrot the classification label or raw eval numbers\n\n"
-    "Output format (after your thinking):\n"
-    "<line>LINE 1: ...</line>\n"
-    "...\n"
-    "<line>LINE N: ...</line>\n\n"
+    "- Not repeat raw numbers from the eval terms\n\n"
+    "Output format:\n"
+    "<think>\n"
+    "[structured line analysis]\n"
+    "</think>\n"
     "[coaching comment]"
 )
 
@@ -186,13 +191,13 @@ def format_joint_user_prompt(
     played_line: str | None = None,
     key_lines: list[str] | None = None,
 ) -> str:
-    """Build the user message for the joint annotation + coaching task (Phase 2).
+    """Build the user message for the joint thinking + coaching task (Phase 2).
 
-    played_line: SAN line string starting from the student's move, e.g.:
-        "Ne5 → d4 → Nc6 → Bxe5"  (student move first, then engine response)
-    key_lines: list of plain SAN alternative line strings, e.g.:
-        ["Nd5 → e4 → Nc3 → d5", "Nf6 → g5 → Bg2 → h4", ...]
-    Sentinels are injected later by _inject_move_tokens in the train script.
+    played_line: annotated line string starting from the student's move, e.g.:
+        "Ne5 [mobility +0.32; threats +0.18] → d4 [space +0.21] → ..."
+    key_lines: list of annotated alternative line strings with the same format.
+    Sentinels are injected later by _inject_move_tokens in the train script
+    (one sentinel per SAN, positioned before the SAN + bracket annotation).
     """
     fen_line = f"FEN: {fen}\n" if fen else ""
     position_section = f"## Position\n\nBoard before the move:\n{board_ascii_str}\n{fen_line}\n"
@@ -212,15 +217,15 @@ def format_joint_user_prompt(
     if played_line:
         all_lines.append(f"PLAYED LINE: {played_line}")
     if key_lines:
-        for i, l in enumerate(key_lines):
-            all_lines.append(f"Line {i + 1}: {l}")
+        for i, line in enumerate(key_lines):
+            all_lines.append(f"Line {i + 1}: {line}")
     if all_lines:
         lines_section = "## Engine Key Lines\n\n" + "\n".join(all_lines) + "\n\n"
 
     task_section = (
         "## Task\n\n"
-        "Annotate each engine key line with move purposes, then give a coaching comment "
-        "to the student about their move."
+        "Analyse each engine key line using the SF15 eval term changes shown, "
+        "then give a coaching comment to the student about their move."
     )
 
     return f"{position_section}{move_section}{facts_section}{lines_section}{task_section}"
