@@ -46,8 +46,7 @@ from data.pipeline.convert_lines_to_sft_thinking import (
     _get_engine,
     _move_purpose,
 )
-
-from data.pipeline.sf15_eval import get_eval_diff
+from data.pipeline.sf15_eval import get_eval_diff, get_sf15_eval
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -56,6 +55,75 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Adaptive line sampling parameters
 # ---------------------------------------------------------------------------
+
+
+def _sf15_annotation(term_diffs: dict[str, float]) -> str:
+    """Convert notable SF15 term diffs into a compact annotation string.
+
+    Only terms with |diff| >= 0.10 are included.  Terms are sorted by
+    absolute magnitude so the most impactful appear first.
+    Example output: "king safety −0.45, mobility +0.21"
+    """
+    notable = [(abs(d), term, d) for term, d in term_diffs.items() if abs(d) >= 0.10]
+    if not notable:
+        return ""
+    notable.sort(reverse=True)
+    parts = []
+    for _, term, d in notable[:3]:  # cap at 3 terms to keep annotations concise
+        sign = "+" if d >= 0 else "−"
+        parts.append(f"{term.lower()} {sign}{abs(d):.2f}")
+    return "; ".join(parts)
+
+
+def _annotate_line_with_sf15(
+    moves: list[tuple[str, str]],
+    start_fen: str,
+    white_to_move_at_start: bool,
+) -> list[tuple[str, str, str]]:
+    """Walk a line of (san, purpose) pairs and attach SF15 term annotations.
+
+    Returns list of (san, purpose, sf15_annotation) triples.
+    sf15_annotation is empty string when SF15 is unavailable or diff is tiny.
+    """
+    result: list[tuple[str, str, str]] = []
+    board = chess.Board(start_fen)
+    try:
+        eval_before = get_sf15_eval(start_fen)
+    except Exception:
+        # SF15 not available — return unannotated
+        return [(san, purpose, "") for san, purpose in moves]
+
+    for san, purpose in moves:
+        # Push the move to get fen_after
+        try:
+            move = board.parse_san(san)
+            white_moved = board.turn == chess.WHITE
+            board.push(move)
+            fen_after = board.fen()
+        except Exception:
+            result.append((san, purpose, ""))
+            continue
+
+        try:
+            eval_after = get_sf15_eval(fen_after)
+            diffs: dict[str, float] = {}
+            for term in eval_before:
+                if term not in eval_after:
+                    continue
+                adv_before = eval_before[term]["White"] - eval_before[term]["Black"]
+                adv_after = eval_after[term]["White"] - eval_after[term]["Black"]
+                delta = adv_after - adv_before
+                if not white_moved:
+                    delta = -delta
+                diffs[term] = round(delta, 2)
+            annotation = _sf15_annotation(diffs)
+        except Exception:
+            annotation = ""
+
+        result.append((san, purpose, annotation))
+        eval_before = eval_after  # chain: next move's "before" is this move's "after"
+
+    return result
 
 
 def _line_params(spread_cp: int) -> tuple[int, int]:
@@ -352,20 +420,6 @@ def convert_sample(
         return None
     board_after_str = board_ascii(board_after)
     fen_after = board_after.fen()
-    
-    try:
-        eval_diffs = get_eval_diff(fen, fen_after, board.turn == chess.WHITE)
-        notable_diffs = []
-        for term, diff in eval_diffs.items():
-            if abs(diff) >= 0.1:
-                # Add human readable terms matching the paper's style
-                notable_diffs.append(f"{term.lower()} {diff:+.2f}")
-        
-        if notable_diffs:
-            diff_str = ", ".join(notable_diffs)
-            facts.append(f"After your move: {diff_str}")
-    except Exception as e:
-        log.warning(f"Failed to get sf15 eval diffs: {e}")
 
     # Run Stockfish analysis from the pre-move position
     root_cp, candidates, full_lines, spread_cp = _analyze_full_lines(fen, depth=depth, multipv=6)
@@ -423,12 +477,27 @@ def convert_sample(
         if len(engine_lines_selected) >= n_engine_lines:
             break
 
+    # Annotate each move in each line with SF15 classical eval term diffs.
+    # This is the core RL reward signal: rule-generated, grounded, human-readable.
+    white_to_move = board.turn == chess.WHITE
+    played_line_annotated = _annotate_line_with_sf15(played_line_truncated, fen, white_to_move)
+    engine_lines_annotated = [
+        (_annotate_line_with_sf15(moves_info, fen, white_to_move), eval_label, cp)
+        for moves_info, eval_label, cp in engine_lines_selected
+    ]
+
     # Build prompt key_lines (plain SAN, no sentinels yet)
     key_lines_for_prompt = []
     assistant_lines_list = []
 
     # LINE 1 is always the PLAYED LINE
-    played_annotated = " → ".join(f"{m} ({p})" for m, p in played_line_truncated)
+    def _fmt_move(san: str, purpose: str, sf15: str) -> str:
+        base = f"{san} ({purpose}"
+        return f"{base}; {sf15})" if sf15 else f"{base})"
+
+    played_annotated = " → ".join(
+        _fmt_move(san, purpose, sf15) for san, purpose, sf15 in played_line_annotated
+    )
     # Eval label for played line: use student_cp
     played_eval_label = "equal"
     if student_cp is not None:
@@ -448,11 +517,13 @@ def convert_sample(
     )
 
     # Engine alternative lines
-    for idx, (moves_info, eval_label, cp) in enumerate(engine_lines_selected):
-        sans_only = " → ".join(m for m, p in moves_info)
+    for idx, (ann_moves, eval_label, cp) in enumerate(engine_lines_annotated):
+        sans_only = " → ".join(san for san, _, _ in ann_moves)
         key_lines_for_prompt.append(sans_only)
 
-        annotated_moves = " → ".join(f"{m} ({p})" for m, p in moves_info)
+        annotated_moves = " → ".join(
+            _fmt_move(san, purpose, sf15) for san, purpose, sf15 in ann_moves
+        )
         assistant_lines_list.append(
             f"<line>LINE {idx + 2}: {annotated_moves} | eval: {eval_label}</line>"
         )
@@ -520,7 +591,9 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--depth", type=int, default=18)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--include-mate", action="store_true", help="Include MATE dataset positions")
+    parser.add_argument(
+        "--include-mate", action="store_true", help="Include MATE dataset positions"
+    )
     parser.add_argument("--mate-comments-cache", default="data/processed/mate_comments_cache.jsonl")
     args = parser.parse_args()
 
@@ -571,38 +644,47 @@ def main() -> None:
 
     if args.include_mate:
         try:
-            from datasets import load_dataset
             import re
-            
+
+            from datasets import load_dataset
+
             mate_comments = {}
             mate_cache_path = Path(args.mate_comments_cache)
             if mate_cache_path.exists():
                 with mate_cache_path.open() as f:
                     for line in f:
-                        if not line.strip(): continue
+                        if not line.strip():
+                            continue
                         rec = json.loads(line)
                         k = f"{rec['fen']}_{rec['move_uci']}"
-                        mate_comments[k] = rec['comment']
+                        mate_comments[k] = rec["comment"]
                 log.info("Loaded %d MATE LLM comments from cache", len(mate_comments))
-            
+
             ds = load_dataset("OutFlankShu/MATE_DATASET", data_files="both.zip", split="train")
-            
+
             def parse_mate_input(input_text: str, output_text: str):
                 fen_match = re.search(r'FEN of the given chess board is "(.*?)".', input_text)
                 fen = fen_match.group(1) if fen_match else ""
-                
-                move_a_match = re.search(r'MoveA:(\w+),\s*(.*?)\s*TacticA:\s*(.*?)\s*MoveB:', input_text, re.DOTALL)
-                move_b_match = re.search(r'MoveB:(\w+),\s*(.*?)\s*TacticB:\s*(.*)', input_text, re.DOTALL)
-                
+
+                move_a_match = re.search(
+                    r"MoveA:(\w+),\s*(.*?)\s*TacticA:\s*(.*?)\s*MoveB:", input_text, re.DOTALL
+                )
+                move_b_match = re.search(
+                    r"MoveB:(\w+),\s*(.*?)\s*TacticB:\s*(.*)", input_text, re.DOTALL
+                )
+
                 if not move_a_match or not move_b_match:
                     return None
-                    
+
                 move_a = move_a_match.group(1)
                 tactic_a = move_a_match.group(3).strip()
                 move_b = move_b_match.group(1)
                 tactic_b = move_b_match.group(3).strip()
-                
-                return fen, [{"move": move_a, "tactic": tactic_a}, {"move": move_b, "tactic": tactic_b}]
+
+                return fen, [
+                    {"move": move_a, "tactic": tactic_a},
+                    {"move": move_b, "tactic": tactic_b},
+                ]
 
             mate_samples = []
             for i, row in enumerate(ds):
@@ -614,15 +696,17 @@ def main() -> None:
                 for m in moves:
                     k = f"{fen}_{m['move']}"
                     if k in mate_comments:
-                        mate_samples.append({
-                            "metadata": {
-                                "source": "mate_dataset",
-                                "fen": fen,
-                                "move_uci": m["move"],
-                                "llm_comment": mate_comments[k]
+                        mate_samples.append(
+                            {
+                                "metadata": {
+                                    "source": "mate_dataset",
+                                    "fen": fen,
+                                    "move_uci": m["move"],
+                                    "llm_comment": mate_comments[k],
+                                }
                             }
-                        })
-            
+                        )
+
             log.info("Loaded %d MATE positions with cached comments", len(mate_samples))
             all_samples.extend(mate_samples)
         except Exception as e:
@@ -640,7 +724,7 @@ def main() -> None:
         source = rec.get("metadata", {}).get("source", "")
         if source == "mate_dataset":
             return rec.get("metadata", {}).get("llm_comment")
-            
+
         if not comments_cache:
             return None
 
