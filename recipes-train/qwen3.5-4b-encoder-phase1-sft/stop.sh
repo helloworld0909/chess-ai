@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop Qwen3-4B Encoder Phase 1 SFT training
+# Stop Qwen3.5-4B Encoder Phase 1 SFT training
 
 set -euo pipefail
 

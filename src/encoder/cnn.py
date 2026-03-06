@@ -38,7 +38,7 @@ class ChessEncoder(nn.Module):
         in_channels: int = 38,
         hidden_size: int = 256,
         num_blocks: int = 10,
-        out_dim: int = 2560,  # Qwen3-4B hidden size
+        out_dim: int = 2560,  # Qwen3.5-4B hidden size
     ):
         """Build a 10-block PyTorch ResNet to produce a single soft token.
 

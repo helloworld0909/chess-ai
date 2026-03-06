@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop SFT training — Qwen3-4B-Thinking-2507
+# Stop SFT training — Qwen3.5-4B-Thinking-2507
 
 PID_FILE="/tmp/chess-train.pid"
 

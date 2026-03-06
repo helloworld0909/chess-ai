@@ -1,14 +1,14 @@
-"""SFT training — Qwen3-4B-Thinking-2507 + QLoRA (8-bit, r=64).
+"""SFT training — Qwen3.5-4B-Thinking-2507 + QLoRA (8-bit, r=64).
 
 Parallelism: DDP (torchrun --nproc_per_node=2)
   Each GPU holds a full model copy; Trainer synchronises gradients.
 
 Usage (via recipe):
-    ./recipes-train/qwen3-4b-sft/start.sh
+    ./recipes-train/qwen3.5-4b-sft/start.sh
 
 Direct:
-    torchrun --nproc_per_node=2 recipes-train/qwen3-4b-sft/train.py \\
-        --config recipes-train/qwen3-4b-sft/config.yaml
+    torchrun --nproc_per_node=2 recipes-train/qwen3.5-4b-sft/train.py \\
+        --config recipes-train/qwen3.5-4b-sft/config.yaml
 """
 
 import argparse
@@ -26,7 +26,7 @@ _logger = logging.getLogger(__name__)
 
 
 def setup(config_path: str):
-    """Load Qwen3-4B with 8-bit QLoRA for DDP training."""
+    """Load Qwen3.5-4B with 8-bit QLoRA for DDP training."""
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -81,7 +81,7 @@ def setup(config_path: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", "-c", default="recipes-train/qwen3-4b-sft/config.yaml")
+    parser.add_argument("--config", "-c", default="recipes-train/qwen3.5-4b-sft/config.yaml")
     parser.add_argument("--resume", nargs="?", const=True, default=None, metavar="CHECKPOINT_DIR")
     args = parser.parse_args()
 

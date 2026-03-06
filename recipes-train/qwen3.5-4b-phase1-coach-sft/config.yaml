@@ -1,9 +1,9 @@
-# Training configuration for Qwen3-4B-Thinking POC
+# Training configuration for Qwen3.5-4B-Thinking POC
 # Chess Tutor SFT with QLoRA
 
 # Model settings
 model:
-  model_name: "Qwen/Qwen3-4B-Thinking-2507"
+  model_name: "Qwen/Qwen3.5-4B-Instruct"
   quantization: "8bit"
   attn_implementation: "sdpa"
   torch_dtype: bfloat16
@@ -59,7 +59,7 @@ training:
   seed: 42
 
 # Output
-output_dir: checkpoints/qwen3-4b-phase1-coach-sft
+output_dir: checkpoints/qwen3.5-4b-phase1-coach-sft
 
 # Wandb
 wandb:

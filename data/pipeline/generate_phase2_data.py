@@ -47,6 +47,8 @@ from data.pipeline.convert_lines_to_sft_thinking import (
     _move_purpose,
 )
 
+from data.pipeline.sf15_eval import get_eval_diff
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
@@ -350,6 +352,20 @@ def convert_sample(
         return None
     board_after_str = board_ascii(board_after)
     fen_after = board_after.fen()
+    
+    try:
+        eval_diffs = get_eval_diff(fen, fen_after, board.turn == chess.WHITE)
+        notable_diffs = []
+        for term, diff in eval_diffs.items():
+            if abs(diff) >= 0.1:
+                # Add human readable terms matching the paper's style
+                notable_diffs.append(f"{term.lower()} {diff:+.2f}")
+        
+        if notable_diffs:
+            diff_str = ", ".join(notable_diffs)
+            facts.append(f"After your move: {diff_str}")
+    except Exception as e:
+        log.warning(f"Failed to get sf15 eval diffs: {e}")
 
     # Run Stockfish analysis from the pre-move position
     root_cp, candidates, full_lines, spread_cp = _analyze_full_lines(fen, depth=depth, multipv=6)
@@ -504,6 +520,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--depth", type=int, default=18)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--include-mate", action="store_true", help="Include MATE dataset positions")
+    parser.add_argument("--mate-comments-cache", default="data/processed/mate_comments_cache.jsonl")
     args = parser.parse_args()
 
     train_path = Path(args.train_data)
@@ -551,6 +569,65 @@ def main() -> None:
 
     log.info("Loaded %d textbook positions", len(all_samples))
 
+    if args.include_mate:
+        try:
+            from datasets import load_dataset
+            import re
+            
+            mate_comments = {}
+            mate_cache_path = Path(args.mate_comments_cache)
+            if mate_cache_path.exists():
+                with mate_cache_path.open() as f:
+                    for line in f:
+                        if not line.strip(): continue
+                        rec = json.loads(line)
+                        k = f"{rec['fen']}_{rec['move_uci']}"
+                        mate_comments[k] = rec['comment']
+                log.info("Loaded %d MATE LLM comments from cache", len(mate_comments))
+            
+            ds = load_dataset("OutFlankShu/MATE_DATASET", data_files="both.zip", split="train")
+            
+            def parse_mate_input(input_text: str, output_text: str):
+                fen_match = re.search(r'FEN of the given chess board is "(.*?)".', input_text)
+                fen = fen_match.group(1) if fen_match else ""
+                
+                move_a_match = re.search(r'MoveA:(\w+),\s*(.*?)\s*TacticA:\s*(.*?)\s*MoveB:', input_text, re.DOTALL)
+                move_b_match = re.search(r'MoveB:(\w+),\s*(.*?)\s*TacticB:\s*(.*)', input_text, re.DOTALL)
+                
+                if not move_a_match or not move_b_match:
+                    return None
+                    
+                move_a = move_a_match.group(1)
+                tactic_a = move_a_match.group(3).strip()
+                move_b = move_b_match.group(1)
+                tactic_b = move_b_match.group(3).strip()
+                
+                return fen, [{"move": move_a, "tactic": tactic_a}, {"move": move_b, "tactic": tactic_b}]
+
+            mate_samples = []
+            for i, row in enumerate(ds):
+                # Process a reasonable subset if needed, but we limit to cached comments
+                parsed = parse_mate_input(row["input"], row["output"])
+                if not parsed:
+                    continue
+                fen, moves = parsed
+                for m in moves:
+                    k = f"{fen}_{m['move']}"
+                    if k in mate_comments:
+                        mate_samples.append({
+                            "metadata": {
+                                "source": "mate_dataset",
+                                "fen": fen,
+                                "move_uci": m["move"],
+                                "llm_comment": mate_comments[k]
+                            }
+                        })
+            
+            log.info("Loaded %d MATE positions with cached comments", len(mate_samples))
+            all_samples.extend(mate_samples)
+        except Exception as e:
+            log.warning("Failed to load MATE dataset: %s", e)
+
     rng = random.Random(args.seed)
     rng.shuffle(all_samples)
     n_eval = max(1, int(len(all_samples) * args.eval_split))
@@ -560,6 +637,10 @@ def main() -> None:
     log.info("Split: %d train / %d eval", len(train_samples), len(eval_samples))
 
     def _get_llm_comment(rec: dict[str, Any]) -> str | None:
+        source = rec.get("metadata", {}).get("source", "")
+        if source == "mate_dataset":
+            return rec.get("metadata", {}).get("llm_comment")
+            
         if not comments_cache:
             return None
 

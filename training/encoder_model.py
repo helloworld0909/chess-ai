@@ -1,4 +1,4 @@
-"""Wrapper module coupling Qwen3-4B with the ChessEncoder trunk."""
+"""Wrapper module coupling Qwen3.5-4B with the ChessEncoder trunk."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from src.encoder.cnn import ChessEncoder
 
 
 class ChessLMWithEncoder(nn.Module):
-    """Combines a base LLM (e.g., Qwen3-4B) with a ResNet board encoder.
+    """Combines a base LLM (e.g., Qwen3.5-4B) with a ResNet board encoder.
 
     The encoder processes 38-channel 8x8 spatial tensors (before+after board)
     and injects them as CNN embeddings directly into the token embedding sequence

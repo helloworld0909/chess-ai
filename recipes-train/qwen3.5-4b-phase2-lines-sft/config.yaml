@@ -1,11 +1,11 @@
-# Line-generator SFT — Qwen3-4B-Thinking-2507 + QLoRA (8-bit, r=64)
+# Line-generator SFT — Qwen3.5-4B-Thinking-2507 + QLoRA (8-bit, r=64)
 # Teaches the model the <line> output format AND pseudo-thinking scaffold before GRPO.
 # DDP: 2× RTX 5090  |  28k train / 1.4k eval
-# NOTE: starts from base Qwen3-4B — <think> blocks included in SFT loss so the
+# NOTE: starts from base Qwen3.5-4B — <think> blocks included in SFT loss so the
 #       model learns to produce structured thinking before GRPO refines it.
 
 model:
-  model_name: "Qwen/Qwen3-4B-Thinking-2507"
+  model_name: "Qwen/Qwen3.5-4B-Instruct"
   quantization: "8bit"
   attn_implementation: "sdpa"
   torch_dtype: bfloat16
@@ -59,7 +59,7 @@ training:
 
   seed: 42
 
-output_dir: checkpoints/qwen3-4b-phase2-lines-sft
+output_dir: checkpoints/qwen3.5-4b-phase2-lines-sft
 
 wandb:
   enabled: false

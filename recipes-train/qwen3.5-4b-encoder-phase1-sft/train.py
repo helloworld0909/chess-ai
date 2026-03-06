@@ -186,7 +186,7 @@ def setup_encoder_model(config_path: str) -> tuple:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", "-c", default="recipes-train/qwen3-4b-encoder-phase1-sft/config.yaml"
+        "--config", "-c", default="recipes-train/qwen3.5-4b-encoder-phase1-sft/config.yaml"
     )
     parser.add_argument("--resume", nargs="?", const=True, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -201,7 +201,7 @@ def main() -> None:
 
         wandb.init(
             project=wandb_cfg.get("project", "chess-tutor"),
-            name=wandb_cfg.get("name", "qwen3-4b-encoder-phase1-sft"),
+            name=wandb_cfg.get("name", "qwen3.5-4b-encoder-phase1-sft"),
             tags=wandb_cfg.get("tags", ["encoder-sft"]),
         )
 

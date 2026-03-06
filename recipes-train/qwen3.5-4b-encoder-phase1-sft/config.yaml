@@ -1,12 +1,12 @@
-# Qwen3-4B Encoder Phase 1 SFT — Joint annotation + coaching task
-# Qwen3-4B + pretrained ChessEncoder (72M params) + QLoRA
+# Qwen3.5-4B Encoder Phase 1 SFT — Joint annotation + coaching task
+# Qwen3.5-4B + pretrained ChessEncoder (72M params) + QLoRA
 # Joint task: model sees student move + engine key lines as board embeddings in
 # the user prompt; outputs annotated lines + coaching comment (pure text, no sentinels).
 # Dataset: lines_joint_sft (~31k textbook positions with Stockfish lines + expert coaching comments)
 # DDP: 2× RTX 5090  |  effective batch = 84 (1 × 2 GPUs × 42)
 
 model:
-  model_name: "Qwen/Qwen3-4B-Thinking-2507"
+  model_name: "Qwen/Qwen3.5-4B-Instruct"
   quantization: "8bit"
   attn_implementation: "sdpa"
   torch_dtype: bfloat16
@@ -66,10 +66,10 @@ training:
 
   seed: 42
 
-output_dir: checkpoints/qwen3-4b-encoder-phase1-sft
+output_dir: checkpoints/qwen3.5-4b-encoder-phase1-sft
 
 wandb:
   enabled: false
   project: "chess-tutor"
-  name: "qwen3-4b-encoder-phase1-sft"
+  name: "qwen3.5-4b-encoder-phase1-sft"
   tags: ["encoder-sft", "phase1-sft", "joint-task"]

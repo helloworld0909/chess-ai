@@ -273,12 +273,12 @@ If Stage 2 GRPO is needed:
 
 ### Phase 1 — Coach SFT ✅ DONE
 - [x] `data/pipeline/generate_lines.py` — pull Lichess games, extract positions, run Stockfish
-- [x] Coach SFT: `recipes-train/qwen3-4b-phase1-coach-sft/` → `checkpoints/qwen3-4b-phase1-coach-sft/`
+- [x] Coach SFT: `recipes-train/qwen3.5-4b-phase1-coach-sft/` → `checkpoints/qwen3.5-4b-phase1-coach-sft/`
 
 ### Phase 2 — Line Generator SFT (in progress)
 - [x] Training data: `data/processed/lines_sft.jsonl` (28k), `lines_sft_eval.jsonl` (1.5k)
-- [x] Recipe: `recipes-train/qwen3-4b-phase2-lines-sft/` — starts from Phase 1 checkpoint-1230
-- [ ] Wait for training to complete → `checkpoints/qwen3-4b-phase2-lines-sft/`
+- [x] Recipe: `recipes-train/qwen3.5-4b-phase2-lines-sft/` — starts from Phase 1 checkpoint-1230
+- [ ] Wait for training to complete → `checkpoints/qwen3.5-4b-phase2-lines-sft/`
 
 ### Phase 3 — GRPO on Line Generator (next)
 Improve line quality with verifiable Stockfish rewards. Starts from Phase 2 checkpoint.
@@ -287,7 +287,7 @@ GRPO generates rollouts on the fly — no new SFT data needed. Uses existing
 - [ ] `src/verification/rewards.py` — R1 legality (gate), R2 eval accuracy, R3a annotation,
   R4 depth, R5 breadth, R6 opponent quality, R7 relevance
   R1=hard gate (-1.0 if illegal, skip rest), R2=0.28, R3a=0.12, R4=0.10, R5=0.10, R6=0.10, R7=0.05
-- [ ] `recipes-train/qwen3-4b-phase3-grpo/` — already has config skeleton, wire up rewards
+- [ ] `recipes-train/qwen3.5-4b-phase3-grpo/` — already has config skeleton, wire up rewards
 - [ ] Start from Phase 2 final checkpoint (update `config.yaml` when Phase 2 completes)
 
 ### ❌ No combined Phase 3 SFT
@@ -314,6 +314,6 @@ GRPO generates rollouts on the fly — no new SFT data needed. Uses existing
 ## ✅ Phase 2 Base Model — RESOLVED
 
 **Decision**: Sequential training. Phase 2 now starts from Phase 1 checkpoint.
-`recipes-train/qwen3-4b-phase2-lines-sft/config.yaml` updated to
-`model_name: "checkpoints/qwen3-4b-phase1-coach-sft"`.
+`recipes-train/qwen3.5-4b-phase2-lines-sft/config.yaml` updated to
+`model_name: "checkpoints/qwen3.5-4b-phase1-coach-sft"`.
 Old Phase 2 checkpoint (trained from base) deleted.

@@ -5,7 +5,7 @@ Standalone FastAPI server that loads ChessLMWithEncoder and exposes:
                                lines, builds the joint prompt, streams the
                                annotated lines + coaching comment.
 
-Launch via: recipes-train/qwen3-4b-encoder-phase1-sft/serve.sh
+Launch via: recipes-train/qwen3.5-4b-encoder-phase1-sft/serve.sh
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ _model = None
 _tokenizer = None
 _engine: chess.engine.SimpleEngine | None = None
 
-CHECKPOINT_DIR = os.environ.get("ENCODER_CHECKPOINT", "checkpoints/qwen3-4b-encoder-phase1-sft")
+CHECKPOINT_DIR = os.environ.get("ENCODER_CHECKPOINT", "checkpoints/qwen3.5-4b-encoder-phase1-sft")
 CONFIG_PATH = os.environ.get(
-    "ENCODER_CONFIG", "recipes-train/qwen3-4b-encoder-phase1-sft/config.yaml"
+    "ENCODER_CONFIG", "recipes-train/qwen3.5-4b-encoder-phase1-sft/config.yaml"
 )
 STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "stockfish")
 STOCKFISH_DEPTH = int(os.environ.get("STOCKFISH_DEPTH", "18"))

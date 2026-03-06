@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# GRPO training — Qwen3-4B-Thinking-2507 + QLoRA (8-bit, r=64)
+# GRPO training — Qwen3.5-4B-Thinking-2507 + QLoRA (8-bit, r=64)
 # 2-GPU DDP via torchrun — each rank gets a full model replica on its own GPU.
 # DDP doubles effective throughput vs single-GPU: each GPU processes its own
 # batch of rollouts in parallel, then gradients are all-reduced.
 # Rewards: R1 legality + R2 eval accuracy + R3a annotations + R4 depth + R5 breadth + R6 relevance
-# Output: checkpoints/qwen3-4b-phase3-grpo/
+# Output: checkpoints/qwen3.5-4b-phase3-grpo/
 #
 # Usage:
-#   ./recipes-train/qwen3-4b-phase3-grpo/start.sh
-#   ./recipes-train/qwen3-4b-phase3-grpo/start.sh --resume           # resume last checkpoint
-#   ./recipes-train/qwen3-4b-phase3-grpo/start.sh --resume checkpoints/qwen3-4b-phase3-grpo/checkpoint-300
+#   ./recipes-train/qwen3.5-4b-phase3-grpo/start.sh
+#   ./recipes-train/qwen3.5-4b-phase3-grpo/start.sh --resume           # resume last checkpoint
+#   ./recipes-train/qwen3.5-4b-phase3-grpo/start.sh --resume checkpoints/qwen3.5-4b-phase3-grpo/checkpoint-300
 #
 # Logs: /tmp/chess-grpo.log
-# Stop: ./recipes-train/qwen3-4b-phase3-grpo/stop.sh
+# Stop: ./recipes-train/qwen3.5-4b-phase3-grpo/stop.sh
 
 set -euo pipefail
 

@@ -50,7 +50,7 @@ Input: (19, 8, 8)
 → Linear(256, hidden_dim)  →  (hidden_dim,)   # projection into LLM space
 ```
 
-`hidden_dim` = LLM embedding dim (e.g. 2560 for Qwen3-4B).
+`hidden_dim` = LLM embedding dim (e.g. 2560 for Qwen3.5-4B).
 
 The output is a single vector that becomes one soft prefix token prepended to the
 token sequence.
@@ -99,7 +99,7 @@ The board token is inserted as the **first token** of the user message (before F
 ```python
 class ChessLMWithEncoder(nn.Module):
     def __init__(self, llm, cnn_encoder, projection):
-        self.llm = llm            # Qwen3-4B (frozen or LoRA)
+        self.llm = llm            # Qwen3.5-4B (frozen or LoRA)
         self.cnn = cnn_encoder    # Leela trunk (frozen or lightly tuned)
         self.proj = projection    # Linear(256, hidden_dim)
 
@@ -175,7 +175,7 @@ Existing files unchanged in Phase 1 — encoder is additive.
    project the (256, 8, 8) feature map (before global pool) to 64 tokens (one per square).
    More expressive but 64× more tokens. Start with single token, evaluate.
 
-3. **Qwen3-4B vs 30B**: 4B is the target (faster iteration). Encoder adds ~15M params
+3. **Qwen3.5-4B vs 30B**: 4B is the target (faster iteration). Encoder adds ~15M params
    (CNN trunk) + 256×2560 projection — negligible overhead.
 
 4. **Does it actually help?** Ablation needed: train identical model with and without

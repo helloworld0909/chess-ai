@@ -75,43 +75,43 @@ STOCKFISH_PATH="$HOME/.local/bin/stockfish" uv run python -c \
 
 ## Training Pipeline
 
-Three phases, all using `Qwen/Qwen3-4B-Thinking-2507` + QLoRA 8-bit on 2× RTX 5090:
+Three phases, all using `Qwen/Qwen3.5-4B-Instruct` + QLoRA 8-bit on 2× RTX 5090:
 
-### Phase 1 — Coach SFT (`recipes-train/qwen3-4b-phase1-coach-sft/`)
+### Phase 1 — Coach SFT (`recipes-train/qwen3.5-4b-phase1-coach-sft/`)
 
 Teaches the model to explain chess moves in natural language.
 
 ```bash
-./recipes-train/qwen3-4b-phase1-coach-sft/start.sh
+./recipes-train/qwen3.5-4b-phase1-coach-sft/start.sh
 ```
 
 - Data: `data/processed/train.jsonl` (coach annotations)
-- Output: `checkpoints/qwen3-4b-phase1-coach-sft/`
+- Output: `checkpoints/qwen3.5-4b-phase1-coach-sft/`
 
-### Phase 2 — Line Generator SFT (`recipes-train/qwen3-4b-phase2-lines-sft/`)
+### Phase 2 — Line Generator SFT (`recipes-train/qwen3.5-4b-phase2-lines-sft/`)
 
 Cold-starts the model on the `<line>` output format before RL.
 
 ```bash
-./recipes-train/qwen3-4b-phase2-lines-sft/start.sh
-./recipes-train/qwen3-4b-phase2-lines-sft/stop.sh
+./recipes-train/qwen3.5-4b-phase2-lines-sft/start.sh
+./recipes-train/qwen3.5-4b-phase2-lines-sft/stop.sh
 # Logs: /tmp/chess-lines-train.log
 ```
 
 - Data: `data/processed/lines_sft.jsonl` (28k samples)
-- Output: `checkpoints/qwen3-4b-phase2-lines-sft/`
+- Output: `checkpoints/qwen3.5-4b-phase2-lines-sft/`
 - Format: `<line>LINE N: move (purpose) → move (purpose) | eval: <label></line>`
 
-### Phase 3 — GRPO (`recipes-train/qwen3-4b-phase3-grpo/`)
+### Phase 3 — GRPO (`recipes-train/qwen3.5-4b-phase3-grpo/`)
 
 Reinforcement learning with verifiable chess rewards. Starts from Phase 2 checkpoint.
 
 ```bash
-./recipes-train/qwen3-4b-phase3-grpo/start.sh
+./recipes-train/qwen3.5-4b-phase3-grpo/start.sh
 ```
 
 - Rewards: R1 legality (0.25), R3 eval accuracy (0.30), R4a annotations (0.15), R5 relevance (0.10)
-- Output: `checkpoints/qwen3-4b-phase3-grpo/`
+- Output: `checkpoints/qwen3.5-4b-phase3-grpo/`
 
 ---
 

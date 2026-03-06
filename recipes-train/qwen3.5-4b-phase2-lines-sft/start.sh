@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Line-generator SFT — Qwen3-4B-Thinking-2507 + QLoRA (8-bit, r=64)
+# Line-generator SFT — Qwen3.5-4B-Thinking-2507 + QLoRA (8-bit, r=64)
 # DDP: 2× RTX 5090  |  10k train / 500 eval
 # Output: checkpoints/chess-lines-4b-sft/
 #
 # Usage:
-#   ./recipes-train/qwen3-4b-phase2-lines-sft/start.sh
-#   ./recipes-train/qwen3-4b-phase2-lines-sft/start.sh --resume
+#   ./recipes-train/qwen3.5-4b-phase2-lines-sft/start.sh
+#   ./recipes-train/qwen3.5-4b-phase2-lines-sft/start.sh --resume
 #
 # Logs: /tmp/chess-lines-train.log
-# Stop: ./recipes-train/qwen3-4b-phase2-lines-sft/stop.sh
+# Stop: ./recipes-train/qwen3.5-4b-phase2-lines-sft/stop.sh
 
 set -euo pipefail
 

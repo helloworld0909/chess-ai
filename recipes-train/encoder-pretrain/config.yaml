@@ -11,7 +11,7 @@ encoder:
   in_channels: 38       # before (19ch) + after (19ch) board tensors
   hidden_size: 512      # ResNet filters
   num_blocks: 15        # depth
-  out_dim: 2560         # must match Qwen3-4B hidden_size for later SFT integration
+  out_dim: 2560         # must match Qwen3.5-4B hidden_size for later SFT integration
 
 training:
   train_file: data/processed/encoder_pretrain_1b.jsonl

@@ -1,4 +1,4 @@
-# GRPO configuration — Qwen3-4B-Thinking-2507 + QLoRA (8-bit, r=64)
+# GRPO configuration — Qwen3.5-4B-Thinking-2507 + QLoRA (8-bit, r=64)
 # Stage 1: Line generator RL with verifiable chess rewards
 #
 # Parallelism: 2-GPU DDP via torchrun (each rank = full model replica on own GPU)
@@ -7,7 +7,7 @@
 # R1<0 short-circuits all downstream rewards to -1.0
 
 model:
-  model_name: "checkpoints/qwen3-4b-phase2-lines-sft"
+  model_name: "checkpoints/qwen3.5-4b-phase2-lines-sft"
   quantization: "8bit"
   attn_implementation: "sdpa"
   torch_dtype: bfloat16
@@ -79,12 +79,12 @@ training:
   save_steps: 10
   save_total_limit: 20
 
-output_dir: checkpoints/qwen3-4b-phase3-grpo
+output_dir: checkpoints/qwen3.5-4b-phase3-grpo
 
 wandb:
   enabled: false
   project: chess-tutor-grpo
-  name: qwen3-4b-grpo-phase1
+  name: qwen3.5-4b-grpo-phase1
   tags:
     - grpo
     - lines

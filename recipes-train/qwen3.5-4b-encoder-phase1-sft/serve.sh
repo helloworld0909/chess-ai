@@ -2,10 +2,10 @@
 # Launch the encoder inference server (ChessLMWithEncoder on GPU 0).
 #
 # Usage:
-#   ./recipes-train/qwen3-4b-encoder-phase1-sft/serve.sh
+#   ./recipes-train/qwen3.5-4b-encoder-phase1-sft/serve.sh
 #
 # Env overrides:
-#   ENCODER_CHECKPOINT  — path to checkpoint dir (default: checkpoints/qwen3-4b-encoder-phase1-sft)
+#   ENCODER_CHECKPOINT  — path to checkpoint dir (default: checkpoints/qwen3.5-4b-encoder-phase1-sft)
 #   ENCODER_PORT        — port to listen on (default: 8200)
 #   STOCKFISH_DEPTH     — Stockfish analysis depth (default: 18)
 #
@@ -34,8 +34,8 @@ fi
 source "$REPO_ROOT/.venv/bin/activate"
 
 export STOCKFISH_PATH="${STOCKFISH_PATH:-$HOME/.local/bin/stockfish}"
-export ENCODER_CHECKPOINT="${ENCODER_CHECKPOINT:-checkpoints/qwen3-4b-encoder-phase1-sft}"
-export ENCODER_CONFIG="${ENCODER_CONFIG:-recipes-train/qwen3-4b-encoder-phase1-sft/config.yaml}"
+export ENCODER_CHECKPOINT="${ENCODER_CHECKPOINT:-checkpoints/qwen3.5-4b-encoder-phase1-sft}"
+export ENCODER_CONFIG="${ENCODER_CONFIG:-recipes-train/qwen3.5-4b-encoder-phase1-sft/config.yaml}"
 export ENCODER_PORT="${ENCODER_PORT:-8200}"
 export STOCKFISH_DEPTH="${STOCKFISH_DEPTH:-18}"
 

@@ -16,7 +16,7 @@ training/
 
 recipes-train/
   ds_zero2.json               # Shared DeepSpeed ZeRO-2 config
-  qwen3-4b-sft/
+  qwen3.5-4b-sft/
     train.py                  # 4B-specific: 8-bit QLoRA, DDP (LOCAL_RANK), r=64
     config.yaml               # Hyperparameters
     start.sh / stop.sh        # Launch/stop via nohup + PID file
@@ -26,7 +26,7 @@ recipes-train/
     start.sh / stop.sh
 
 recipes-inference/
-  qwen3-4b-thinking-lora/     # vLLM + LoRA adapter, port 8101
+  qwen3.5-4b-thinking-lora/     # vLLM + LoRA adapter, port 8101
   qwen3.5-35b-a3b-fp8/        # vLLM base model, port 8100
 ```
 
@@ -72,7 +72,7 @@ model-specific lives in the shared lib.
 ## 5. Key Config (4B Active Run)
 
 ```yaml
-model:      Qwen/Qwen3-4B-Thinking-2507, 8-bit, sdpa
+model:      Qwen/Qwen3.5-4B-Instruct, 8-bit, sdpa
 lora:       r=64, alpha=128, all 7 projections (q/k/v/o + gate/up/down)
 batch:      5 per GPU × 2 GPUs × 8 grad_accum = 80 effective
 lr:         1e-4 cosine, warmup_ratio=0.03
@@ -101,7 +101,7 @@ checkpoints: every 50 steps, keep 10
 
 ## 7. Current Training Status
 
-- **Model**: `Qwen/Qwen3-4B-Thinking-2507` + 8-bit QLoRA
+- **Model**: `Qwen/Qwen3.5-4B-Instruct` + 8-bit QLoRA
 - **Epoch**: ~1.3 / 3
 - **Train loss**: ~0.31 | **Eval loss**: ~0.317 (tight gap → good generalization)
 - **Speed**: ~21s/step → ~7 hours total
@@ -112,7 +112,7 @@ checkpoints: every 50 steps, keep 10
 ## 8. Next Steps
 
 1. **Monitor to completion** — eval loss should continue falling through epoch 3
-2. **Serve via recipe**: `./recipes-inference/qwen3-4b-thinking-lora/start.sh` (update checkpoint path in docker-compose)
+2. **Serve via recipe**: `./recipes-inference/qwen3.5-4b-thinking-lora/start.sh` (update checkpoint path in docker-compose)
 3. **Manual review**: `uv run chess-review <username>` to evaluate coaching quality
 4. **Go/No-Go for 35B SFT** based on 4B output quality
 5. **Persistence mode on reboot**: `sudo ./scripts/install-nvidia-persistence.sh`

@@ -30,7 +30,7 @@ def _load_module(path: str, name: str):
 
 
 _sft = _load_module(
-    os.path.join(_REPO, "recipes-train", "qwen3-4b-encoder-phase1-sft", "train.py"),
+    os.path.join(_REPO, "recipes-train", "qwen3.5-4b-encoder-phase1-sft", "train.py"),
     "encoder_sft_train",
 )
 _inject_move_tokens = _sft._inject_move_tokens
@@ -50,7 +50,7 @@ EncoderRegressorHead = _pre.EncoderRegressorHead
 
 @pytest.fixture(scope="module")
 def mock_tokenizer():
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Thinking-2507", trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B-Instruct", trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     # No add_special_tokens needed — MOVE_TOKEN (<|fim_pad|>) is already in vocab
@@ -61,7 +61,7 @@ def mock_tokenizer():
 def mock_llm():
     from transformers import AutoConfig
 
-    config = AutoConfig.from_pretrained("Qwen/Qwen3-4B-Thinking-2507")
+    config = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B-Instruct")
     config.hidden_size = 256
     config.num_hidden_layers = 1
     llm = AutoModelForCausalLM.from_config(config)

@@ -18,12 +18,12 @@ Reward functions (Phase 1, all free/cheap):
     R6  — Line relevance         weight 0.05  (first move is legal from FEN)
 
 Usage (via recipe):
-    ./recipes-train/qwen3-4b-phase3-grpo/start.sh
+    ./recipes-train/qwen3.5-4b-phase3-grpo/start.sh
 
 Direct:
     STOCKFISH_PATH=/path/to/stockfish \\
-    python recipes-train/qwen3-4b-phase3-grpo/train.py \\
-        --config recipes-train/qwen3-4b-phase3-grpo/config.yaml
+    python recipes-train/qwen3.5-4b-phase3-grpo/train.py \\
+        --config recipes-train/qwen3.5-4b-phase3-grpo/config.yaml
 """
 
 from __future__ import annotations
@@ -198,7 +198,7 @@ def _make_weighted_reward(fn, weight: float):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", "-c", default="recipes-train/qwen3-4b-grpo/config.yaml")
+    parser.add_argument("--config", "-c", default="recipes-train/qwen3.5-4b-grpo/config.yaml")
     parser.add_argument("--resume", nargs="?", const=True, default=None, metavar="CHECKPOINT_DIR")
     args = parser.parse_args()
 
