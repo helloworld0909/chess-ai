@@ -45,12 +45,14 @@ _logger = logging.getLogger(__name__)
 _model = None
 _tokenizer = None
 _engine: chess.engine.SimpleEngine | None = None
+_sf15_path: str | None = None  # path to SF15 binary (None = skip SF15 annotations)
 
 CHECKPOINT_DIR = os.environ.get("ENCODER_CHECKPOINT", "checkpoints/qwen3.5-4b-encoder-phase1-sft")
 CONFIG_PATH = os.environ.get(
     "ENCODER_CONFIG", "recipes-train/qwen3.5-4b-encoder-phase1-sft/config.yaml"
 )
 STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "stockfish")
+SF15_PATH = os.environ.get("SF15_PATH", "")  # empty = disabled
 STOCKFISH_DEPTH = int(os.environ.get("STOCKFISH_DEPTH", "18"))
 HOST = os.environ.get("ENCODER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ENCODER_PORT", "8200"))
@@ -63,7 +65,7 @@ PORT = int(os.environ.get("ENCODER_PORT", "8200"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global _model, _tokenizer, _engine
+    global _model, _tokenizer, _engine, _sf15_path
 
     _logger.info("Loading encoder model from %s ...", CHECKPOINT_DIR)
     _model, _tokenizer = load_encoder_model(CHECKPOINT_DIR, CONFIG_PATH)
@@ -72,6 +74,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _logger.info("Starting Stockfish at %s", STOCKFISH_PATH)
     _engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
     _logger.info("Stockfish ready.")
+
+    if SF15_PATH and os.path.isfile(SF15_PATH):
+        _sf15_path = SF15_PATH
+        _logger.info("SF15 annotations enabled: %s", SF15_PATH)
+    else:
+        _sf15_path = None
+        _logger.warning("SF15_PATH not set or not found — running without SF15 term annotations")
 
     yield
 
@@ -107,6 +116,86 @@ class AnalyzeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# SF15 annotation helpers (mirrors generate_phase2_data.py logic exactly)
+# ---------------------------------------------------------------------------
+
+
+def _sf15_terms(term_diffs: dict[str, float]) -> list[tuple[str, float]]:
+    notable = [(abs(d), term, d) for term, d in term_diffs.items() if abs(d) >= 0.10]
+    if not notable:
+        return []
+    notable.sort(reverse=True)
+    return [(term, d) for _, term, d in notable[:3]]
+
+
+def _fmt_terms(terms: list[tuple[str, float]]) -> str:
+    parts = []
+    for term, d in terms:
+        sign = "+" if d >= 0 else "−"
+        parts.append(f"{term.lower()} {sign}{abs(d):.2f}")
+    return "; ".join(parts)
+
+
+def _annotate_sans_with_sf15(
+    sans: list[str],
+    start_fen: str,
+    white_to_move_at_start: bool,
+) -> list[str]:
+    """Walk a list of SANs and return annotated strings like 'Nd5 [mobility +0.32; threats −0.15]'.
+
+    Falls back to plain SAN if SF15 is unavailable or a move fails.
+    """
+    if _sf15_path is None:
+        return list(sans)
+
+    from data.pipeline.sf15_eval import get_sf15_eval
+
+    result: list[str] = []
+    board = chess.Board(start_fen)
+    try:
+        eval_before = get_sf15_eval(start_fen)
+    except Exception:
+        return list(sans)
+
+    for san in sans:
+        try:
+            move = board.parse_san(san)
+            white_moved = board.turn == chess.WHITE
+            board.push(move)
+            fen_after = board.fen()
+        except Exception:
+            result.append(san)
+            continue
+
+        try:
+            eval_after = get_sf15_eval(fen_after)
+            diffs: dict[str, float] = {}
+            for term in eval_before:
+                if term not in eval_after:
+                    continue
+                adv_before = eval_before[term]["White"] - eval_before[term]["Black"]
+                adv_after = eval_after[term]["White"] - eval_after[term]["Black"]
+                delta = adv_after - adv_before
+                if not white_moved:
+                    delta = -delta
+                diffs[term] = round(delta, 2)
+            terms = _sf15_terms(diffs)
+            eval_before = eval_after
+        except Exception:
+            terms = []
+
+        if terms:
+            result.append(f"{san} [{_fmt_terms(terms)}]")
+        else:
+            result.append(san)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+
+
 def _line_params(spread_cp: int) -> tuple[int, int]:
     """Return (line_depth_half_moves, n_engine_lines) based on position spread.
 
@@ -124,7 +213,7 @@ def _line_params(spread_cp: int) -> tuple[int, int]:
 
 def _get_analysis(
     fen: str, move_uci: str, depth: int
-) -> tuple[list[str], list[list[str]], str, int | None, int | None, str, str]:
+) -> tuple[list[str], list[list[str]], str, int | None, int | None, str, str, str, list[str]]:
     """Run Stockfish and return analysis for the position.
 
     Returns:
@@ -134,7 +223,9 @@ def _get_analysis(
         root_cp: centipawns from White's perspective before student move (None if mate)
         student_cp: centipawns from White's perspective after student move (None if mate)
         best_move_san: SAN of engine's top choice from pre-move position
-        played_line_str: plain SAN string for PLAYED LINE (for prompt)
+        played_line_str: annotated PLAYED LINE string for prompt (with SF15 brackets)
+        played_line_str_plain: plain SAN PLAYED LINE string (for UI display)
+        engine_line_strs: annotated engine line strings for prompt (with SF15 brackets)
     """
     assert _engine is not None
     board = chess.Board(fen)
@@ -256,7 +347,18 @@ def _get_analysis(
         if len(engine_line_sans) >= n_engine_lines:
             break
 
-    played_line_str = " → ".join(played_sans_truncated)
+    played_line_str_plain = " → ".join(played_sans_truncated)
+
+    # Annotate with SF15 terms to match training data format
+    white_to_move = board.turn == chess.WHITE
+    # Played line starts from pre-move board (student's move is first)
+    played_annotated = _annotate_sans_with_sf15(played_sans_truncated, fen, white_to_move)
+    played_line_str = " → ".join(played_annotated)
+
+    engine_line_strs = []
+    for line_sans in engine_line_sans:
+        ann = _annotate_sans_with_sf15(line_sans, fen, white_to_move)
+        engine_line_strs.append(" → ".join(ann))
 
     return (
         played_sans_truncated,
@@ -266,6 +368,8 @@ def _get_analysis(
         student_cp,
         best_move_san,
         played_line_str,
+        played_line_str_plain,
+        engine_line_strs,
     )
 
 
@@ -347,6 +451,8 @@ async def _stream(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
             student_cp,
             best_move_san,
             played_line_str,
+            played_line_str_plain,
+            engine_line_strs,
         ) = await asyncio.get_event_loop().run_in_executor(
             None, _get_analysis, req.fen, req.move_uci, req.depth
         )
@@ -365,8 +471,8 @@ async def _stream(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
     except Exception:
         classification, cp_loss = "Good", 0
 
-    # Emit meta (played + engine lines as plain SAN strings for the UI)
-    all_line_strs = [played_line_str] + [" → ".join(line) for line in engine_line_sans]
+    # Emit meta (plain SAN strings for the UI — no SF15 brackets)
+    all_line_strs = [played_line_str_plain] + [" → ".join(line) for line in engine_line_sans]
     is_best = move_san == best_move_san
     meta = {
         "eval_label": eval_label,
@@ -386,8 +492,7 @@ async def _stream(req: AnalyzeRequest) -> AsyncGenerator[str, None]:
     board_after.push(move)
     board_after_str = board_ascii(board_after)
 
-    # Build user prompt (plain SAN, no sentinels yet)
-    engine_line_strs = [" → ".join(line) for line in engine_line_sans]
+    # Build user prompt (SF15-annotated, no sentinels yet)
     user_content = format_joint_user_prompt(
         board_ascii_str=board_before_str,
         fen=req.fen,
@@ -544,11 +649,12 @@ async def debug_encoder(req: AnalyzeRequest) -> dict:
         _,
         _,
         played_line_str,
+        played_line_str_plain,
+        engine_line_strs,
     ) = await asyncio.get_event_loop().run_in_executor(
         None, _get_analysis, req.fen, req.move_uci, req.depth
     )
-    engine_line_strs = [" → ".join(line) for line in engine_line_sans]
-    all_line_strs = [played_line_str] + engine_line_strs
+    all_line_strs = [played_line_str_plain] + [" → ".join(line) for line in engine_line_sans]
 
     board_before_str = board_ascii(board)
     facts = move_facts(board, move)

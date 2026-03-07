@@ -34,7 +34,9 @@ fi
 source "$REPO_ROOT/.venv/bin/activate"
 
 export STOCKFISH_PATH="${STOCKFISH_PATH:-$HOME/.local/bin/stockfish}"
-export ENCODER_CHECKPOINT="${ENCODER_CHECKPOINT:-checkpoints/qwen3.5-4b-encoder-phase1-sft}"
+export SF15_PATH="${SF15_PATH:-$HOME/.local/bin/stockfish-15}"
+# checkpoint-840 has best eval_loss (0.3412); final checkpoint is checkpoint-890
+export ENCODER_CHECKPOINT="${ENCODER_CHECKPOINT:-checkpoints/qwen3.5-4b-encoder-phase1-sft/checkpoint-840}"
 export ENCODER_CONFIG="${ENCODER_CONFIG:-recipes-train/qwen3.5-4b-encoder-phase1-sft/config.yaml}"
 export ENCODER_PORT="${ENCODER_PORT:-8200}"
 export STOCKFISH_DEPTH="${STOCKFISH_DEPTH:-18}"
@@ -42,6 +44,7 @@ export STOCKFISH_DEPTH="${STOCKFISH_DEPTH:-18}"
 echo "Checkpoint : $ENCODER_CHECKPOINT"
 echo "Port       : $ENCODER_PORT"
 echo "Stockfish  : $STOCKFISH_PATH (depth $STOCKFISH_DEPTH)"
+echo "SF15       : $SF15_PATH"
 echo "Log        : $LOG_FILE"
 echo ""
 
@@ -49,6 +52,7 @@ nohup bash -c "
   source '$REPO_ROOT/.venv/bin/activate'
   export PYTHONPATH='$REPO_ROOT'
   export STOCKFISH_PATH='$STOCKFISH_PATH'
+  export SF15_PATH='$SF15_PATH'
   export ENCODER_CHECKPOINT='$ENCODER_CHECKPOINT'
   export ENCODER_CONFIG='$ENCODER_CONFIG'
   export ENCODER_PORT='$ENCODER_PORT'
