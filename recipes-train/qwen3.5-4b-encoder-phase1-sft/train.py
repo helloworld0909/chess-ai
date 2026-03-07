@@ -181,6 +181,11 @@ def setup_encoder_model(config_path: str) -> tuple:
     else:
         _logger.warning("No encoder.pretrained_weights set!")
 
+    # PEFT get_peft_model() disables all gradients globally except LoRA.
+    # We must explicitly re-enable them for the newly attached CNN encoder!
+    for param in model.cnn.parameters():
+        param.requires_grad_(True)
+
     model.print_trainable_parameters()
     return model, tokenizer
 

@@ -9,7 +9,7 @@
 # R1<0 short-circuits line rewards to -1.0; comment rewards always apply
 
 model:
-  model_name: "checkpoints/qwen3.5-4b-phase2-lines-sft"
+  model_name: "checkpoints/qwen3.5-4b-encoder-phase1-sft/checkpoint-840-adapter"
   quantization: "8bit"
   attn_implementation: "sdpa"
   torch_dtype: bfloat16

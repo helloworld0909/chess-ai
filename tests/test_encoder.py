@@ -48,7 +48,7 @@ EncoderRegressorHead = _pre.EncoderRegressorHead
 # Minimal fake tokenizer — no network calls, no model weights
 # ---------------------------------------------------------------------------
 
-_VOCAB_SIZE = 151700  # large enough to include MOVE_TOKEN_ID (151654)
+_VOCAB_SIZE = 250000  # large enough to include MOVE_TOKEN_ID (248055 for Qwen3.5-4B)
 _PAD_ID = 0
 _EOS_ID = 1
 

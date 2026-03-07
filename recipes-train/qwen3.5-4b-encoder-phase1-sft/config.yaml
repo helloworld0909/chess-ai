@@ -6,7 +6,7 @@
 # DDP: 2× RTX 5090  |  effective batch = 32 (1 × 2 GPUs × 16)
 
 model:
-  model_name: "Qwen/Qwen3-4B-Thinking-2507"
+  model_name: "Qwen/Qwen3.5-4B"
   quantization: "8bit"
   attn_implementation: "sdpa"
   torch_dtype: bfloat16

@@ -7,7 +7,7 @@ from .cnn import ChessEncoder
 # The collator replaces this with a CNN board embedding at embedding time;
 # the token ID itself is never predicted (label = -100).
 MOVE_TOKEN = "<|vision_pad|>"
-MOVE_TOKEN_ID = 151654  # Qwen3 vocab ID for <|vision_pad|> — unused in text-only model
+MOVE_TOKEN_ID = 248055  # Qwen3 vocab ID for <|vision_pad|> — unused in text-only model
 
 __all__ = [
     "board_to_tensor",
