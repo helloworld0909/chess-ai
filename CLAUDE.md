@@ -67,6 +67,8 @@ chess-ai/
 
 ## Running the Project
 
+Chess.com username is set in `.env` as `CHESS_COM_USERNAME`.
+
 ```bash
 # Install dependencies
 uv sync
@@ -79,6 +81,15 @@ STOCKFISH_PATH="/home/zheng/.local/bin/stockfish" uv run pytest tests/ -v
 
 # Run CLI tutor
 STOCKFISH_PATH="/home/zheng/.local/bin/stockfish" uv run python -c "import sys; sys.path.insert(0,'src'); from tutor.cli import main; main()"
+
+# Launch encoder inference server (checkpoint-840, port 8200)
+./recipes-train/qwen3.5-4b-encoder-phase1-sft/serve.sh
+
+# Launch web UI (port 8080)
+STOCKFISH_PATH=/home/zheng/.local/bin/stockfish ENCODER_SERVER_URL=http://localhost:8200 PYTHONPATH=src uv run uvicorn tutor.web:app --host 0.0.0.0 --port 8080
+
+# Or via chess-review (fetches chess.com games for CHESS_COM_USERNAME)
+./scripts/start-review.sh MiracleRoguee
 ```
 
 ## Current TODO Items

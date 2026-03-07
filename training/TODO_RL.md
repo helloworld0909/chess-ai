@@ -159,35 +159,65 @@ A line is relevant if it illustrates the consequence of the move played.
 Proxy: the first move of the line must be the move played (or the best response to it).
 Lines that ignore the played move and analyse a random position get 0.
 
-**Combined Stage 1 Reward:**
+---
 
-R1 is evaluated first. If R1=0 (illegal), all downstream rewards (R2–R7) are set to 0.
+## Coaching Comment Rewards (Goals 2, 3, 4)
 
-Phase 1 (all free, no LLM cost):
+These reward the free-text coaching paragraph that follows the `<line>...</line>` blocks.
+All are **free** (no LLM judge) — proxy signals derived from text analysis.
+Total weight: 0.25 (comment rewards) vs 0.75 (line rewards).
+
+**RC0 — Comment Format** — weight 0.05
+Reward presence of a non-empty comment after the last `</line>`.
+- +1.0 comment present; 0.0 no text after lines; -1.0 no lines at all.
+
+**RC1 — Tone (Goal 2: Tone)** — weight 0.08
+Checks three dimensions (each weighted):
+- Uses second-person "you"/"your" (+0.4 contribution) — model speaks *to* the student
+- Contains encouraging language: "you played", "your idea", "consider" (+0.3)
+- Does NOT use cold/robotic constructions: "the move is", "one should", "the player" (+0.3)
+Score mapped from [0, 1] → [-1.0, +1.0].
+
+**RC2 — Conciseness (Goal 4: Conciseness)** — weight 0.05
+Counts sentences (split on `.!?`):
+- 2–5 sentences → +1.0 (optimal coaching comment length)
+- 1 sentence    → +0.5 (too brief)
+- 6 sentences   → 0.0
+- 7+            → -1.0 (padding/repetition)
+
+**RC3 — Educational Value (Goal 3: Educational)** — weight 0.07
+Proxy checks (each weighted):
+- References at least one specific move SAN from the lines (+0.4) — grounded, not generic
+- Uses chess concept vocabulary: fork, pin, tempo, outpost, king safety, etc. (+0.4)
+- Contains causal reasoning: "because", "since", "which means", "allowing" (+0.2)
+Score mapped from [0, 1] → [-1.0, +1.0].
+
+**Combined Reward (Phase 1):**
+
+R1 (legality) gates line rewards; comment rewards always apply.
+
 ```python
-if not R1_legal:
-    R = -1.0  # hard gate — skip all downstream
-else:
-    R = 0.28 * R2 + 0.12 * R3a + 0.10 * R4 + 0.10 * R5 + 0.10 * R6 + 0.05 * R7
-    # weights sum to 0.75; remaining 0.25 is implicit in the gate structure
-```
-
-Phase 2 (add Haiku enrichment judge):
-```python
-if not R1_legal:
-    R = -1.0
-else:
-    R = 0.28 * R2 + 0.10 * R3a + 0.08 * R3b + 0.11 * R4 + 0.11 * R5 + 0.08 * R6 + 0.05 * R7
+line_reward = (
+    0.28 * R2_eval + 0.12 * R3a_annot + 0.10 * R4_depth
+    + 0.10 * R5_breadth + 0.05 * R7_relevance
+)
+comment_reward = (
+    0.05 * RC0_fmt + 0.08 * RC1_tone + 0.05 * RC2_conc + 0.07 * RC3_educ
+)
+R = (-1.0 + comment_reward) if R1_illegal else (line_reward + comment_reward)
 ```
 
 Weight rationale (sorted by weight):
 - R1 (legality)            = hard gate — no weight; illegal → -1.0, stop
 - R2 (eval accuracy)       = 0.28 — strongest verifiable signal
-- R3a (structural annotation) = 0.12 — free correctness check on move descriptions
+- RC1 (tone)               = 0.08 — most impactful UX signal (Goal 2)
+- R3a (structural annot)   = 0.12 — free correctness check on move descriptions
+- RC3 (educational)        = 0.07 — concepts + causal reasoning (Goal 3)
 - R4 (depth)               = 0.10 — encourages ≥6 half-move lines
 - R5 (breadth)             = 0.10 — encourages genuinely different first moves
-- R6 (opponent quality)    = 0.10 — defensive floor; prevents "assume blunder" shortcuts
 - R7 (relevance)           = 0.05 — soft nudge to stay on-topic
+- RC0 (comment format)     = 0.05 — presence gate
+- RC2 (conciseness)        = 0.05 — sentence count (Goal 4)
 
 ### Bootstrapping the `<think>` Block
 
@@ -284,10 +314,9 @@ If Stage 2 GRPO is needed:
 Improve line quality with verifiable Stockfish rewards. Starts from Phase 2 checkpoint.
 GRPO generates rollouts on the fly — no new SFT data needed. Uses existing
 `data/processed/lines_sft.jsonl` prompts (FEN + move) as the prompt pool.
-- [ ] `src/verification/rewards.py` — R1 legality (gate), R2 eval accuracy, R3a annotation,
-  R4 depth, R5 breadth, R6 opponent quality, R7 relevance
-  R1=hard gate (-1.0 if illegal, skip rest), R2=0.28, R3a=0.12, R4=0.10, R5=0.10, R6=0.10, R7=0.05
-- [ ] `recipes-train/qwen3.5-4b-phase3-grpo/` — already has config skeleton, wire up rewards
+- [x] `src/verification/rewards.py` — R1 legality (gate), R2 eval accuracy, R3a annotation,
+  R4 depth, R5 breadth, R7 relevance + RC0-RC3 coaching comment rewards (tone, conciseness, educational)
+- [ ] `recipes-train/qwen3.5-4b-encoder-phase2-grpo/` — already has config skeleton, wire up rewards
 - [ ] Start from Phase 2 final checkpoint (update `config.yaml` when Phase 2 completes)
 
 ### ❌ No combined Phase 3 SFT

@@ -18,12 +18,12 @@ Reward functions (Phase 1, all free/cheap):
     R6  — Line relevance         weight 0.05  (first move is legal from FEN)
 
 Usage (via recipe):
-    ./recipes-train/qwen3.5-4b-phase3-grpo/start.sh
+    ./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh
 
 Direct:
     STOCKFISH_PATH=/path/to/stockfish \\
-    python recipes-train/qwen3.5-4b-phase3-grpo/train.py \\
-        --config recipes-train/qwen3.5-4b-phase3-grpo/config.yaml
+    python recipes-train/qwen3.5-4b-encoder-phase2-grpo/train.py \\
+        --config recipes-train/qwen3.5-4b-encoder-phase2-grpo/config.yaml
 """
 
 from __future__ import annotations
@@ -59,12 +59,16 @@ def load_config(path: str) -> dict:
 
 
 def load_grpo_dataset(jsonl_path: str):
-    """Load the line-generator SFT JSONL as a GRPO prompt dataset.
+    """Load a GRPO prompt dataset from JSONL.
 
-    GRPOTrainer expects a dataset with a 'prompt' column — a list of messages
-    up to (but not including) the final assistant turn.  We strip the last
-    assistant message (which contains the <line> targets) and keep the
-    system + user turns as the prompt.
+    Supports two formats:
+    1. Prompt-only format (generate_grpo_prompts.py output):
+       {"prompt": [system_msg, user_msg], "fen": ..., "move_san": ...}
+    2. SFT format (lines_sft_thinking.jsonl):
+       {"messages": [..., assistant_turn], "metadata": {"fen": ..., "move_san": ...}}
+       — assistant turn is stripped to give the prompt.
+
+    GRPOTrainer expects a dataset with a 'prompt' column (list of messages).
     """
     from datasets import Dataset
 
@@ -78,21 +82,31 @@ def load_grpo_dataset(jsonl_path: str):
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            msgs = rec.get("messages", [])
-            if not msgs:
-                continue
-            # Strip trailing assistant turn — that's what GRPO generates
-            if msgs[-1]["role"] == "assistant":
-                prompt_msgs = msgs[:-1]
+
+            # Format 1: already prompt-only
+            if "prompt" in rec:
+                prompt_msgs = rec["prompt"]
+                fen = rec.get("fen", "")
+                move_san = rec.get("move_san", "")
+            # Format 2: SFT format with messages + metadata
+            elif "messages" in rec:
+                msgs = rec["messages"]
+                if not msgs:
+                    continue
+                # Strip trailing assistant turn
+                if msgs[-1]["role"] == "assistant":
+                    prompt_msgs = msgs[:-1]
+                else:
+                    prompt_msgs = msgs
+                fen = rec.get("metadata", {}).get("fen", "")
+                move_san = rec.get("metadata", {}).get("move_san", "")
             else:
-                prompt_msgs = msgs
-            rows.append(
-                {
-                    "prompt": prompt_msgs,
-                    "fen": rec.get("metadata", {}).get("fen", ""),
-                    "move_san": rec.get("metadata", {}).get("move_san", ""),
-                }
-            )
+                continue
+
+            if not prompt_msgs:
+                continue
+            rows.append({"prompt": prompt_msgs, "fen": fen, "move_san": move_san})
+
     log.info("Loaded %d GRPO prompt rows from %s", len(rows), jsonl_path)
     return Dataset.from_list(rows)
 
@@ -233,11 +247,16 @@ def main():
     from verification.rewards import (
         reward_annotation_structural,
         reward_breadth,
+        reward_comment_format,
+        reward_conciseness,
         reward_depth,
+        reward_educational,
         reward_eval_accuracy,
         reward_format,
         reward_legality,
         reward_relevance,
+        reward_think,
+        reward_tone,
     )
 
     # Configure Stockfish eval depth from config (default 12 — fast enough for reward signal)
@@ -259,12 +278,17 @@ def main():
     # Log file rotates every logging_steps batches to avoid unbounded growth.
     _reward_names = [
         "R0_format",
+        "R_think",
         "R1_legality",
         "R2_eval",
         "R3a_annot",
         "R4_depth",
         "R5_breadth",
         "R6_relevance",
+        "RC_fmt",
+        "RC_tone",
+        "RC_conc",
+        "RC_educ",
     ]
 
     class _RewardLogger:
@@ -315,26 +339,33 @@ def main():
                     )
                     f.write(row + "\n")
 
-    _logger = _RewardLogger(num_funcs=7)
+    _logger = _RewardLogger(num_funcs=12)
 
     # Individual weighted reward functions (for logging breakdown)
+    # Line generator rewards (R0-R6): correctness, depth, breadth, relevance
+    # Coaching comment rewards (RC_*): tone, conciseness, educational value
     _reward_fns_individual = [
-        _make_weighted_reward(reward_format, 0.20),  # R0
-        reward_legality_gate,  # R1
-        _make_weighted_reward(reward_eval_accuracy, 0.28),  # R2
-        _make_weighted_reward(reward_annotation_structural, 0.12),  # R3a
-        _make_weighted_reward(reward_depth, 0.10),  # R4
-        _make_weighted_reward(reward_breadth, 0.10),  # R5
-        _make_weighted_reward(reward_relevance, 0.05),  # R6
+        _make_weighted_reward(reward_format, 0.20),  # R0  — format gate
+        _make_weighted_reward(reward_think, 0.10),  # R_think — think block quality
+        reward_legality_gate,  # R1  — legality (hard gate)
+        _make_weighted_reward(reward_eval_accuracy, 0.28),  # R2  — eval accuracy
+        _make_weighted_reward(reward_annotation_structural, 0.12),  # R3a — structural annot
+        _make_weighted_reward(reward_depth, 0.10),  # R4  — line depth
+        _make_weighted_reward(reward_breadth, 0.10),  # R5  — first-move breadth
+        _make_weighted_reward(reward_relevance, 0.05),  # R6  — line relevance
+        _make_weighted_reward(reward_comment_format, 0.05),  # RC_fmt — comment present
+        _make_weighted_reward(reward_tone, 0.08),  # RC_tone — 2nd-person, encouraging
+        _make_weighted_reward(reward_conciseness, 0.05),  # RC_conc — 2-5 sentences
+        _make_weighted_reward(reward_educational, 0.07),  # RC_educ — concepts + reasoning
     ]
 
-    # Run all 7 reward functions in parallel — TRL calls reward functions sequentially,
+    # Run all 12 reward functions in parallel — TRL calls reward functions sequentially,
     # so we expose a single function that fans out to a thread pool internally.
     # This overlaps Stockfish evals (R2), annotation checks (R3a), and other CPU work,
     # cutting reward wall-time from ~sum(fn_times) to ~max(fn_times).
     from concurrent.futures import ThreadPoolExecutor as _TPE
 
-    _reward_executor = _TPE(max_workers=7, thread_name_prefix="reward")
+    _reward_executor = _TPE(max_workers=12, thread_name_prefix="reward")
 
     def combined_parallel_reward(prompts, completions, **kwargs):
         import time
@@ -352,7 +383,7 @@ def main():
         _logger.step += 1
 
         n = len(completions)
-        return [sum(all_scores[r][i] for r in range(7)) for i in range(n)]
+        return [sum(all_scores[r][i] for r in range(12)) for i in range(n)]
 
     combined_parallel_reward.__name__ = "combined_reward"
 

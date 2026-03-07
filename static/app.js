@@ -511,11 +511,11 @@ function renderEncoderMeta(meta, el) {
       <div class="encoder-lines-title">Engine Key Lines</div>
       ${linesHtml}
     </div>
-    <div class="encoder-completion streaming"></div>
     <details class="thinking-block" hidden>
-      <summary>Thinking</summary>
+      <summary>Reasoning</summary>
       <pre class="thinking-text"></pre>
     </details>
+    <div class="encoder-completion streaming"></div>
   `;
 }
 
@@ -530,6 +530,7 @@ function updateThinking(text, el) {
   const pre = el.querySelector('.thinking-text');
   if (!details || !pre) return;
   details.hidden = false;
+  // Keep collapsed by default — user can expand; just update content
   pre.textContent = text;
 }
 
@@ -539,7 +540,7 @@ function renderEncoderAnalysis(data, el) {
   ).join('');
 
   const thinkingBlock = data.thinking
-    ? `<details class="thinking-block"><summary>Thinking</summary><pre class="thinking-text">${escapeHtml(data.thinking)}</pre></details>`
+    ? `<details class="thinking-block"><summary>Reasoning</summary><pre class="thinking-text">${escapeHtml(data.thinking)}</pre></details>`
     : '';
 
   el.innerHTML = `
@@ -548,8 +549,8 @@ function renderEncoderAnalysis(data, el) {
       <div class="encoder-lines-title">Engine Key Lines</div>
       ${linesHtml}
     </div>
-    <div class="encoder-completion">${formatEncoderCompletion(data.completion || '')}</div>
     ${thinkingBlock}
+    <div class="encoder-completion">${formatEncoderCompletion(data.completion || '')}</div>
   `;
 }
 

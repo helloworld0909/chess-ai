@@ -2,9 +2,11 @@
 # Stage 1: Line generator RL with verifiable chess rewards
 #
 # Parallelism: 2-GPU DDP via torchrun (each rank = full model replica on own GPU)
-# Rewards: R1 legality (gate) + R2 eval accuracy (0.28) + R3a annotation (0.12)
-#          + R4 depth (0.10) + R5 breadth (0.10) + R6 relevance (0.05)
-# R1<0 short-circuits all downstream rewards to -1.0
+# Rewards: R0 format (0.15) + R_think (0.15) + R1 legality (gate)
+#          + R2 eval accuracy (0.12) + R3a annotation (0.20)
+#          + R4 depth (0.12) + R5 breadth (0.10) + R6 relevance (0.05)
+#          + RC comment rewards (0.25 total; 0.0 when no comment)
+# R1<0 short-circuits line rewards to -1.0; comment rewards always apply
 
 model:
   model_name: "checkpoints/qwen3.5-4b-phase2-lines-sft"
@@ -27,8 +29,8 @@ lora:
   bias: none
 
 training:
-  train_file: data/processed/lines_sft_thinking.jsonl
-  eval_file:  data/processed/lines_sft_thinking_eval.jsonl
+  train_file: data/processed/grpo_prompts.jsonl
+  eval_file:  data/processed/grpo_prompts_eval.jsonl
 
   # Rollout generation
   # 2-GPU DDP via torchrun — each rank gets a full model replica on its own GPU.
@@ -38,12 +40,11 @@ training:
   max_completion_length: 1500 # keep high — want to encourage deep thinking
   stockfish_depth: 12         # CPU is idle, use full depth for better reward signal
 
-  # Batch — 11-13GB VRAM free → bump per_device 2→3 safely (~25GB peak)
+  # Batch — GPUs are free (~32GB VRAM each). No encoder server running.
   # TRL constraint: generation_batch_size = per_device × world_size × grad_accum must be
-  # divisible by num_generations=4 → 3 × 2 × 4 = 24, 24 % 4 == 0 ✓
-  # grad_accum 8→4 halves backward passes per optimizer step (speed), keeps batch reasonable
-  # Effective batch: 3 prompts/GPU × 2 GPUs × 4 gen × 4 accum = 96 rollouts
-  per_device_train_batch_size: 3
+  # divisible by num_generations=4 → x × 2 × y = 4n 
+  # Set per_device to 4 to max out memory per GPU
+  per_device_train_batch_size: 2
   gradient_accumulation_steps: 4
 
   # Optimiser
@@ -79,7 +80,7 @@ training:
   save_steps: 10
   save_total_limit: 20
 
-output_dir: checkpoints/qwen3.5-4b-phase3-grpo
+output_dir: checkpoints/qwen3.5-4b-encoder-phase2-grpo
 
 wandb:
   enabled: false

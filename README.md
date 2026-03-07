@@ -102,16 +102,16 @@ Cold-starts the model on the `<line>` output format before RL.
 - Output: `checkpoints/qwen3.5-4b-phase2-lines-sft/`
 - Format: `<line>LINE N: move (purpose) → move (purpose) | eval: <label></line>`
 
-### Phase 3 — GRPO (`recipes-train/qwen3.5-4b-phase3-grpo/`)
+### Phase 3 — GRPO (`recipes-train/qwen3.5-4b-encoder-phase2-grpo/`)
 
 Reinforcement learning with verifiable chess rewards. Starts from Phase 2 checkpoint.
 
 ```bash
-./recipes-train/qwen3.5-4b-phase3-grpo/start.sh
+./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh
 ```
 
 - Rewards: R1 legality (0.25), R3 eval accuracy (0.30), R4a annotations (0.15), R5 relevance (0.10)
-- Output: `checkpoints/qwen3.5-4b-phase3-grpo/`
+- Output: `checkpoints/qwen3.5-4b-encoder-phase2-grpo/`
 
 ---
 

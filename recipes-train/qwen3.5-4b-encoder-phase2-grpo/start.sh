@@ -4,15 +4,15 @@
 # DDP doubles effective throughput vs single-GPU: each GPU processes its own
 # batch of rollouts in parallel, then gradients are all-reduced.
 # Rewards: R1 legality + R2 eval accuracy + R3a annotations + R4 depth + R5 breadth + R6 relevance
-# Output: checkpoints/qwen3.5-4b-phase3-grpo/
+# Output: checkpoints/qwen3.5-4b-encoder-phase2-grpo/
 #
 # Usage:
-#   ./recipes-train/qwen3.5-4b-phase3-grpo/start.sh
-#   ./recipes-train/qwen3.5-4b-phase3-grpo/start.sh --resume           # resume last checkpoint
-#   ./recipes-train/qwen3.5-4b-phase3-grpo/start.sh --resume checkpoints/qwen3.5-4b-phase3-grpo/checkpoint-300
+#   ./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh
+#   ./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh --resume           # resume last checkpoint
+#   ./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh --resume checkpoints/qwen3.5-4b-encoder-phase2-grpo/checkpoint-300
 #
 # Logs: /tmp/chess-grpo.log
-# Stop: ./recipes-train/qwen3.5-4b-phase3-grpo/stop.sh
+# Stop: ./recipes-train/qwen3.5-4b-encoder-phase2-grpo/stop.sh
 
 set -euo pipefail
 

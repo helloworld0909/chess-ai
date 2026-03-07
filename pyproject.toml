@@ -21,6 +21,7 @@ dependencies = [
     "openai>=2.15.0",
     "fastapi[standard]>=0.115",
     "datasets>=2.18",
+    "flash-attn-3>=3.0.0",
 ]
 
 [project.optional-dependencies]

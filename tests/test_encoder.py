@@ -2,10 +2,11 @@ import json
 import os
 import sys
 import tempfile
+from typing import Any, Dict, List, Optional, Union
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import importlib.util as _ilu
@@ -44,29 +45,151 @@ EncoderPretrainDataset = _pre.EncoderPretrainDataset
 EncoderRegressorHead = _pre.EncoderRegressorHead
 
 # ---------------------------------------------------------------------------
+# Minimal fake tokenizer — no network calls, no model weights
+# ---------------------------------------------------------------------------
+
+_VOCAB_SIZE = 151700  # large enough to include MOVE_TOKEN_ID (151654)
+_PAD_ID = 0
+_EOS_ID = 1
+
+
+class _FakeTokenizer:
+    """Minimal tokenizer for encoder tests.
+
+    Tokenises by splitting on whitespace, mapping each token to a stable
+    integer via hash.  The MOVE_TOKEN sentinel gets its correct ID (151654).
+    The collator only needs: __call__, pad(), apply_chat_template().
+    """
+
+    pad_token_id = _PAD_ID
+    eos_token_id = _EOS_ID
+    pad_token = "[PAD]"
+    eos_token = "[EOS]"
+    model_input_names = ["input_ids", "attention_mask"]
+
+    # ------------------------------------------------------------------
+    def _tok_id(self, word: str) -> int:
+        if word == MOVE_TOKEN:
+            return MOVE_TOKEN_ID
+        return max(2, abs(hash(word)) % (_VOCAB_SIZE - 2))
+
+    def __call__(
+        self,
+        text: Union[str, List[str]],
+        return_tensors=None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        if isinstance(text, list):
+            results = [self._encode_single(t) for t in text]
+            ids = [r["input_ids"] for r in results]
+            masks = [r["attention_mask"] for r in results]
+            if return_tensors == "pt":
+                max_len = max(len(i) for i in ids)
+                ids_padded = [i + [_PAD_ID] * (max_len - len(i)) for i in ids]
+                masks_padded = [m + [0] * (max_len - len(m)) for m in masks]
+                return {
+                    "input_ids": torch.tensor(ids_padded),
+                    "attention_mask": torch.tensor(masks_padded),
+                }
+            return {"input_ids": ids, "attention_mask": masks}
+        return self._encode_single(text)
+
+    def _encode_single(self, text: str) -> Dict[str, List[int]]:
+        words = text.split()
+        ids = [self._tok_id(w) for w in words] if words else [_EOS_ID]
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+    def pad(
+        self,
+        features: List[Dict[str, Any]],
+        padding: bool = True,
+        max_length: Optional[int] = None,
+        return_tensors: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        ids_list = [f["input_ids"] for f in features]
+        masks_list = [f["attention_mask"] for f in features]
+        target_len = max_length or max(len(i) for i in ids_list)
+        padded_ids = [i + [_PAD_ID] * (target_len - len(i)) for i in ids_list]
+        padded_masks = [m + [0] * (target_len - len(m)) for m in masks_list]
+        result = {
+            "input_ids": torch.tensor(padded_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(padded_masks, dtype=torch.long),
+        }
+        return result
+
+    def apply_chat_template(
+        self,
+        messages: List[Dict[str, str]],
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        **kwargs,
+    ) -> str:
+        """Concatenate role+content pairs into a single string."""
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            parts.append(f"<|{role}|>{content}<|end|>")
+        if add_generation_prompt:
+            parts.append("<|assistant|>")
+        return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Minimal fake LLM — pure nn.Module, no pretrained weights
+# ---------------------------------------------------------------------------
+
+
+class _FakeEmbedding(nn.Embedding):
+    pass
+
+
+class _FakeLLM(nn.Module):
+    """Tiny causal LM stub with the interface ChessLMWithEncoder expects."""
+
+    def __init__(self, hidden_size: int = 256, vocab_size: int = _VOCAB_SIZE):
+        super().__init__()
+        self.config = type("cfg", (), {"hidden_size": hidden_size})()
+        self._embed = _FakeEmbedding(vocab_size, hidden_size)
+        # Expose the same attribute name as Qwen models
+        self.model = type("model_stub", (), {"embed_tokens": self._embed})()
+        # A single linear head (B, L, H) -> (B, L, V)
+        self._lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def get_input_embeddings(self):
+        return self._embed
+
+    def forward(self, inputs_embeds=None, input_ids=None, attention_mask=None, labels=None, **kw):
+        if inputs_embeds is None:
+            inputs_embeds = self._embed(input_ids)
+        logits = self._lm_head(inputs_embeds)
+        loss = None
+        if labels is not None:
+            # Simple cross-entropy on last dim
+            shift_logits = logits[:, :-1].reshape(-1, logits.size(-1))
+            shift_labels = labels[:, 1:].reshape(-1)
+            mask = shift_labels != -100
+            if mask.any():
+                loss = nn.functional.cross_entropy(shift_logits[mask], shift_labels[mask])
+            else:
+                loss = torch.tensor(0.0, requires_grad=True)
+        return type("Out", (), {"logits": logits, "loss": loss})()
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def mock_tokenizer():
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B-Instruct", trust_remote_code=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    # No add_special_tokens needed — MOVE_TOKEN (<|fim_pad|>) is already in vocab
-    return tok
+    return _FakeTokenizer()
 
 
 @pytest.fixture(scope="module")
 def mock_llm():
-    from transformers import AutoConfig
-
-    config = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B-Instruct")
-    config.hidden_size = 256
-    config.num_hidden_layers = 1
-    llm = AutoModelForCausalLM.from_config(config)
-    # No resize_token_embeddings needed — vocab unchanged
-    return llm
+    return _FakeLLM(hidden_size=256)
 
 
 @pytest.fixture(scope="module")

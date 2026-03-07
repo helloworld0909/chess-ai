@@ -3,7 +3,7 @@
 # Joint task: model sees student move + engine key lines as board embeddings in
 # the user prompt; outputs annotated lines + coaching comment (pure text, no sentinels).
 # Dataset: lines_joint_sft (~31k textbook positions with Stockfish lines + expert coaching comments)
-# DDP: 2× RTX 5090  |  effective batch = 84 (1 × 2 GPUs × 42)
+# DDP: 2× RTX 5090  |  effective batch = 32 (1 × 2 GPUs × 16)
 
 model:
   model_name: "Qwen/Qwen3-4B-Thinking-2507"
@@ -34,13 +34,13 @@ lora:
 training:
   train_file: data/processed/lines_joint_sft.jsonl
   eval_file:  data/processed/lines_joint_sft_eval.jsonl
-  max_seq_length: 2400   # prompts are longer (key lines + coaching comment)
+  max_seq_length: 4400   # max=4311 tokens; covers 100% of samples without truncation
   keep_think: true       # include <think> blocks in SFT loss
   packing: false
 
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 42  # effective batch = 84 (1 × 2 GPUs × 42)
+  gradient_accumulation_steps: 16  # effective batch = 32 (1 × 2 GPUs × 16)
 
   learning_rate: 1.0e-4
   lr_scheduler_type: cosine
@@ -51,7 +51,7 @@ training:
   weight_decay: 0.01
   max_grad_norm: 1.0
 
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   bf16: true
   dataloader_num_workers: 8
   ddp_find_unused_parameters: false
