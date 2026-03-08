@@ -9,6 +9,7 @@ overhead of spawning a new process for every FEN.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import subprocess
@@ -96,6 +97,7 @@ def _parse_float(s: str) -> float:
     return float(s)
 
 
+@functools.lru_cache(maxsize=65536)
 def get_sf15_eval(fen: str) -> dict[str, dict[str, float]]:
     """Return per-term MG/EG averages for White and Black.
 

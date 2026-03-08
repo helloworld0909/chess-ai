@@ -1,28 +1,27 @@
 # Chess AI Tutor
 
-> **Work in progress.** The web UI and coaching pipeline are functional. The two-stage training pipeline (Phase 2 line-gen SFT → Phase 3 GRPO) is actively being developed.
-
-A pedagogical chess analysis system combining Stockfish 17 NNUE evaluations with fine-tuned LLM coaching via a two-stage training pipeline (SFT → GRPO).
+A chess analysis system combining Stockfish evaluations with a fine-tuned encoder+LLM model for move coaching. The model uses a CNN board encoder to inject positional embeddings into the LLM, then learns to annotate engine key lines and produce coaching comments via SFT + GRPO.
 
 ## Features
 
-- **Move Analysis**: Classify moves as Best/Great/Good/Inaccuracy/Mistake/Blunder
-- **Natural Language Coaching**: Human-like explanations of chess concepts
+- **Move Analysis**: Classify moves via Stockfish (Best/Inaccuracy/Mistake/Blunder)
+- **Encoder-augmented LLM**: ResNet CNN encodes board states → embeddings injected at `<|vision_pad|>` tokens in the prompt
+- **SF15 Term Annotations**: Each engine key line move annotated with classical eval term diffs (mobility, king safety, threats, etc.)
+- **Natural Language Coaching**: Model produces structured line analysis + coaching comment grounded in SF15 terms
 - **Web UI**: Browser-based game review with chess.com integration
-- **MCP Integration**: Stockfish tools accessible via Model Context Protocol
-- **Two-Stage Training**: Line-generator SFT cold-start → GRPO with verifiable chess rewards
+- **MCP Integration**: Stockfish tools via Model Context Protocol
 
 ## Installation
 
 ```bash
-# Install dependencies
 uv sync
-
-# Install Stockfish 17
-./scripts/install_stockfish.sh
-
-# Run tests
 ./scripts/test.sh -v
+```
+
+Set Stockfish path:
+```bash
+export STOCKFISH_PATH="$HOME/.local/bin/stockfish"
+export SF15_PATH="$HOME/.local/bin/stockfish-15"
 ```
 
 ## Quick Start
@@ -31,113 +30,140 @@ uv sync
 # Game review (fetches chess.com games, opens browser UI)
 uv run chess-review <username>
 
-# CLI tutor
-STOCKFISH_PATH="$HOME/.local/bin/stockfish" uv run python -c \
-  "import sys; sys.path.insert(0,'src'); from tutor.cli import main; main()"
+# Launch encoder inference server (phase1-sft checkpoint, port 8200)
+./recipes-train/qwen3.5-4b-encoder-phase1-sft/serve.sh
+
+# Launch web UI (port 8080)
+STOCKFISH_PATH=/home/zheng/.local/bin/stockfish \
+ENCODER_SERVER_URL=http://localhost:8200 \
+PYTHONPATH=src uv run uvicorn tutor.web:app --host 0.0.0.0 --port 8080
 ```
 
 ---
 
 ## Project Structure
 
-### `src/chess_mcp/` — MCP Server & Stockfish Integration ✅
+### `src/`
 
-- `stockfish.py` — Async Stockfish UCI wrapper
-- `tools.py` — 6 MCP tools: `get_best_move`, `get_eval`, `get_threats`, `compare_moves`, `get_legal_moves`, `validate_move`
-- `server.py` — MCP server entry point
-- `representations.py` — FEN / ASCII / SVG / PNG converters
+- `chess_mcp/` — MCP server + async Stockfish wrapper (6 tools: get_best_move, get_eval, compare_moves, ...)
+- `verification/` — Move legality validation + GRPO reward functions (`rewards.py`)
+- `tutor/` — FastAPI web server, chess.com client, prompt templates
+- `encoder/` — Board tensor builder (`MOVE_TOKEN`, `MOVE_TOKEN_ID` constants)
 
-### `src/verification/` — Move Validation & GRPO Rewards ✅
+### `training/`
 
-- `legality.py` — Move legality validation (UCI, SAN, LAN)
-- `tactical_loop.py` — LLM output verification against engine
-- `rewards.py` — GRPO reward functions: R1 legality, R3 eval accuracy, R4a annotations, R5 relevance
+- `encoder_model.py` — `ChessLMWithEncoder`: Qwen3.5-4B + ResNet CNN (72M params), PEFT LoRA wrapper
+- `encoder_collator.py` — Builds board tensors from FEN + SAN sequences; injects at `<|vision_pad|>` positions
+- `lib.py` — Shared SFT utilities: `load_jsonl_lines`, `strip_think_from_target`, `make_training_args`
 
-### `src/tutor/` — Web UI & Coaching ✅
+### `recipes-train/`
 
-- `web.py` — FastAPI server with model toggle and compare mode
-- `prompts.py` — Shared prompts: `SYSTEM_PROMPT`, `LINE_GENERATOR_SYSTEM_PROMPT`, formatting helpers
-- `review.py` — CLI entry: fetches chess.com games → starts web server → opens browser
-- `chesscom.py` — chess.com public API client + PGN parser
+| Recipe | Purpose | Status |
+|--------|---------|--------|
+| `encoder-pretrain/` | CNN encoder regression on SF15 evals | ✅ Done (`checkpoint-580083`) |
+| `qwen3.5-4b-encoder-phase1-sft/` | SFT: joint task with engine key lines + coaching comment | ✅ Done (`checkpoint-890`) |
+| `qwen3.5-4b-encoder-phase2-grpo/` | GRPO: SF15 annotation accuracy + comment quality rewards | 🔄 Active |
 
-### `data/pipeline/` — Training Data Pipeline ✅
+### `data/pipeline/`
 
-- `prepare_datasets.py` — Main pipeline: Stockfish analysis + LLM coaching annotations
-- `convert_lines_to_sft.py` — Converts `lines_30k.jsonl` to `<line>` tag SFT format
-- Outputs: `data/processed/lines_sft.jsonl` (28k train), `data/processed/lines_sft_eval.jsonl` (1.4k eval)
+- `generate_phase2_data.py` — Textbook positions + Stockfish depth-18 → `lines_joint_sft.jsonl`
+- `generate_grpo_joint_prompts.py` — Lichess `lines_30k.jsonl` + SF15 annotations → `grpo_joint_prompts_sf15.jsonl`
+- `generate_encoder_data.py` — Board positions for encoder pretraining
+- `sf15_eval.py` — Stockfish 15 classical eval term wrapper (`get_sf15_eval(fen)`)
 
-### `training/` — Shared Training Utilities
+### `data/processed/` (active datasets)
 
-- `train.py` — Base SFT script (QLoRA, DDP, response-only masking)
-- `lib.py` — Dataset helpers: `load_jsonl`, `load_jsonl_lines`, `format_dataset`, `strip_think_from_target`
+| File | Used by |
+|------|---------|
+| `encoder_pretrain_1b.jsonl` | encoder-pretrain |
+| `lines_joint_sft.jsonl` | phase1-sft |
+| `lines_joint_sft_eval.jsonl` | phase1-sft eval |
+| `grpo_joint_prompts_sf15.jsonl` | phase2-grpo (14,950 train) |
+| `grpo_joint_prompts_sf15_eval50.jsonl` | phase2-grpo eval (50 samples) |
+| `lines_30k.jsonl` | source for grpo prompts |
 
 ---
 
 ## Training Pipeline
 
-Three phases, all using `Qwen/Qwen3.5-4B-Instruct` + QLoRA 8-bit on 2× RTX 5090:
+### Architecture
 
-### Phase 1 — Coach SFT (`recipes-train/qwen3.5-4b-phase1-coach-sft/`)
+```
+User prompt:
+  ## Engine Key Lines
+  PLAYED LINE: <|vision_pad|>Ne5 [mobility +0.32; threats +0.18] → <|vision_pad|>d4 [...] | eval: equal
+  Line 1: <|vision_pad|>Nd5 [king safety +0.21] → ...
 
-Teaches the model to explain chess moves in natural language.
+  ↑ CNN injects board embeddings at each <|vision_pad|> token
 
-```bash
-./recipes-train/qwen3.5-4b-phase1-coach-sft/start.sh
+Assistant output:
+  <think>
+  PLAYED: Ne5 → d4 | eval: equal
+    Ne5: mobility +0.32, threats +0.18 → centralises knight, creates tactical pressure
+    ...
+  </think>
+  <line>LINE 1: Ne5 (centralise knight) → d4 (gain space) | eval: equal</line>
+  [coaching comment]
 ```
 
-- Data: `data/processed/train.jsonl` (coach annotations)
-- Output: `checkpoints/qwen3.5-4b-phase1-coach-sft/`
+### Phase 1 — SFT (`qwen3.5-4b-encoder-phase1-sft`)
 
-### Phase 2 — Line Generator SFT (`recipes-train/qwen3.5-4b-phase2-lines-sft/`)
-
-Cold-starts the model on the `<line>` output format before RL.
+Cold-starts the joint task: given board + student move + engine key lines with SF15 annotations, output annotated lines + coaching comment.
 
 ```bash
-./recipes-train/qwen3.5-4b-phase2-lines-sft/start.sh
-./recipes-train/qwen3.5-4b-phase2-lines-sft/stop.sh
-# Logs: /tmp/chess-lines-train.log
+./recipes-train/qwen3.5-4b-encoder-phase1-sft/start.sh
 ```
 
-- Data: `data/processed/lines_sft.jsonl` (28k samples)
-- Output: `checkpoints/qwen3.5-4b-phase2-lines-sft/`
-- Format: `<line>LINE N: move (purpose) → move (purpose) | eval: <label></line>`
+### Phase 2 — GRPO (`qwen3.5-4b-encoder-phase2-grpo`)
 
-### Phase 3 — GRPO (`recipes-train/qwen3.5-4b-encoder-phase2-grpo/`)
-
-Reinforcement learning with verifiable chess rewards. Starts from Phase 2 checkpoint.
+Reinforcement learning from verifiable rewards. Starts from phase1 checkpoint-890.
 
 ```bash
 ./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh
+./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh --resume   # resume last checkpoint
 ```
 
-- Rewards: R1 legality (0.25), R3 eval accuracy (0.30), R4a annotations (0.15), R5 relevance (0.10)
-- Output: `checkpoints/qwen3.5-4b-encoder-phase2-grpo/`
+**Rewards** (6 total, all free — no LLM judge):
+
+| Reward | Weight | Signal |
+|--------|--------|--------|
+| R0 format | 0.10 | `<line>` tags present |
+| R1 legality | hard gate | All line moves legal (python-chess) |
+| R_think | 0.15 | Non-empty think block with ≥2 moves |
+| R3b sf15 | 0.35 | Think-block SF15 term interpretations match prompt diffs |
+| RC_tone | 0.20 | Chess concept vocabulary in coaching comment |
+| RC_educ | 0.20 | Grounded moves + causal reasoning in comment |
+
+Key config: `beta=0.0` (no reference model, pure REINFORCE), 2-GPU DDP, 50-sample eval set.
+
+---
+
+## GRPO Reward Details
+
+`R3b sf15_annotation` is the primary learning signal. For each move in the prompt's Engine Key Lines that has notable SF15 term diffs (|delta| ≥ 0.10), it checks whether the model's `<think>` block interprets the top term in the correct direction using a vocabulary mapping (`_SF15_TERM_VOCAB` in `rewards.py`).
+
+Example: prompt shows `Ne5 [mobility +0.32]` → model says "improves piece activity" → +1.0. Model says "restricts pieces" → −1.0. Model ignores the term → 0.0.
 
 ---
 
 ## Tests
 
 ```bash
-./scripts/test.sh -v        # runs all 99 tests with STOCKFISH_PATH set
+./scripts/test.sh -v   # 288 tests
 ```
 
-| File | Tests |
-|------|-------|
-| `test_stockfish.py` | 16 |
-| `test_mcp_tools.py` | 17 |
-| `test_verification.py` | 40 |
-| `test_representations.py` | 25 |
-| `test_chesscom.py` | 1 |
+| File | Coverage |
+|------|---------|
+| `test_stockfish.py` | Stockfish wrapper |
+| `test_mcp_tools.py` | MCP tools |
+| `test_verification.py` | Move legality |
+| `test_representations.py` | Board display |
+| `test_rewards.py` | All 6 GRPO reward functions |
+| `test_encoder.py` | Board tensors, CNN forward pass |
+| `test_chesscom.py` | chess.com API client |
 
 ---
 
-## Configuration
+## Experiments Log
 
-```bash
-STOCKFISH_PATH=/home/zheng/.local/bin/stockfish
-STOCKFISH_DEPTH=20
-STOCKFISH_THREADS=4
-STOCKFISH_HASH_MB=256
-```
-
-vLLM server (Qwen3.5-35B-A3B, port 8100) is used for coaching data generation and the web UI's LLM backend. See `docker-compose.yml`.
+See [EXPERIMENTS.md](EXPERIMENTS.md) for a history of tried approaches and why each was abandoned or superseded.

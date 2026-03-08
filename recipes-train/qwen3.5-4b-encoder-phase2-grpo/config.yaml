@@ -1,18 +1,19 @@
-# GRPO configuration — Qwen3.5-4B-Thinking-2507 + QLoRA (8-bit, r=64)
-# Stage 1: Line generator RL with verifiable chess rewards
-#
-# Parallelism: 2-GPU DDP via torchrun (each rank = full model replica on own GPU)
-# Rewards: R0 format (0.15) + R_think (0.15) + R1 legality (gate)
-#          + R2 eval accuracy (0.12) + R3a annotation (0.20)
-#          + R4 depth (0.12) + R5 breadth (0.10) + R6 relevance (0.05)
-#          + RC comment rewards (0.25 total; 0.0 when no comment)
-# R1<0 short-circuits line rewards to -1.0; comment rewards always apply
+# GRPO Phase 2 — ChessLMWithEncoder (CNN frozen + LoRA on LLM)
+# Same architecture and prompt format as Phase 1 SFT.
+# CNN board encoder is frozen; LoRA adapters on Qwen3.5-4B are trainable.
+# Rewards: Stockfish legality/eval + structural annotation + coaching quality.
+# Dataset: grpo_joint_prompts.jsonl — 14k unseen Lichess positions from lines_30k,
+#          formatted as lines_joint_sft prompts (JOINT_SYSTEM_PROMPT + Engine Key Lines).
 
 model:
-  model_name: "checkpoints/qwen3.5-4b-encoder-phase1-sft/checkpoint-840-adapter"
-  quantization: "8bit"
+  model_name: "checkpoints/qwen3.5-4b-encoder-phase1-sft/checkpoint-890"
   attn_implementation: "sdpa"
   torch_dtype: bfloat16
+
+encoder:
+  hidden_size: 512
+  num_blocks: 15
+  pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-580083/encoder_weights.pt"
 
 lora:
   r: 64
@@ -29,50 +30,39 @@ lora:
   bias: none
 
 training:
-  train_file: data/processed/grpo_prompts.jsonl
-  eval_file:  data/processed/grpo_prompts_eval.jsonl
+  train_file: data/processed/grpo_joint_prompts_sf15.jsonl
+  eval_file:  data/processed/grpo_joint_prompts_sf15_eval50.jsonl  # 50 samples — fast eval
 
-  # Rollout generation
-  # 2-GPU DDP via torchrun — each rank gets a full model replica on its own GPU.
-  # Constraint: per_device_train_batch_size must be divisible by num_generations.
-  num_generations: 4          # completions per prompt — keep 4 for GRPO advantage variance
-  max_prompt_length: 800      # tokens (system + user — measured p99=641, max=644; 800 = safe ceiling)
-  max_completion_length: 1500 # keep high — want to encourage deep thinking
-  stockfish_depth: 12         # CPU is idle, use full depth for better reward signal
+  num_generations: 4
+  max_prompt_length: 2000    # joint prompts are longer (have Engine Key Lines)
+  max_completion_length: 1500
+  stockfish_depth: 12
 
-  # Batch — GPUs are free (~32GB VRAM each). No encoder server running.
-  # TRL constraint: generation_batch_size = per_device × world_size × grad_accum must be
-  # divisible by num_generations=4 → x × 2 × y = 4n 
-  # Set per_device to 4 to max out memory per GPU
+  # TRL constraint: per_device x world_size x grad_accum divisible by num_generations
+  # 2 x 2 x 4 = 16, 16 % 4 == 0
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 4
+  dataloader_num_workers: 4
+  ddp_find_unused_parameters: false  # CNN is frozen, no unused params in backward
 
-  # Optimiser
   learning_rate: 5.0e-6
   lr_scheduler_type: cosine
-  warmup_steps: 10         # short warmup — LoRA init is small, no need for 236-step ramp
+  warmup_steps: 10
   num_train_epochs: 1
-  optim: adamw_8bit
+  optim: adamw_torch
   weight_decay: 0.01
   max_grad_norm: 0.1
 
-  # GRPO hyperparameters
-  # beta=0: TRL skips the reference model entirely (ref_model=None), saving ~5GB VRAM
-  # per GPU and one full forward pass per step. The Phase 2 SFT reference is weak
-  # (produces illegal moves), so there is no benefit to KL regularization here.
-  beta: 0.0       # no KL penalty — ref model skipped entirely, saves VRAM + compute
-  epsilon: 0.2    # PPO clip ratio
+  beta: 0.0
+  epsilon: 0.2
 
-  # Generation sampling
-  temperature: 0.9
+  temperature: 1.0
   top_p: 0.95
 
-  # Infrastructure
   bf16: true
   gradient_checkpointing: true
   seed: 42
 
-  # Logging / checkpointing
   logging_steps: 5
   eval_strategy: steps
   eval_steps: 100
@@ -85,8 +75,8 @@ output_dir: checkpoints/qwen3.5-4b-encoder-phase2-grpo
 wandb:
   enabled: false
   project: chess-tutor-grpo
-  name: qwen3.5-4b-grpo-phase1
+  name: qwen3.5-4b-encoder-phase2-grpo
   tags:
     - grpo
-    - lines
-    - phase1
+    - encoder
+    - phase2

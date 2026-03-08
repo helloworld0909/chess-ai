@@ -133,8 +133,21 @@ def setup_encoder_model(config_path: str) -> tuple:
             f"MOVE_TOKEN {MOVE_TOKEN!r} resolved to id={actual_id}, expected {MOVE_TOKEN_ID}."
         )
 
-    _logger.info("Loading base LLM (8-bit) on GPU %d", local_rank)
-    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    quant_mode = model_cfg.get("quantization", "8bit")
+    if quant_mode == "8bit":
+        _logger.info("Loading base LLM (8-bit) on GPU %d", local_rank)
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    elif quant_mode == "4bit":
+        _logger.info("Loading base LLM (4-bit) on GPU %d", local_rank)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+    else:
+        _logger.info("Loading base LLM (bf16, no quantization) on GPU %d", local_rank)
+        bnb_config = None
     base_llm = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=bnb_config,
