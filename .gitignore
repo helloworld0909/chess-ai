@@ -67,3 +67,6 @@ Thumbs.db
 
 # UV cache
 .uv/
+
+# Claude Code
+.claude/
