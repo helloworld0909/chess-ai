@@ -22,12 +22,13 @@ class ChessLMWithEncoder(nn.Module):
 
     Usage:
         # collator provides board_tensors_flat (N_total, 38, 8, 8) and
-        # move_counts (B,) so the forward pass knows which tensors belong
-        # to which batch item.
+        # move_counts (B,) alongside input_ids. board_tensors_flat/move_counts
+        # are optional — omit them (or pass None) for TRL log-prob passes on
+        # completion-only sequences; zero embeddings will be used instead.
         out = model(
-            board_tensors_flat=flat,   # (N_total, 38, 8, 8)
-            move_counts=counts,        # (B,)
             input_ids=ids,             # (B, L)
+            board_tensors_flat=flat,   # (N_total, 38, 8, 8)  — optional
+            move_counts=counts,        # (B,)  — optional, kept for API compat
             attention_mask=mask,       # (B, L)
             labels=labels,             # (B, L)
         )
@@ -78,9 +79,9 @@ class ChessLMWithEncoder(nn.Module):
 
     def forward(
         self,
-        board_tensors_flat: torch.Tensor,
-        move_counts: torch.Tensor,
         input_ids: torch.LongTensor,
+        board_tensors_flat: Optional[torch.Tensor] = None,
+        move_counts: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         **kwargs,
@@ -88,54 +89,63 @@ class ChessLMWithEncoder(nn.Module):
         """Forward pass — splices CNN embeddings into move token positions.
 
         Args:
+            input_ids: (B, L)
             board_tensors_flat: (N_total, 38, 8, 8) all board tensors for the
                 batch, concatenated in sequence order across all examples.
-            move_counts: (B,) number of move tokens per example.
-            input_ids: (B, L)
+                If None (e.g. TRL log-prob pass on completion-only sequences),
+                zero embeddings are used for all <|move|> positions.
+            move_counts: (B,) number of move tokens per example. Unused in forward
+                (counts are derived from input_ids); kept for API compatibility.
             attention_mask: (B, L)
             labels: (B, L) — move token positions will be set to -100.
         """
         device = input_ids.device
         dtype = self.embed_tokens.weight.dtype
-
-        # 1. Encode all board tensors in one batched CNN call: (N_total, H)
-        # CNN weights are float32; cast board tensors to CNN weight dtype, not embed dtype
-        cnn_dtype = next(self.cnn.parameters()).dtype
-        cnn_embs_flat = self.cnn(board_tensors_flat.to(device=device, dtype=cnn_dtype))
-        cnn_embs_flat = cnn_embs_flat.to(dtype=dtype)  # cast output to LLM dtype
-
-        # 2. Text embeddings: (B, L, H)
-        text_embs = self.embed_tokens(input_ids)
-
-        # 3. Find all <|move|> positions: (N_total, 2) of (batch_idx, seq_idx)
-        move_positions = (input_ids == self.move_token_id).nonzero(as_tuple=False)
-
-        if move_positions.shape[0] != cnn_embs_flat.shape[0]:
-            raise RuntimeError(
-                f"move token count mismatch: {move_positions.shape[0]} <|move|> tokens "
-                f"in input_ids but {cnn_embs_flat.shape[0]} board tensors provided."
-            )
-
-        # 4. Scatter CNN embeddings into a (B, L, H) canvas then merge.
-        #    index_put with accumulate=False is differentiable under autocast.
         B, L = input_ids.shape
-        H = cnn_embs_flat.shape[-1]
-        cnn_canvas = torch.zeros(B, L, H, dtype=dtype, device=device)
-        if move_positions.shape[0] > 0:
+
+        # 1. Text embeddings: (B, L, H)
+        inputs_embeds = self.embed_tokens(input_ids)
+
+        # 2. Find all <|move|> positions: (N_total, 2) of (batch_idx, seq_idx)
+        move_mask = input_ids == self.move_token_id
+        n_moves = move_mask.sum().item()
+
+        if n_moves > 0:
+            # 3. Encode all board tensors in one batched CNN call: (N_total, H)
+            # CNN weights are float32; cast board tensors to CNN weight dtype, not embed dtype
+            if board_tensors_flat is not None and board_tensors_flat.shape[0] > 0:
+                cnn_dtype = next(self.cnn.parameters()).dtype
+                cnn_embs = self.cnn(board_tensors_flat.to(device=device, dtype=cnn_dtype))
+                cnn_embs = cnn_embs.to(dtype=dtype)  # cast output to LLM dtype
+                # Truncate/pad to match actual move token count
+                if cnn_embs.shape[0] != n_moves:
+                    if cnn_embs.shape[0] > n_moves:
+                        cnn_embs = cnn_embs[:n_moves]
+                    else:
+                        pad = torch.zeros(
+                            n_moves - cnn_embs.shape[0],
+                            cnn_embs.shape[-1],
+                            dtype=dtype,
+                            device=device,
+                        )
+                        cnn_embs = torch.cat([cnn_embs, pad], dim=0)
+            else:
+                H = inputs_embeds.shape[-1]
+                cnn_embs = torch.zeros(n_moves, H, dtype=dtype, device=device)
+
+            # 4. Scatter CNN embeddings directly into inputs_embeds at move positions
+            #    index_put with accumulate=False is differentiable under autocast.
+            move_positions = move_mask.nonzero(as_tuple=False)
             b_idx = move_positions[:, 0]
             l_idx = move_positions[:, 1]
-            cnn_canvas = cnn_canvas.index_put((b_idx, l_idx), cnn_embs_flat, accumulate=False)
+            inputs_embeds = inputs_embeds.index_put((b_idx, l_idx), cnn_embs, accumulate=False)
 
-        # 5. Replace text embeddings at move positions with CNN embeddings
-        move_mask_3d = (input_ids == self.move_token_id).unsqueeze(-1).expand(B, L, H)
-        inputs_embeds = torch.where(move_mask_3d, cnn_canvas, text_embs)
-
-        # 6. Mask <|move|> positions in labels — never predict the move token itself
-        if labels is not None:
+        # 5. Mask <|move|> positions in labels — never predict the move token itself
+        if labels is not None and n_moves > 0:
             labels = labels.clone()
-            labels[input_ids == self.move_token_id] = -100
+            labels[move_mask] = -100
 
-        # 7. Forward through LLM — sequence length unchanged
+        # 6. Forward through LLM — sequence length unchanged
         return self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,

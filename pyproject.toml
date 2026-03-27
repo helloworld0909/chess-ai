@@ -22,6 +22,8 @@ dependencies = [
     "fastapi[standard]>=0.115",
     "datasets>=2.18",
     "flash-attn-3>=3.0.0",
+    "trl==0.29.1",
+    "jmespath>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -32,7 +34,6 @@ training = [
     "accelerate>=0.30",
     "bitsandbytes>=0.43",
     "peft>=0.10",
-    "trl>=0.8",
     "liger-kernel>=0.7",
     "wandb",
     "deepspeed",

@@ -32,6 +32,7 @@ import sys
 import chess
 import torch
 import yaml
+from trl import GRPOTrainer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -301,27 +302,139 @@ def setup_encoder_model(config: dict):
 # ---------------------------------------------------------------------------
 
 
-class EncoderGRPOTrainer:
-    """Thin wrapper that pre-builds board tensors and runs GRPO via a custom loop.
+class EncoderGRPOTrainer(GRPOTrainer):
+    """GRPOTrainer subclass that threads board_tensors_flat through the GRPO pipeline.
 
-    TRL's GRPOTrainer is tightly coupled to HF model.generate() and standard
-    forward(input_ids, attention_mask, labels). ChessLMWithEncoder requires
-    board_tensors_flat + move_counts at every forward pass.
+    TRL's stock GRPOTrainer builds model_inputs manually in
+    _get_per_token_logps_and_entropies with only {input_ids, attention_mask},
+    so ChessLMWithEncoder's CNN forward always received None board tensors —
+    wasting CNN compute and training the LLM on zero embeddings at <|move|>
+    positions instead of real board embeddings.
 
-    Strategy:
-      - Generation: use model.llm (the inner PEFT model) directly — it accepts
-        plain input_ids and produces token completions.  The prompt tokens
-        already contain <|move|> sentinel IDs; during generation the LLM sees
-        them as regular tokens (the CNN embeddings are only needed for the
-        policy gradient forward pass, not for autoregressive sampling).
-      - Policy forward pass: run the full ChessLMWithEncoder with board tensors
-        built from the prompt's fen/line_sans metadata.
-
-    This keeps the implementation simple: generation is text-only, gradients
-    flow through the full encoder model.
+    This subclass:
+      1. Carries board_tensors_flat from the collator batch through
+         _generate_and_score_completions into the buffered inputs dict.
+      2. Passes board_tensors_flat to model(**model_inputs) in every
+         _get_per_token_logps_and_entropies call (policy + ref log-probs).
     """
 
-    pass  # Placeholder — see EncoderGRPOTrainer below
+    def _prepare_inputs(self, generation_batch):
+        # Extract board tensors from the raw collator batch. They live on self
+        # so that _compute_loss can attach them to each accumulation-step batch
+        # after TRL's shuffle/split pipeline (which can't handle the non-batch
+        # first dim of board_tensors_flat).
+        if isinstance(generation_batch, dict):
+            self._full_board_tensors = generation_batch.get("board_tensors_flat")
+        else:
+            self._full_board_tensors = None
+
+        inputs = super()._prepare_inputs(generation_batch)
+
+        # Re-attach board tensors for this accumulation step's prompt_ids.
+        if self._full_board_tensors is not None and "prompt_ids" in inputs:
+            prompt_ids = inputs["prompt_ids"]
+            n_moves = int((prompt_ids == MOVE_TOKEN_ID).sum().item())
+            # steps_per_generation=1 in our config, so _step-1 mod 1 == 0 always,
+            # meaning prior_moves=0 and we take the first n_moves tensors.
+            # This remains correct even if steps_per_generation > 1 is added later
+            # because prompt_ids gives us the exact count needed for this step.
+            step_idx = (self._step - 1) % self.args.steps_per_generation
+            total_steps = self.args.steps_per_generation
+            total_moves = self._full_board_tensors.shape[0]
+            offset = (total_moves * step_idx) // total_steps
+            inputs["board_tensors_flat"] = self._full_board_tensors[offset : offset + n_moves]
+
+        return inputs
+
+    def _compute_loss(self, model, inputs):
+        # Stash board tensors on self so _get_per_token_logps_and_entropies
+        # can inject them into model_inputs without changing its call signature.
+        self._current_board_tensors = inputs.get("board_tensors_flat")
+        try:
+            return super()._compute_loss(model, inputs)
+        finally:
+            self._current_board_tensors = None
+
+    def _get_per_token_logps_and_entropies(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        logits_to_keep,
+        batch_size=None,
+        compute_entropy=False,
+        **kwargs,
+    ):
+        # board_tensors_flat is stashed by _compute_loss for the gradient-step
+        # forward pass. It is None during torch.no_grad() importance-sampling
+        # calls from _generate_and_score_completions (those don't need correct
+        # board embeddings since the CNN is frozen and the call is ref-only).
+        board_tensors_flat = getattr(self, "_current_board_tensors", None)
+        kwargs.pop("board_tensors_flat", None)
+        kwargs.pop("move_counts", None)
+
+        # When called from _compute_loss (train or eval), batch_size is None.
+        # Use per_device_eval_batch_size during eval to avoid OOM on the full
+        # eval batch, and per_device_train_batch_size during training.
+        if batch_size is None:
+            mode = "train" if model.training else "eval"
+            if mode == "eval":
+                batch_size = self.args.per_device_eval_batch_size
+            else:
+                batch_size = self.args.per_device_train_batch_size
+        all_logps = []
+        all_entropies = []
+
+        from trl.trainer.utils import selective_log_softmax
+
+        try:
+            from trl.trainer.utils import entropy_from_logits
+        except ImportError:
+
+            def entropy_from_logits(logits):
+                pd = torch.nn.functional.softmax(logits, dim=-1)
+                return torch.logsumexp(logits, dim=-1) - (pd * logits).sum(dim=-1)
+
+        for start in range(0, input_ids.size(0), batch_size):
+            end = start + batch_size
+            ids_chunk = input_ids[start:end]
+            mask_chunk = attention_mask[start:end]
+
+            model_inputs = {**kwargs, "input_ids": ids_chunk, "attention_mask": mask_chunk}
+
+            # Slice board tensors for this chunk.
+            # board_tensors_flat spans all <|move|> tokens in prompt positions
+            # across the full batch; compute offset by counting move tokens before
+            # this chunk.
+            if board_tensors_flat is not None:
+                prior_n_moves = (input_ids[:start] == MOVE_TOKEN_ID).sum().item()
+                chunk_n_moves = (ids_chunk == MOVE_TOKEN_ID).sum().item()
+                if chunk_n_moves > 0:
+                    model_inputs["board_tensors_flat"] = board_tensors_flat[
+                        prior_n_moves : prior_n_moves + chunk_n_moves
+                    ]
+
+            if "logits_to_keep" in self.model_kwarg_keys:
+                model_inputs["logits_to_keep"] = logits_to_keep + 1
+            model_inputs["use_cache"] = False
+
+            logits = model(**model_inputs).logits
+            logits = logits[:, :-1, :]
+            logits = logits[:, -logits_to_keep:, :]
+            logits = logits / self.temperature
+
+            completion_ids = ids_chunk[:, -logits_to_keep:]
+            logps = selective_log_softmax(logits, completion_ids)
+            all_logps.append(logps)
+
+            if compute_entropy:
+                with torch.no_grad():
+                    entropies = entropy_from_logits(logits)
+                all_entropies.append(entropies)
+
+        logps = torch.cat(all_logps, dim=0)
+        entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
+        return logps, entropies
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +627,7 @@ def main():
 
     combined_reward = build_reward_fn(train_cfg)
 
-    from trl import GRPOConfig, GRPOTrainer
+    from trl import GRPOConfig
 
     grpo_config = GRPOConfig(
         output_dir=config.get("output_dir", "checkpoints/qwen3.5-4b-encoder-phase2-grpo"),
@@ -522,6 +635,7 @@ def main():
         max_prompt_length=max_prompt_length,
         max_completion_length=train_cfg.get("max_completion_length", 1500),
         per_device_train_batch_size=train_cfg.get("per_device_train_batch_size", 2),
+        per_device_eval_batch_size=train_cfg.get("per_device_eval_batch_size", 2),
         gradient_accumulation_steps=train_cfg.get("gradient_accumulation_steps", 4),
         num_train_epochs=train_cfg.get("num_train_epochs", 1),
         max_steps=train_cfg.get("max_steps", -1),
@@ -541,6 +655,7 @@ def main():
         bf16=train_cfg.get("bf16", True),
         gradient_checkpointing=train_cfg.get("gradient_checkpointing", True),
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        torch_empty_cache_steps=train_cfg.get("torch_empty_cache_steps", None),
         seed=train_cfg.get("seed", 42),
         dataloader_num_workers=train_cfg.get("dataloader_num_workers", 0),
         ddp_find_unused_parameters=train_cfg.get("ddp_find_unused_parameters", False),
@@ -568,50 +683,6 @@ def main():
     # warnings_issued shim for TRL/transformers compatibility
     if not hasattr(model, "warnings_issued"):
         model.warnings_issued = {}
-
-    # Patch model.forward to accept board_tensors_flat/move_counts from batch,
-    # building zero tensors when they're absent (e.g. during TRL's log-prob pass
-    # on completions that have no engine lines yet).
-    _original_forward = model.forward
-
-    def _patched_forward(
-        input_ids=None,
-        attention_mask=None,
-        labels=None,
-        board_tensors_flat=None,
-        move_counts=None,
-        inputs_embeds=None,
-        **kwargs,
-    ):
-        # If board tensors not provided, build zero tensors for all <|move|> positions
-        if board_tensors_flat is None or move_counts is None:
-            if input_ids is not None:
-                n_moves = (input_ids == MOVE_TOKEN_ID).sum().item()
-            else:
-                n_moves = 0
-            device = input_ids.device if input_ids is not None else next(model.parameters()).device
-            dtype = next(model.cnn.parameters()).dtype
-            board_tensors_flat = torch.zeros(max(n_moves, 1), 38, 8, 8, device=device, dtype=dtype)
-            if input_ids is not None:
-                B = input_ids.shape[0]
-                move_counts = torch.tensor(
-                    [(input_ids[i] == MOVE_TOKEN_ID).sum().item() for i in range(B)],
-                    device=device,
-                    dtype=torch.long,
-                )
-            else:
-                move_counts = torch.tensor([0], device=device, dtype=torch.long)
-
-        return _original_forward(
-            board_tensors_flat=board_tensors_flat,
-            move_counts=move_counts,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            **kwargs,
-        )
-
-    model.forward = _patched_forward
 
     # Shims for HF PreTrainedModel methods that GRPOTrainer calls on the model
     if not hasattr(model, "add_model_tags"):
@@ -656,7 +727,7 @@ def main():
     if not hasattr(model, "_keys_to_ignore_on_save"):
         model._keys_to_ignore_on_save = None
 
-    trainer = GRPOTrainer(
+    trainer = EncoderGRPOTrainer(
         model=model,
         reward_funcs=[combined_reward],
         args=grpo_config,

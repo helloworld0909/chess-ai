@@ -145,9 +145,9 @@ def _prompt_str(prompt: list[dict] | str) -> str:
 
 def _lines_start_fen(prompt_text: str, move_san: str = "") -> str:
     fen_before, fen_after, _ = _extract_context(prompt_text, move_san_override=move_san)
-    if "## Engine Key Lines" in prompt_text:
-        return fen_before or fen_after
-    return fen_after
+    # Engine Key Lines show continuations after the student's move has been played,
+    # so legality replay must start from fen_after (opponent to move), not fen_before.
+    return fen_after or fen_before
 
 
 # ---------------------------------------------------------------------------
@@ -251,11 +251,11 @@ def reward_format(
     completions: list,
     **kwargs: Any,
 ) -> list[float]:
-    """R0: +1.0 if completion contains ≥1 <line>...</line> block, -1.0 otherwise."""
+    """R0: +1.0 if completion contains ≥1 parsed line (PLAYED/LINE N format), -1.0 otherwise."""
     scores = []
     for comp in completions:
         text = comp[-1]["content"] if isinstance(comp, list) else str(comp)
-        has_line = bool(re.search(r"<line>.*?</line>", text, re.DOTALL))
+        has_line = bool(parse_lines(text))
         scores.append(1.0 if has_line else -1.0)
     return scores
 
@@ -572,7 +572,7 @@ def _model_correctly_interprets(
     Returns:
       +1.0  correct direction mentioned (positive term → positive framing)
       -1.0  wrong direction mentioned (positive term → negative framing)
-       0.0  term not mentioned at all (neutral — model skipped it)
+      -0.5  term not mentioned at all (model skipped a move with notable terms)
     """
     # Find the top term by absolute value
     if not terms:
@@ -594,7 +594,7 @@ def _model_correctly_interprets(
             relevant_lines.append(tline.lower())
 
     if not relevant_lines:
-        return 0.0  # model didn't mention this move in think
+        return -0.5  # model didn't mention this move in think — penalise
 
     context = " ".join(relevant_lines)
 
@@ -603,7 +603,7 @@ def _model_correctly_interprets(
     has_negative = any(w in context for w in negative_words)
 
     if not has_positive and not has_negative:
-        return 0.0  # mentioned the move but not this term concept
+        return -0.5  # mentioned the move but not this term concept
 
     # top_delta > 0 means term improved for moving side → expect positive framing
     if top_delta > 0:
@@ -917,9 +917,9 @@ _WEIGHTS = {
     "format": 0.10,  # cold-start gate
     "think": 0.15,  # reasoning quality
     "legality": 1.0,  # hard gate (unweighted — used as gate in combined)
-    "sf15": 0.35,  # SF15 term accuracy — primary quality signal
-    "tone": 0.20,  # comment chess vocabulary
-    "educational": 0.20,  # comment grounding + causal reasoning
+    "sf15": 0.50,  # SF15 term accuracy — primary quality signal
+    "tone": 0.15,  # comment chess vocabulary
+    "educational": 0.10,  # comment grounding + causal reasoning
 }
 
 

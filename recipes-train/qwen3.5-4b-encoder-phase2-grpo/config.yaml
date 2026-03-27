@@ -41,6 +41,7 @@ training:
   # TRL constraint: per_device x world_size x grad_accum divisible by num_generations
   # 2 x 2 x 4 = 16, 16 % 4 == 0
   per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
   gradient_accumulation_steps: 4
   dataloader_num_workers: 4
   ddp_find_unused_parameters: false  # CNN is frozen, no unused params in backward
@@ -61,11 +62,12 @@ training:
 
   bf16: true
   gradient_checkpointing: true
+  torch_empty_cache_steps: 1
   seed: 42
 
   logging_steps: 5
   eval_strategy: steps
-  eval_steps: 100
+  eval_steps: 500
   save_strategy: steps
   save_steps: 10
   save_total_limit: 20
