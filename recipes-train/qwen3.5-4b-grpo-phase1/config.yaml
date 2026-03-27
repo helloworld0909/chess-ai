@@ -12,8 +12,8 @@ model:
   torch_dtype: bfloat16
 
 lora:
-  r: 64
-  alpha: 128
+  r: 32
+  alpha: 64
   dropout: 0.05
   target_modules:
     - q_proj
@@ -29,15 +29,15 @@ training:
   train_file: data/processed/grpo_phase1_prompts.jsonl
   eval_file:  data/processed/grpo_phase1_prompts_eval.jsonl
 
-  num_generations: 16
-  max_completion_length: 16000
+  num_generations: 4
+  max_completion_length: 8192
 
   # generation_batch_size = per_device_train_batch_size x steps_per_generation
   # prompts_per_generation_call = generation_batch_size // num_generations
-  # 4 x 8 = 32 → 32 // 16 = 2 prompts generated together each step
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 16
-  gradient_accumulation_steps: 16
+  # 1 x 8 = 8 → 8 // 8 = 1 prompt per generation call
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
   steps_per_generation: 8
   dataloader_num_workers: 2
 
@@ -45,22 +45,17 @@ training:
   lr_scheduler_type: cosine
   warmup_steps: 5
   num_train_epochs: 1
-  optim: adamw_torch
+  optim: adamw_8bit
   weight_decay: 0.01
   max_grad_norm: 0.1
 
   beta: 0.0     # pure REINFORCE — no reference model
   epsilon: 0.2
 
-  use_vllm: false
-  vllm_mode: colocate
-  vllm_gpu_memory_utilization: 0.3
-
   temperature: 1.0
   top_p: 0.95
 
   bf16: true
-  gradient_checkpointing: true
   torch_empty_cache_steps: 1
   seed: 42
 

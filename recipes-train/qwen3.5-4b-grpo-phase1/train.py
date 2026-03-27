@@ -4,7 +4,7 @@ Vanilla Qwen3.5-4B with LoRA, no chess encoder. Goal: verify the GRPO +
 judge reward loop produces improving completions before adding the encoder.
 
 Reward: GCC-Eval judge (Qwen3.5-35B-A3B-GPTQ-Int4, port 8400).
-Single GPU (GPU 0) — GPU 1 reserved for judge.
+Both GPUs available for training — judge runs via OpenRouter API.
 
 Usage:
     ./recipes-train/qwen3.5-4b-grpo-phase1/start.sh
@@ -18,8 +18,8 @@ import json
 import logging
 import os
 import sys
-from typing import Any
 
+import unsloth  # must be imported before transformers/trl
 import yaml
 from trl import GRPOConfig, GRPOTrainer
 
@@ -112,19 +112,25 @@ CHESS_TOOLS: list[dict] = [
 _SYSTEM_PROMPT = """\
 You are an expert chess coach giving move-by-move feedback to a student.
 
-You have tools to analyse the position. Use them — especially sf15_term_diff to verify strategic claims.
+You have tools to analyse the position. Use them immediately — don't speculate, just call the tool.
 
 Workflow:
-1. Think step by step inside <think>...</think> — reason about the position, call tools, interpret results.
-2. Write your coaching comment AFTER </think> — direct, second person, no tool syntax.
+1. <think>: Keep it SHORT. Identify the move, call sf15_term_diff right away, read the result, done. \
+No long reasoning — the tool gives you the facts.
+2. After </think>: write your coaching comment — direct, second person, 2-5 sentences max.
 
-Coaching rules:
-- Write in second person ("You centralise the knight", "You play Nd5 to...").
+Think block rules:
+- CALL TOOLS FIRST, reason after. Do not think for more than a few sentences before calling a tool.
+- One or two tool calls is enough. Do not over-analyse.
+- Keep the entire think block under 300 words.
+
+Coaching comment rules:
+- Second person ("You centralise the knight", "You play Nd5 to...").
 - Name the key strategic or tactical idea and explain WHY this move achieves it.
 - Reference specific moves, squares, or pieces — never vague platitudes.
-- OPENING (moves 1-12): be concise (2-3 sentences), identify opening/variation.
-- MIDDLEGAME: explain the key idea and top alternatives (3-5 sentences).
-- ENDGAME: analyse key lines in depth (4-6 sentences).
+- OPENING (moves 1-12): 2-3 sentences, identify opening/variation.
+- MIDDLEGAME: key idea + top alternative, 3-4 sentences.
+- ENDGAME: key lines, 4-5 sentences.
 - Do NOT parrot engine numbers, generic study advice, or opening recommendations.
 """
 
@@ -167,12 +173,14 @@ def load_grpo_dataset(jsonl_path: str, tokenizer):
             prompt_msgs = msgs[:-1] if msgs[-1]["role"] == "assistant" else msgs
             phase_msgs = _build_messages(prompt_msgs)
 
-            rows.append({
-                "prompt": phase_msgs,
-                "fen": fen,
-                "move_san": move_san,
-                "chat_template_kwargs": {"tools": CHESS_TOOLS},
-            })
+            rows.append(
+                {
+                    "prompt": phase_msgs,
+                    "fen": fen,
+                    "move_san": move_san,
+                    "chat_template_kwargs": {"tools": CHESS_TOOLS},
+                }
+            )
 
     log.info("Loaded %d GRPO rows from %s", len(rows), jsonl_path)
     return Dataset.from_list(rows)
@@ -184,42 +192,43 @@ def load_grpo_dataset(jsonl_path: str, tokenizer):
 
 
 def setup_model(config: dict):
-    import torch
-    from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from unsloth import FastLanguageModel
 
     model_cfg = config["model"]
     lora_cfg = config["lora"]
     base_model_name = model_cfg["model_name"]
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    train_cfg = config["training"]
 
-    log.info("Loading tokenizer from %s", base_model_name)
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    max_seq_len = train_cfg.get("max_completion_length", 8192) + 512  # prompt headroom
+
+    log.info("Loading %s with Unsloth (max_seq_len=%d)", base_model_name, max_seq_len)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=base_model_name,
+        max_seq_length=max_seq_len,
+        dtype=None,  # auto-detect bfloat16
+        load_in_4bit=False,
+        trust_remote_code=True,
+    )
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    log.info("Loading base LLM (bf16) from %s on GPU %d", base_model_name, local_rank)
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        device_map={"": local_rank},
-        attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
-    )
-
-    lora_config = LoraConfig(
-        r=lora_cfg.get("r", 64),
-        lora_alpha=lora_cfg.get("alpha", 128),
+    log.info("Applying LoRA (r=%d, alpha=%d)", lora_cfg.get("r", 32), lora_cfg.get("alpha", 64))
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=lora_cfg.get("r", 32),
+        lora_alpha=lora_cfg.get("alpha", 64),
         target_modules=lora_cfg.get(
             "target_modules",
             ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         ),
         lora_dropout=lora_cfg.get("dropout", 0.05),
         bias=lora_cfg.get("bias", "none"),
-        task_type="CAUSAL_LM",
+        use_gradient_checkpointing="unsloth",
+        random_state=42,
+        use_rslora=False,
     )
-    model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     return model, tokenizer
 
@@ -400,18 +409,18 @@ def main():
 
     grpo_config = GRPOConfig(
         output_dir=config.get("output_dir", "checkpoints/qwen3.5-4b-grpo-phase1"),
-        num_generations=train_cfg.get("num_generations", 8),
-        max_completion_length=train_cfg.get("max_completion_length", 16000),
+        num_generations=train_cfg.get("num_generations", 4),
+        max_completion_length=train_cfg.get("max_completion_length", 8192),
         per_device_train_batch_size=train_cfg.get("per_device_train_batch_size", 1),
-        per_device_eval_batch_size=train_cfg.get("per_device_eval_batch_size", 8),
-        gradient_accumulation_steps=train_cfg.get("gradient_accumulation_steps", 8),
+        per_device_eval_batch_size=train_cfg.get("per_device_eval_batch_size", 4),
+        gradient_accumulation_steps=train_cfg.get("gradient_accumulation_steps", 4),
         steps_per_generation=train_cfg.get("steps_per_generation", None),
         num_train_epochs=train_cfg.get("num_train_epochs", 1),
         max_steps=train_cfg.get("max_steps", -1),
         learning_rate=train_cfg.get("learning_rate", 3e-6),
         lr_scheduler_type=train_cfg.get("lr_scheduler_type", "cosine"),
         warmup_steps=train_cfg.get("warmup_steps", 5),
-        optim=train_cfg.get("optim", "adamw_torch"),
+        optim=train_cfg.get("optim", "adamw_8bit"),
         weight_decay=train_cfg.get("weight_decay", 0.01),
         max_grad_norm=train_cfg.get("max_grad_norm", 0.1),
         logging_steps=train_cfg.get("logging_steps", 1),
@@ -422,8 +431,8 @@ def main():
         save_steps=train_cfg.get("save_steps", 10),
         save_total_limit=train_cfg.get("save_total_limit", 10),
         bf16=train_cfg.get("bf16", True),
-        gradient_checkpointing=train_cfg.get("gradient_checkpointing", True),
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        # Gradient checkpointing is handled by Unsloth's "unsloth" mode in get_peft_model
+        gradient_checkpointing=False,
         torch_empty_cache_steps=train_cfg.get("torch_empty_cache_steps", 1),
         seed=train_cfg.get("seed", 42),
         dataloader_num_workers=train_cfg.get("dataloader_num_workers", 2),
@@ -431,15 +440,10 @@ def main():
         epsilon=train_cfg.get("epsilon", 0.2),
         temperature=train_cfg.get("temperature", 1.0),
         top_p=train_cfg.get("top_p", 0.95),
-        use_vllm=train_cfg.get("use_vllm", False),
-        vllm_mode=train_cfg.get("vllm_mode", "colocate"),
-        vllm_gpu_memory_utilization=train_cfg.get("vllm_gpu_memory_utilization", 0.3),
+        use_vllm=False,
         report_to="wandb" if wandb_cfg.get("enabled") else "none",
         remove_unused_columns=False,
     )
-
-    if not hasattr(model, "warnings_issued"):
-        model.warnings_issued = {}
 
     trainer = GRPOTrainer(
         model=model,
