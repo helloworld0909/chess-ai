@@ -1,0 +1,86 @@
+# GRPO Phase 1 — Board-reading pretraining
+#
+# Verifiable tasks: legal_moves, captures, in_check, piece_at
+# Rule-based reward (no LLM judge) — both GPUs (Unsloth FastVisionModel).
+# Short completions: think block + <answer>...</answer> ~300-800 tokens max.
+
+model:
+  model_name: "Qwen/Qwen3.5-4B"
+  torch_dtype: bfloat16
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    # LLM attention + MLP
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    # Visual encoder attention + MLP
+    - qkv
+    - linear_fc1
+    - linear_fc2
+  bias: none
+
+training:
+  train_file: data/processed/grpo_phase1_board_reading.jsonl
+  eval_file:  data/processed/grpo_phase1_board_reading_eval.jsonl
+
+  # Curriculum phase 1: easy tasks only. Set to null for full training.
+  task_filter: ["in_check", "piece_at"]
+
+  num_generations: 4
+  max_completion_length: 4096
+
+  # Effective batch = per_device_train_batch_size × gradient_accumulation_steps × num_generations × num_gpus
+  # = 8 × 1 × 4 × 2 = 64 completions/optimizer step
+  # Eval has no backward — can be much larger than train batch
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 1
+  dataloader_num_workers: 2
+
+  learning_rate: 2.0e-6
+  lr_scheduler_type: cosine
+  warmup_steps: 50
+  num_train_epochs: 1
+  optim: adamw_torch_fused
+  weight_decay: 0.01
+  max_grad_norm: 0.1
+
+  beta: 0.0     # pure REINFORCE — no reference model
+  epsilon: 0.2
+
+  # Linear length penalty on completion word count
+  len_penalty_free_tokens: 500   # no penalty up to this many words
+  len_penalty_max: 0.1           # max penalty at max_completion_length
+
+  temperature: 1.0
+  top_p: 0.95
+
+  bf16: true
+  seed: 42
+
+  logging_steps: 1
+  eval_strategy: steps
+  eval_steps: 100
+  save_strategy: steps
+  save_steps: 20
+  save_total_limit: 10
+
+output_dir: checkpoints/qwen3.5-4b-grpo-phase1
+
+wandb:
+  enabled: false
+  project: chess-tutor-grpo
+  name: qwen3.5-4b-grpo-phase1
+  tags:
+    - grpo
+    - phase1
+    - board-reading
+    - rule-based-reward

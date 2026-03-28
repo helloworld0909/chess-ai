@@ -70,8 +70,8 @@ chess-ai/
 Chess.com username is set in `.env` as `CHESS_COM_USERNAME`.
 
 ```bash
-# Install dependencies
-uv sync
+# Install dependencies (always use uv sync, never uv pip install)
+uv sync --extra training
 
 # Set Stockfish path (required for engine tests)
 export STOCKFISH_PATH="/home/zheng/.local/bin/stockfish"

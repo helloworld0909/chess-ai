@@ -28,7 +28,6 @@ dependencies = [
 [project.optional-dependencies]
 # Training deps — install with: uv sync --extra training
 # torch+cu130 and torchvision come from the PyTorch index (see [tool.uv.sources] below)
-# Unsloth requires transformers<=5.3.0 and trl<=0.24.0
 #
 # After uv sync, build CUDA extensions from source (one-time, sm_120 only):
 #   TORCH_CUDA_ARCH_LIST="12.0" MAX_JOBS=6 uv pip install flash-attn causal-conv1d --no-build-isolation --no-cache
@@ -36,15 +35,19 @@ dependencies = [
 training = [
     "torch==2.11.0",
     "torchvision",
-    "transformers>=4.51.3,<=5.3.0",
+    "transformers>=4.51.3",
     "huggingface_hub>=1.3.0",
     "datasets>=2.18",
     "accelerate>=0.30",
     "bitsandbytes>=0.45.5",
     "peft>=0.10",
-    "trl>=0.18.2,<=0.24.0",
-    "unsloth",
-    "unsloth_zoo",
+    "trl>=0.29.1",
+    "liger-kernel @ git+https://github.com/linkedin/Liger-Kernel.git",
+    "kernels",
+    "nvidia-cudnn-cu12>=9.0",
+    "nvidia-cusparselt-cu12",
+    "nvidia-nccl-cu12",
+    "nvidia-nvshmem-cu12",
     "jmespath>=1.0",
     "wandb",
 ]
