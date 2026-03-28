@@ -39,6 +39,11 @@ from trl.trainer.grpo_trainer import GRPOTrainer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+import torch._dynamo
+
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.suppress_errors = True  # fall back to eager on guard failures
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -128,6 +133,8 @@ def render_board_png_cached(fen: str, size: int = 256, flipped: bool = False) ->
     board = chess.Board(fen)
     svg = chess.svg.board(board, size=size, flipped=flipped)
     png = cairosvg.svg2png(bytestring=svg.encode())
+    if png is None:
+        raise RuntimeError(f"cairosvg.svg2png returned None for FEN: {fen}")
 
     with open(cache_path, "wb") as f:
         f.write(png)
@@ -236,7 +243,7 @@ def load_grpo_dataset(jsonl_path: str, board_size: int = 256, task_filter: list[
 
 def setup_model(config: dict):
     import torch
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     model_cfg = config["model"]
@@ -264,9 +271,10 @@ def setup_model(config: dict):
         bias=lora_cfg.get("bias", "none"),
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-    return model, processor
+    peft_model = get_peft_model(model, lora_config)
+    assert isinstance(peft_model, PeftModel)
+    peft_model.print_trainable_parameters()
+    return peft_model, processor
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +306,10 @@ def _score_answer(task: str, predicted: str, gold: str) -> float:
         intersection = len(pred_set & gold_set)
         union = len(pred_set | gold_set)
         return intersection / union if union > 0 else 0.0
-    elif task in ("in_check", "piece_at"):
+    elif task in ("in_check", "piece_at", "attacked_by"):
         return 1.0 if predicted.lower().strip() == gold.lower().strip() else 0.0
+    elif task in ("count_pieces", "piece_count_by_type", "material_count"):
+        return 1.0 if predicted.strip() == gold.strip() else 0.0
     return 0.0
 
 
@@ -472,6 +482,7 @@ def main():
         epsilon=train_cfg.get("epsilon", 0.2),
         temperature=train_cfg.get("temperature", 0.8),
         top_p=train_cfg.get("top_p", 0.95),
+        repetition_penalty=train_cfg.get("repetition_penalty", 1.0),
         use_vllm=False,
         use_liger_kernel=True,
         report_to="wandb" if wandb_cfg.get("enabled") else "none",
