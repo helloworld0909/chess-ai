@@ -333,8 +333,24 @@ def build_reward_fn(train_cfg: dict):
         scores: list[float] = []
         log_records: list[dict] = []
 
-        for comp, task, gold, fen in zip(completions, tasks, gold_answers, fens):
+        for prompt, comp, task, gold, fen in zip(prompts, completions, tasks, gold_answers, fens):
             text = _completion_text(comp)
+            # Extract user message text from prompt (last user turn)
+            prompt_text = ""
+            if isinstance(prompt, list):
+                for msg in reversed(prompt):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            # Multimodal: extract text parts only (skip PngImageFile etc.)
+                            prompt_text = " ".join(
+                                c.get("text", "") if isinstance(c, dict) else str(c)
+                                for c in content
+                                if not isinstance(c, dict) or c.get("type") == "text"
+                            )
+                        else:
+                            prompt_text = str(content)
+                        break
 
             has_answer_tag = 1.0 if _ANSWER_RE.search(text) else 0.0
             predicted = _extract_answer(text)
@@ -352,6 +368,8 @@ def build_reward_fn(train_cfg: dict):
                     "score": score,
                     "penalty": penalty,
                     "has_tag": bool(has_answer_tag),
+                    "prompt": prompt_text,
+                    "completion": text,
                 }
             )
 
@@ -388,7 +406,7 @@ def main():
     parser.add_argument(
         "--config", "-c", default="recipes-train/qwen3.5-4b-grpo-phase1/config.yaml"
     )
-    parser.add_argument("--resume", nargs="?", const=True, default=None)
+    parser.add_argument("--resume", nargs="?", const="latest", default=None)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -474,7 +492,22 @@ def main():
     )
 
     log.info("Starting GRPO Phase-1 board-reading training (both GPUs)...")
-    trainer.train(resume_from_checkpoint=args.resume)
+    resume = args.resume
+    if resume == "latest":
+        # Find latest checkpoint in output_dir
+        import glob as _glob
+
+        ckpts = sorted(
+            _glob.glob(
+                os.path.join(
+                    config.get("output_dir", "checkpoints/qwen3.5-4b-grpo-phase1"), "checkpoint-*"
+                )
+            )
+        )
+        resume = ckpts[-1] if ckpts else None
+        if resume:
+            log.info("Resuming from latest checkpoint: %s", resume)
+    trainer.train(resume_from_checkpoint=resume)
 
     out = config.get("output_dir", "checkpoints/qwen3.5-4b-grpo-phase1")
     log.info("Saving model to %s", out)

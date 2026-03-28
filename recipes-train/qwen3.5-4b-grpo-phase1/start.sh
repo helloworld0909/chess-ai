@@ -36,6 +36,8 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 export HF_HUB_VERBOSITY=warning
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 export CUDA_VISIBLE_DEVICES=0,1
 export OMP_NUM_THREADS=8
 export STOCKFISH_PATH="${STOCKFISH_PATH:-$HOME/.local/bin/stockfish}"
@@ -64,6 +66,8 @@ nohup bash -c "source $REPO_ROOT/.venv/bin/activate \
   && export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   && export TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
   && export HF_HUB_VERBOSITY=warning \
+  && export HF_HUB_OFFLINE=1 \
+  && export TRANSFORMERS_OFFLINE=1 \
   && export CUDA_VISIBLE_DEVICES=0,1 \
   && export STOCKFISH_PATH=${STOCKFISH_PATH} \
   && export PYTHONPATH=$REPO_ROOT/src:${PYTHONPATH:-} \

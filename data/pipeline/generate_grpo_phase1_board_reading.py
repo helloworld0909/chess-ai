@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 _SYSTEM_PROMPT = """\
 You are an expert chess coach with deep positional understanding.
 
-You will be shown a board image and the FEN of a chess position. \
+You will be shown a board image of a chess position. \
 Answer the question precisely and concisely.
 
 Answer format:
@@ -97,7 +97,7 @@ def _task_legal_moves(board: chess.Board) -> tuple[str, str]:
         return "", ""
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
-        f"({_side(board)} to move). FEN: {board.fen()}\n\n"
+        f"({_side(board)} to move).\n\n"
         "List all legal moves available to the side to move. "
         "One move per line, in SAN notation, sorted alphabetically."
     )
@@ -110,7 +110,7 @@ def _task_captures(board: chess.Board) -> tuple[str, str]:
     captures = sorted(board.san(m) for m in board.legal_moves if board.is_capture(m))
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
-        f"({_side(board)} to move). FEN: {board.fen()}\n\n"
+        f"({_side(board)} to move).\n\n"
         "List all capture moves available to the side to move. "
         "One move per line, in SAN notation, sorted alphabetically. "
         'If there are no captures, answer "none".'
@@ -123,7 +123,7 @@ def _task_in_check(board: chess.Board) -> tuple[str, str]:
     """Ask if the side to move is in check."""
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
-        f"({_side(board)} to move). FEN: {board.fen()}\n\n"
+        f"({_side(board)} to move).\n\n"
         "Is the side to move currently in check? Answer yes or no."
     )
     answer = "yes" if board.is_check() else "no"
@@ -147,7 +147,7 @@ def _task_piece_at(board: chess.Board) -> tuple[str, str]:
 
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
-        f"({_side(board)} to move). FEN: {board.fen()}\n\n"
+        f"({_side(board)} to move).\n\n"
         f"What piece is on square {sq_name}? "
         'Answer with color and piece type (e.g. "white rook") or "empty".'
     )
