@@ -24,6 +24,7 @@ wheels/
 .venv/
 venv/
 ENV/
+train.venv/
 
 # IDE
 .idea/
@@ -70,3 +71,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Unsloth compiled cache (auto-generated JIT kernels)
+unsloth_compiled_cache/
