@@ -57,6 +57,7 @@ checkpoints/
 # Logs
 *.log
 wandb/
+completions_*.jsonl
 
 # Environment
 .env
