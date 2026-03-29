@@ -7,7 +7,9 @@ Documents completed and abandoned training experiments.
 ## Active Training Pipeline
 
 ```
-encoder-pretrain → qwen3.5-4b-encoder-phase1-sft → qwen3.5-4b-encoder-phase2-grpo (current)
+encoder-pretrain → qwen3.5-4b-encoder-phase1-sft → qwen3.5-4b-encoder-phase2-grpo
+                                                  ↗
+qwen3.5-4b-grpo-phase1 (board-reading pretraining, current)
 ```
 
 ### encoder-pretrain
@@ -21,12 +23,37 @@ encoder-pretrain → qwen3.5-4b-encoder-phase1-sft → qwen3.5-4b-encoder-phase2
 - **Data**: `lines_joint_sft.jsonl` (28k textbook positions with SF15 annotations, Stockfish depth-18 lines)
 - **Result**: `checkpoints/qwen3.5-4b-encoder-phase1-sft/checkpoint-890` ✅ (used by phase2 GRPO)
 
-### qwen3.5-4b-encoder-phase2-grpo (current)
+### qwen3.5-4b-grpo-phase1 (current)
+- **Goal**: GRPO board-reading pretraining — teach the model to read chess positions from board images before tackling coaching tasks
+- **Base model**: `Qwen/Qwen3.5-4B` base (not SFT checkpoint — encoder-phase1-sft was broken)
+- **Data**: `grpo_phase1c_board_reading.jsonl` — 100k samples, 16,750 unique positions × 6 tasks
+- **Tasks** (all rule-based, no LLM judge):
+  - `piece_at`: what piece is on square X? → "white rook" / "empty"
+  - `count_pieces`: how many white/black pieces total? → integer
+  - `material_count`: count both sides → "white: N\nblack: N"
+  - `piece_positions`: list squares of white/black knights (etc.) → square list or "none"
+  - `in_check`: which squares give check? → square list or "none"
+  - `attacked_by`: which pieces attack square X? → attacker square list or "none"
+- **Rewards**: `0.01 * format + 0.99 * exact_match - len_penalty(max=0.5)`
+  - Jaccard similarity for square-list tasks; exact match for counts/pieces
+  - Format reward kept tiny (0.01) to prevent gaming
+- **Config**: beta=0.05 (KL from base), lr=1e-5, warmup=50, t=1.0, r=64 LoRA
+- **Key lessons learned**:
+  - `beta=0.0` (pure REINFORCE) → entropy collapse by step ~735 despite t=1.3
+  - `beta=0.01` → mode collapse by step ~700 (outputs `</think><answer>no</answer>`)
+  - `beta=0.05` → stable so far; KL stays bounded
+  - TRL PEFT resume bug: adapter weights reset on `resume_from_checkpoint`; fixed by explicit `set_peft_model_state_dict` before `trainer.train()`
+  - Yes/no tasks (`in_check`, `attacked_by`) gameable — replaced with square-list answers
+  - Eval OOM: TRL eval computes ref logprobs + Accelerate casts logits to fp32 → 15GB spike; disabled eval entirely
+  - Checkpoint collapse: save every 50 steps, limit 50, never delete old ones
+- **Status**: In progress (phase1c, step ~100)
+
+### qwen3.5-4b-encoder-phase2-grpo
 - **Goal**: GRPO RL on the joint coaching task; rewards for SF15 annotation accuracy, comment quality, move legality
 - **Base model**: phase1-sft checkpoint-890
 - **Data**: `grpo_joint_prompts_sf15.jsonl` (14,950 Lichess positions with SF15 term annotations)
 - **Rewards**: R0 format, R1 legality, R3b SF15 annotation, RC_tone, RC_educ
-- **Status**: In progress
+- **Status**: Paused (blocked on board-reading pretraining)
 
 ---
 
@@ -84,6 +111,8 @@ encoder-pretrain → qwen3.5-4b-encoder-phase1-sft → qwen3.5-4b-encoder-phase2
 ## Key Architecture Decisions
 
 - **Sentinel injection**: `<|vision_pad|>` (token ID 151654) replaces each SAN in user prompt; CNN injects board embeddings at these positions
-- **Beta=0.0**: No reference model in GRPO (pure REINFORCE); saves ~4.3GB GPU memory
+- **Beta=0.05 (phase1)**: KL penalty from base model prevents entropy/mode collapse; with PEFT this is free (no second model copy — TRL disables adapter for ref logprobs)
+- **Beta=0.0 (phase2)**: No reference model in GRPO (pure REINFORCE); saves ~4.3GB GPU memory
 - **SF15 terms**: Use Stockfish 15 classical eval (not SF16+) for interpretable term diffs (mobility, king safety, threats, etc.)
-- **Eval set**: 50 samples only — prevents NCCL timeout during DDP eval step
+- **Eval disabled (phase1)**: TRL eval computes ref logprobs + Accelerate fp32 cast of logits → 15GB OOM spike on 32GB cards; train reward logging is sufficient
+- **Board-reading pretraining**: Train on verifiable position tasks before coaching to establish basic board perception
