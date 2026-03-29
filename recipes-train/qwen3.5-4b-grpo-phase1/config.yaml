@@ -1,6 +1,6 @@
 # GRPO Phase 1 — Board-reading pretraining
 #
-# Verifiable tasks: piece_at, in_check, count_pieces, piece_count_by_type, attacked_by, material_count
+# Verifiable tasks: piece_at, in_check, count_pieces, piece_positions, attacked_by, material_count
 # Rule-based reward (no LLM judge) — both GPUs.
 # Short completions: think block + <answer>...</answer> ~300-800 tokens max.
 
@@ -32,7 +32,7 @@ training:
   eval_file:  data/processed/grpo_phase1c_board_reading_eval.jsonl
 
   # Curriculum phase 1c: all 6 basic tasks, randomly mixed
-  task_filter: ["piece_at", "in_check", "count_pieces", "piece_count_by_type", "attacked_by", "material_count"]
+  task_filter: ["piece_at", "in_check", "count_pieces", "piece_positions", "attacked_by", "material_count"]
 
   num_generations: 4
   max_completion_length: 1024
@@ -41,7 +41,7 @@ training:
   # = 8 × 1 × 4 × 2 = 64 completions/optimizer step (num_generations dropped 8→4 for faster steps)
   # Eval has no backward — can be much larger than train batch
   per_device_train_batch_size: 8
-  per_device_eval_batch_size: 32
+  per_device_eval_batch_size: 16
   gradient_accumulation_steps: 1
   dataloader_num_workers: 2
 
@@ -53,7 +53,7 @@ training:
   weight_decay: 0.01
   max_grad_norm: 0.1
 
-  beta: 0.01    # KL penalty from base model (prevents entropy collapse); PEFT = no second model copy
+  beta: 0.05    # KL penalty from base model (prevents entropy collapse); PEFT = no second model copy
   epsilon: 0.2
 
   # Linear length penalty on completion word count
@@ -68,11 +68,11 @@ training:
   seed: 42
 
   logging_steps: 1
-  eval_strategy: steps
+  eval_strategy: "no"
   eval_steps: 100
   save_strategy: steps
-  save_steps: 20
-  save_total_limit: 10
+  save_steps: 50
+  save_total_limit: 50
 
 output_dir: checkpoints/qwen3.5-4b-grpo-phase1
 

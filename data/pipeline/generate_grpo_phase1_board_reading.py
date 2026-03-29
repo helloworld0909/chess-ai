@@ -34,24 +34,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 log = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
-You are an expert chess coach with deep positional understanding.
+You are a chess board reader. Answer directly from the position shown.
 
-You will be shown a board image of a chess position. \
-Answer the question precisely and concisely.
+Put your final answer in <answer>...</answer> tags.
 
-Answer format:
-<think>
-Brief reasoning (a few sentences max).
-</think>
-<answer>
-Your answer here.
-</answer>
-
-Answer rules:
-- Yes/no questions: answer exactly "yes" or "no".
+Rules:
 - Piece questions: color and piece type (e.g. "white rook", "black knight", "empty").
 - Count questions: answer with a single integer (e.g. "3").
-- Material balance: answer as white minus black with sign (e.g. "+3", "-2", "0").
+- Material count: two lines, "white: N" then "black: N".
+- Square list questions: one square per line (e.g. "d5"), or "none".
 """
 
 _PIECE_NAMES = {
@@ -121,13 +112,22 @@ def _task_captures(board: chess.Board) -> tuple[str, str]:
 
 
 def _task_in_check(board: chess.Board) -> tuple[str, str]:
-    """Ask if the side to move is in check."""
+    """Ask which pieces are giving check (by square), or 'none'."""
+    if board.is_check():
+        king_sq = board.king(board.turn)
+        assert king_sq is not None
+        attacker_color = not board.turn
+        attackers = board.attackers(attacker_color, king_sq)
+        squares = sorted(chess.square_name(sq) for sq in attackers)
+        answer = "\n".join(squares)
+    else:
+        answer = "none"
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
         f"({_side(board)} to move).\n\n"
-        "Is the side to move currently in check? Answer yes or no."
+        "Which squares have pieces that are giving check to the side to move? "
+        'List one square per line (e.g. "d5"), or answer "none" if not in check.'
     )
-    answer = "yes" if board.is_check() else "no"
     return user, answer
 
 
@@ -177,41 +177,48 @@ def _task_count_pieces(board: chess.Board) -> tuple[str, str]:
     return user, answer
 
 
-def _task_piece_count_by_type(board: chess.Board) -> tuple[str, str]:
-    """Ask how many pieces of a specific type and color are on the board."""
+def _task_piece_positions(board: chess.Board) -> tuple[str, str]:
+    """Ask which squares hold pieces of a specific type and color."""
     color = random.choice([chess.WHITE, chess.BLACK])
     piece_type = random.choice([chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN])
     color_name = _COLOR_NAMES[color]
     piece_name = _PIECE_NAMES[piece_type]
-    count = len(board.pieces(piece_type, color))
+    squares = sorted(chess.square_name(sq) for sq in board.pieces(piece_type, color))
+    answer = "\n".join(squares) if squares else "none"
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
         f"({_side(board)} to move).\n\n"
-        f"How many {color_name} {piece_name}s are on the board? "
-        "Answer with a single integer."
+        f"List all squares occupied by {color_name} {piece_name}s. "
+        'One square per line (e.g. "d5"), or "none" if there are none.'
     )
-    answer = str(count)
     return user, answer
 
 
 def _task_attacked_by(board: chess.Board) -> tuple[str, str]:
-    """Ask if a random square is attacked by a given color."""
-    sq = random.randint(0, 63)
+    """Ask which pieces (by square) attack a given square for a given color."""
+    # Bias toward occupied squares to make the question more interesting
+    occupied = [sq for sq in chess.SQUARES if board.piece_at(sq) is not None]
+    if occupied and random.random() < 0.6:
+        sq = random.choice(occupied)
+    else:
+        sq = random.randint(0, 63)
     sq_name = chess.square_name(sq)
     color = random.choice([chess.WHITE, chess.BLACK])
     color_name = _COLOR_NAMES[color]
-    attacked = board.is_attacked_by(color, sq)
+    attackers = board.attackers(color, sq)
+    squares = sorted(chess.square_name(a) for a in attackers)
+    answer = "\n".join(squares) if squares else "none"
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
         f"({_side(board)} to move).\n\n"
-        f"Is square {sq_name} attacked by {color_name}? Answer yes or no."
+        f"Which {color_name} pieces are attacking square {sq_name}? "
+        'List one square per line (e.g. "d5"), or answer "none".'
     )
-    answer = "yes" if attacked else "no"
     return user, answer
 
 
 def _task_material_count(board: chess.Board) -> tuple[str, str]:
-    """Ask for the material balance (white minus black, in pawns)."""
+    """Ask for each side's total material (not the difference)."""
     _PIECE_VALUES = {
         chess.PAWN: 1,
         chess.KNIGHT: 3,
@@ -221,18 +228,12 @@ def _task_material_count(board: chess.Board) -> tuple[str, str]:
     }
     white_mat = sum(_PIECE_VALUES[pt] * len(board.pieces(pt, chess.WHITE)) for pt in _PIECE_VALUES)
     black_mat = sum(_PIECE_VALUES[pt] * len(board.pieces(pt, chess.BLACK)) for pt in _PIECE_VALUES)
-    balance = white_mat - black_mat
-    if balance > 0:
-        answer = f"+{balance}"
-    elif balance < 0:
-        answer = str(balance)
-    else:
-        answer = "0"
+    answer = f"white: {white_mat}\nblack: {black_mat}"
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
         f"({_side(board)} to move).\n\n"
-        "What is the material balance? Count pawns=1, knights=3, bishops=3, rooks=5, queens=9. "
-        'Answer as white minus black (e.g. "+3", "-2", or "0").'
+        "Count the total material for each side. Use pawns=1, knights=3, bishops=3, rooks=5, queens=9. "
+        'Answer on two lines: "white: N" then "black: N".'
     )
     return user, answer
 
@@ -243,7 +244,7 @@ _TASK_FNS = {
     "in_check": _task_in_check,
     "piece_at": _task_piece_at,
     "count_pieces": _task_count_pieces,
-    "piece_count_by_type": _task_piece_count_by_type,
+    "piece_positions": _task_piece_positions,
     "attacked_by": _task_attacked_by,
     "material_count": _task_material_count,
 }
@@ -255,7 +256,7 @@ _TASK_WEIGHTS = {
     "in_check": 1 / 6,
     "piece_at": 1 / 6,
     "count_pieces": 1 / 6,
-    "piece_count_by_type": 1 / 6,
+    "piece_positions": 1 / 6,
     "attacked_by": 1 / 6,
     "material_count": 1 / 6,
 }

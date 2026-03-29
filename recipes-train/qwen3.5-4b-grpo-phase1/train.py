@@ -53,17 +53,13 @@ log = logging.getLogger(__name__)
 _SYSTEM_PROMPT = """\
 You are a chess board reader. Answer directly from the position shown.
 
-<think>
-[brief reasoning]
-</think>
-<answer>
-[your answer]
-</answer>
+Put your final answer in <answer>...</answer> tags.
 
 Rules:
-- legal_moves / captures: SAN notation, one per line, alphabetically sorted
-- in_check: exactly "yes" or "no"
-- piece_at: color + type (e.g. "white rook") or "empty"
+- Piece questions: color and piece type (e.g. "white rook", "black knight", "empty").
+- Count questions: answer with a single integer (e.g. "3").
+- Material count: two lines, "white: N" then "black: N".
+- Square list questions: one square per line (e.g. "d5"), or "none".
 """
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -306,10 +302,39 @@ def _score_answer(task: str, predicted: str, gold: str) -> float:
         intersection = len(pred_set & gold_set)
         union = len(pred_set | gold_set)
         return intersection / union if union > 0 else 0.0
-    elif task in ("in_check", "piece_at", "attacked_by"):
+    elif task in ("piece_at",):
         return 1.0 if predicted.lower().strip() == gold.lower().strip() else 0.0
-    elif task in ("count_pieces", "piece_count_by_type", "material_count"):
+    elif task in ("in_check", "attacked_by"):
+        # Answer is "none" or a newline-separated list of squares — use Jaccard
+        pred_set = _normalize_move_list(predicted.lower())
+        gold_set = _normalize_move_list(gold.lower())
+        if gold_set == {"none"} and pred_set == {"none"}:
+            return 1.0
+        if not gold_set or gold_set == {"none"}:
+            return 1.0 if pred_set == {"none"} or not pred_set else 0.0
+        intersection = len(pred_set & gold_set)
+        union = len(pred_set | gold_set)
+        return intersection / union if union > 0 else 0.0
+    elif task == "count_pieces":
         return 1.0 if predicted.strip() == gold.strip() else 0.0
+    elif task == "material_count":
+        # "white: N\nblack: N" — award partial credit per correct line
+        pred_lines = {l.strip() for l in predicted.strip().splitlines() if l.strip()}
+        gold_lines = {l.strip() for l in gold.strip().splitlines() if l.strip()}
+        if not gold_lines:
+            return 0.0
+        return len(pred_lines & gold_lines) / len(gold_lines)
+    elif task == "piece_positions":
+        # Answer is a list of squares or "none" — use Jaccard
+        pred_set = _normalize_move_list(predicted.lower())
+        gold_set = _normalize_move_list(gold.lower())
+        if gold_set == {"none"} and (pred_set == {"none"} or not pred_set):
+            return 1.0
+        if not gold_set or gold_set == {"none"}:
+            return 1.0 if pred_set == {"none"} or not pred_set else 0.0
+        intersection = len(pred_set & gold_set)
+        union = len(pred_set | gold_set)
+        return intersection / union if union > 0 else 0.0
     return 0.0
 
 
@@ -366,8 +391,9 @@ def build_reward_fn(train_cfg: dict):
             predicted = _extract_answer(text)
             exact = _score_answer(task, predicted, gold) if predicted else 0.0
             penalty = _len_penalty(text)
-            # Rewards: format(0.10) + exact(0.90) - length_penalty(0.1)
-            score = 0.10 * has_answer_tag + 0.90 * exact - penalty
+            # Rewards: tiny format bonus(0.01) + exact(0.99) - length_penalty
+            # Format reward is negligible so model can't game it by guessing
+            score = 0.01 * has_answer_tag + 0.99 * exact - penalty
             scores.append(score)
             log_records.append(
                 {
