@@ -34,14 +34,14 @@ training:
   # Curriculum phase 1c: all 6 basic tasks, randomly mixed
   task_filter: ["piece_at", "in_check", "count_pieces", "piece_count_by_type", "attacked_by", "material_count"]
 
-  num_generations: 8
+  num_generations: 4
   max_completion_length: 1024
 
   # Effective batch = per_device_train_batch_size × gradient_accumulation_steps × num_generations × num_gpus
-  # = 8 × 1 × 4 × 2 = 64 completions/optimizer step
+  # = 8 × 1 × 4 × 2 = 64 completions/optimizer step (num_generations dropped 8→4 for faster steps)
   # Eval has no backward — can be much larger than train batch
   per_device_train_batch_size: 8
-  per_device_eval_batch_size: 64
+  per_device_eval_batch_size: 32
   gradient_accumulation_steps: 1
   dataloader_num_workers: 2
 

@@ -518,6 +518,20 @@ def main():
         resume = ckpts[-1] if ckpts else None
         if resume:
             log.info("Resuming from latest checkpoint: %s", resume)
+
+    # When resuming a PEFT model, explicitly load adapter weights before training.
+    # TRL's resume_from_checkpoint restores optimizer/scheduler but may not reload
+    # PEFT adapter weights, causing the policy to reset to base model.
+    if resume and os.path.isfile(os.path.join(resume, "adapter_model.safetensors")):
+        import safetensors.torch
+        from peft import set_peft_model_state_dict
+
+        adapter_weights = safetensors.torch.load_file(
+            os.path.join(resume, "adapter_model.safetensors"), device="cpu"
+        )
+        set_peft_model_state_dict(model, adapter_weights)
+        log.info("Loaded adapter weights from %s", resume)
+
     trainer.train(resume_from_checkpoint=resume)
 
     out = config.get("output_dir", "checkpoints/qwen3.5-4b-grpo-phase1")
