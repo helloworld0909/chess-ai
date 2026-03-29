@@ -45,7 +45,7 @@ training:
   gradient_accumulation_steps: 1
   dataloader_num_workers: 2
 
-  learning_rate: 1.0e-5
+  learning_rate: 5.0e-6
   lr_scheduler_type: cosine
   warmup_steps: 50
   num_train_epochs: 1
