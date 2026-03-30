@@ -209,10 +209,11 @@ def main() -> None:
         attention_mask = tokenized.get("attention_mask", [1] * len(input_ids))
         labels = _make_labels(input_ids)
 
-        actual_count = input_ids.count(move_token_id)
-        if actual_count != 1:
+        actual_count = input_ids.count(board_token_id)
+        if actual_count != BOARD_TOKENS_PER_POSITION:
             _logger.warning(
-                "move token count mismatch in _fmt: expected 1 got %d (fen=%s)",
+                "sentinel count mismatch in _fmt: expected %d got %d (fen=%s)",
+                BOARD_TOKENS_PER_POSITION,
                 actual_count,
                 fen,
             )

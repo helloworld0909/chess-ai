@@ -18,7 +18,7 @@ encoder:
   in_channels: 19
   hidden_size: 256
   num_blocks: 10
-  pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-110000/encoder_weights.pt"
+  pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt"
   frozen: true          # encoder weights frozen, no grad flows back
 
 lora:
@@ -41,9 +41,9 @@ training:
   eval_file:  data/processed/textbook_pretrain_eval.jsonl
   max_seq_length: 2048
 
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 4   # effective batch = 32 (4 × 2 GPUs × 4)
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 16   # effective batch = 32 (1 × 2 GPUs × 16)
 
   learning_rate: 5.0e-5            # lower than SFT — pretrain is gentler
   lr_scheduler_type: cosine

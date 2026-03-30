@@ -249,7 +249,7 @@ def main() -> None:
         def __call__(self, features):
             import json as _json
 
-            from src.encoder.board_tensor import boards_to_tensor
+            from src.encoder.board_tensor import board_to_tensor
 
             # Extract fens lists before the base collator sees them
             fens_lists: list[list[str]] = []
@@ -263,7 +263,9 @@ def main() -> None:
             # Let base collator handle padding + primary board tensor scaffolding
             batch = super().__call__(features)
 
-            # Rebuild board_tensors_flat using all FENs in sequence order
+            # Rebuild board_tensors_flat using all FENs in sequence order.
+            # Use board_to_tensor (19ch) — no move context in textbook positions,
+            # matching the encoder's in_channels=19 pretrain config.
             all_tensors = []
             board_counts = []
             for b_idx, fens in enumerate(fens_lists):
@@ -276,17 +278,17 @@ def main() -> None:
                         board = chess.Board(fen)
                     except Exception:
                         board = chess.Board()
-                    tensors.append(boards_to_tensor(board, None))
+                    tensors.append(board_to_tensor(board))
 
                 # Pad to n_boards if fens list is shorter
                 while len(tensors) < n_boards:
-                    tensors.append(boards_to_tensor(chess.Board(), None))
+                    tensors.append(board_to_tensor(chess.Board()))
 
                 board_counts.append(len(tensors))
                 all_tensors.extend(tensors)
 
             batch["board_tensors_flat"] = (
-                torch.stack(all_tensors) if all_tensors else torch.zeros(0, 38, 8, 8)
+                torch.stack(all_tensors) if all_tensors else torch.zeros(0, 19, 8, 8)
             )
             batch["move_counts"] = torch.tensor(board_counts, dtype=torch.long)
             return batch

@@ -126,7 +126,8 @@ class ChessLMWithEncoder(nn.Module):
             n_boards = n_sentinels // BOARD_TOKENS_PER_POSITION
 
             if board_tensors_flat is not None and board_tensors_flat.shape[0] > 0:
-                cnn_dtype = next(self.cnn.parameters()).dtype
+                cnn_dtype = next(iter(self.cnn.parameters()), None)
+                cnn_dtype = cnn_dtype.dtype if cnn_dtype is not None else dtype
                 # cnn_out: (N_boards, 64, H)
                 cnn_out = self.cnn(board_tensors_flat.to(device=device, dtype=cnn_dtype))
                 cnn_out = cnn_out.to(dtype=dtype)
@@ -152,8 +153,11 @@ class ChessLMWithEncoder(nn.Module):
             else:
                 cnn_embs = torch.zeros(n_sentinels, H, dtype=dtype, device=device)
 
-            # 4. Scatter into inputs_embeds at all sentinel positions (left-to-right order)
-            move_positions = move_mask.nonzero(as_tuple=False)  # (n_sentinels, 2)
+            # 4. Scatter into inputs_embeds at all sentinel positions (left-to-right order).
+            # Only fill positions covered by complete boards; partial trailing sentinels
+            # (chunk boundary leftovers) stay as their original token embeddings.
+            n_filled = cnn_embs.shape[0]  # n_boards * BOARD_TOKENS_PER_POSITION
+            move_positions = move_mask.nonzero(as_tuple=False)[:n_filled]  # (n_filled, 2)
             b_idx = move_positions[:, 0]
             l_idx = move_positions[:, 1]
             inputs_embeds = inputs_embeds.index_put((b_idx, l_idx), cnn_embs, accumulate=False)

@@ -15,7 +15,7 @@ encoder:
   in_channels: 19       # single board tensor (piece planes + castling + ep + move#)
   hidden_size: 256      # must match pretrain config
   num_blocks: 10        # must match pretrain config
-  pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-580083/encoder_weights.pt"
+  pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt"
 
 lora:
   r: 64
