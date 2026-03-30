@@ -1,46 +1,61 @@
-# Encoder CNN pre-training — MSE regression on cp_diff_scaled
-# Trains ONLY ChessEncoder + scalar head (no LLM).
-# Input: data/processed/encoder_pretrain.jsonl (from generate_encoder_data.py)
-# Output: checkpoints/encoder-pretrain/checkpoint-*/encoder_weights.pt
-#         → load these CNN weights into ChessLMWithEncoder for the full SFT run.
+# Encoder CNN pre-training — SF15 classical eval terms + total eval score
 #
-# DDP: torchrun --nproc_per_node=2 training/train_encoder_pretrain.py
-# Single GPU: uv run python training/train_encoder_pretrain.py
+# Architecture: ChessEncoder (38-ch, 15 blocks, 512 filters)
+#   → (B, 64, 2560) spatial tokens with 2D positional encoding
+#   → EncoderSF15Head: 14 learned queries cross-attend over 64 spatial tokens
+#   → (B, 14) predictions: 13 SF15 terms + 1 total eval score
+#
+# Loss: term_weight × MSE(terms) + eval_weight × MSE(eval_score)
+#   Higher eval_weight anchors the total evaluation; term losses force disentangled
+#   representations (king safety, mobility, pawns, threats, etc.)
+#
+# Dataset: encoder_pretrain_sf15.jsonl (from generate_encoder_pretrain_sf15.py)
+#   Each record: {"fen": "...", "sf15_terms": [13 floats], "eval_score": float}
+#
+# DDP: torchrun --nproc_per_node=2 recipes-train/encoder-pretrain/train.py
+# Single GPU: uv run python recipes-train/encoder-pretrain/train.py
 
 encoder:
-  in_channels: 38       # before (19ch) + after (19ch) board tensors
-  hidden_size: 512      # ResNet filters
-  num_blocks: 15        # depth
-  out_dim: 2560         # must match Qwen3.5-4B hidden_size for later SFT integration
+  in_channels: 19       # single board tensor (piece planes + castling + ep + move#)
+  hidden_size: 256      # ResNet filters — 12.6M params, small enough for full FT during SFT
+  num_blocks: 10        # depth
+  out_dim: 2560         # must match Qwen3.5-4B hidden_size for SFT integration
+
+loss:
+  term_weight: 1.0      # weight for 13 SF15 term losses
+  eval_weight: 3.0      # higher weight for total eval score — anchors the representation
+  piece_weight: 1.0     # CE loss for per-square piece classification — spatial grounding
 
 training:
-  train_file: data/processed/encoder_pretrain_1b.jsonl
-  eval_file: data/processed/encoder_pretrain_eval_1b.jsonl
-  train_limit: 0        # 0 = no limit (use full file)
-  eval_limit: 1000000   # use full 1M eval data
+  train_file: data/processed/encoder_pretrain_sf15.jsonl
+  eval_file:  data/processed/encoder_pretrain_sf15_eval.jsonl
+  train_limit: 0        # 0 = no limit
+  eval_limit:  0        # 0 = full eval set (6.6M samples)
 
-  per_device_train_batch_size: 256
+  per_device_train_batch_size: 1024
   per_device_eval_batch_size: 2048
-  dataloader_num_workers: 2
-  
+  dataloader_num_workers: 10
+
   learning_rate: 3.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.03
-  num_train_epochs: 1
+  num_train_epochs: 2
   max_grad_norm: 1.0
 
   logging_steps: 200
-  eval_steps: 20000
-  save_steps: 20000
+  eval_steps: 10000
+  save_steps: 10000
   save_total_limit: 5
 
-  bf16: true            # bfloat16 AMP (no GradScaler needed)
+  bf16: true
 
 output_dir: checkpoints/encoder-pretrain
 
 wandb:
   enabled: false
   project: chess-tutor
-  name: encoder-pretrain
+  name: encoder-pretrain-sf15
   tags:
     - encoder-pretrain
+    - sf15
+    - cross-attention
