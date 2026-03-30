@@ -1,4 +1,4 @@
-"""Data collator for ChessLMWithEncoder — multi-move token splicing."""
+"""Data collator for ChessLMWithEncoder — board tensor preparation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import chess
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from src.encoder import MOVE_TOKEN, MOVE_TOKEN_ID
+from src.encoder import BOARD_TOKEN_ID
 from src.encoder.board_tensor import boards_to_tensor
 
 _logger = logging.getLogger(__name__)
@@ -19,24 +19,22 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class EncoderDataCollator:
-    """Collates token IDs and computes board tensors for every <|move|> token.
+    """Collates token IDs and computes board tensors for every board position.
 
-    Each training example contains one or more <|move|> sentinels injected by
-    the dataset _fmt() function:
-      - 1 token for the student's move (from metadata fen + move_san)
-      - N tokens for the moves inside <line>...</line> blocks (replayed from
-        the board state after the student's move)
+    Each training example contains one board position represented by
+    BOARD_TOKENS_PER_POSITION (64) consecutive <|vision_pad|> sentinel tokens
+    in the input. The collator builds one (38, 8, 8) board tensor per board
+    position; the CNN forward pass expands each tensor to 64 per-square tokens.
 
     The collator produces:
-      batch["board_tensors_flat"]: (N_total, 38, 8, 8) — all board tensors for
-          the batch concatenated in the same order as the <|move|> tokens appear
-          left-to-right in the padded input_ids.
-      batch["move_counts"]: (B,) — number of move tensors per example, so the
-          forward pass can validate alignment.
+      batch["board_tensors_flat"]: (N_boards, 38, 8, 8) — one tensor per board
+          position in the batch, concatenated in example order.
+      batch["move_counts"]: (B,) — number of board positions per example (always 1
+          for board-reading SFT; may be >1 for phase2 coaching with key lines).
 
-    line_sans_json format (produced by _fmt):
-        JSON-serialised list[list[str]] — one inner list per <line> block,
-        each inner list contains the SAN moves in order.
+    For phase2 coaching compatibility: if move_san is non-empty, the first board
+    tensor encodes (board, student_move). If line_sans_json is non-empty, additional
+    tensors encode each line move from the pre-move board.
     """
 
     tokenizer: PreTrainedTokenizerBase
@@ -44,7 +42,7 @@ class EncoderDataCollator:
     max_length: Optional[int] = None
 
     def __post_init__(self) -> None:
-        self._move_token_id: int = MOVE_TOKEN_ID
+        self._board_token_id: int = BOARD_TOKEN_ID
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # Pop non-tensor fields before HF padding (unknown keys cause errors)
@@ -81,25 +79,28 @@ class EncoderDataCollator:
             batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
 
         all_tensors: List[torch.Tensor] = []
-        move_counts: List[int] = []
+        board_counts: List[int] = []
 
         for b_idx, (fen, student_san, line_sans) in enumerate(
             zip(fens, move_sans, line_sans_lists)
         ):
             tensors_for_example: List[torch.Tensor] = []
 
-            # --- 1. Student move tensor ---
             board = chess.Board(fen)
-            student_move: Optional[chess.Move] = None
+
             if student_san:
+                # Phase2 coaching: first tensor encodes (board, student_move)
+                student_move: Optional[chess.Move] = None
                 try:
                     student_move = board.parse_san(student_san)
                 except Exception:
                     pass
-            tensors_for_example.append(boards_to_tensor(board, student_move))
+                tensors_for_example.append(boards_to_tensor(board, student_move))
+            else:
+                # Board-reading SFT: encode the position without a specific move
+                tensors_for_example.append(boards_to_tensor(board, None))
 
-            # --- 2. LINE move tensors — replay from position after student move ---
-            # Phase 2 compatibility: line replay starts from fen (pre-move board)
+            # Phase2 compatibility: line replay tensors
             for line_san_list in line_sans:
                 line_board = board.copy()
                 for san in line_san_list:
@@ -108,29 +109,32 @@ class EncoderDataCollator:
                         tensors_for_example.append(boards_to_tensor(line_board, mv))
                         line_board.push(mv)
                     except Exception:
-                        # Illegal/unparseable SAN: use identity (null-move) tensor
                         tensors_for_example.append(boards_to_tensor(line_board, None))
 
-            # --- 3. Validate count matches <|move|> tokens in input_ids ---
-            n_tokens = (batch["input_ids"][b_idx] == self._move_token_id).sum().item()
-            n_tensors = len(tensors_for_example)
-            if n_tokens != n_tensors:
-                _logger.debug(
-                    "example %d: %d move tokens vs %d board tensors (truncation) — adjusting",
-                    b_idx,
-                    n_tokens,
-                    n_tensors,
-                )
-                while len(tensors_for_example) < n_tokens:
-                    tensors_for_example.append(boards_to_tensor(chess.Board(fen), None))
-                tensors_for_example = tensors_for_example[:n_tokens]
+            # Validate: number of board positions must match sentinel groups.
+            # Each position occupies BOARD_TOKENS_PER_POSITION consecutive sentinels.
+            from src.encoder import BOARD_TOKENS_PER_POSITION
 
-            move_counts.append(len(tensors_for_example))
+            n_sentinel_tokens = (batch["input_ids"][b_idx] == self._board_token_id).sum().item()
+            n_sentinel_groups = n_sentinel_tokens // BOARD_TOKENS_PER_POSITION
+            n_tensors = len(tensors_for_example)
+            if n_tensors != n_sentinel_groups:
+                _logger.debug(
+                    "example %d: %d board positions vs %d sentinel groups — adjusting",
+                    b_idx,
+                    n_tensors,
+                    n_sentinel_groups,
+                )
+                while len(tensors_for_example) < n_sentinel_groups:
+                    tensors_for_example.append(boards_to_tensor(chess.Board(fen), None))
+                tensors_for_example = tensors_for_example[:n_sentinel_groups]
+
+            board_counts.append(len(tensors_for_example))
             all_tensors.extend(tensors_for_example)
 
         batch["board_tensors_flat"] = (
             torch.stack(all_tensors) if all_tensors else torch.zeros(0, 38, 8, 8)
         )
-        batch["move_counts"] = torch.tensor(move_counts, dtype=torch.long)
+        batch["move_counts"] = torch.tensor(board_counts, dtype=torch.long)
 
         return batch

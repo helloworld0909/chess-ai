@@ -10,24 +10,32 @@ import torch.nn as nn
 from src.encoder import MOVE_TOKEN_ID
 from src.encoder.cnn import ChessEncoder
 
+# Number of sentinel tokens injected per board position.
+# Must match the number of <|vision_pad|> tokens in the user message and the
+# CNN output sequence length (64 = one token per square).
+BOARD_TOKENS_PER_POSITION = 64
+
 
 class ChessLMWithEncoder(nn.Module):
     """Combines a base LLM (e.g., Qwen3.5-4B) with a ResNet board encoder.
 
-    The encoder processes 38-channel 8x8 spatial tensors (before+after board)
-    and injects them as CNN embeddings directly into the token embedding sequence
-    at positions occupied by the <|vision_pad|> sentinel token. Each <|move|> in the
-    input is replaced in-place with the CNN embedding for that specific
-    (board_before, move) pair — the sequence length is unchanged.
+    Each board position is represented by BOARD_TOKENS_PER_POSITION (64) consecutive
+    <|vision_pad|> sentinel tokens in the input. The encoder processes the 38-channel
+    8x8 board tensor and produces 64 per-square embeddings (one per chess square,
+    row-major a1..h8), which replace the 64 sentinels in the embedding sequence.
+
+    Each per-square token encodes the full board context from that square's perspective
+    (receptive field covers the entire board via deep ResNet convolutions), plus a
+    2D learnable positional encoding distinguishing file and rank.
 
     Usage:
-        # collator provides board_tensors_flat (N_total, 38, 8, 8) and
+        # collator provides board_tensors_flat (N_boards, 38, 8, 8) and
         # move_counts (B,) alongside input_ids. board_tensors_flat/move_counts
         # are optional — omit them (or pass None) for TRL log-prob passes on
         # completion-only sequences; zero embeddings will be used instead.
         out = model(
-            input_ids=ids,             # (B, L)
-            board_tensors_flat=flat,   # (N_total, 38, 8, 8)  — optional
+            input_ids=ids,             # (B, L)  — L includes 64 sentinels per board
+            board_tensors_flat=flat,   # (N_boards, 38, 8, 8)  — optional
             move_counts=counts,        # (B,)  — optional, kept for API compat
             attention_mask=mask,       # (B, L)
             labels=labels,             # (B, L)
@@ -38,16 +46,16 @@ class ChessLMWithEncoder(nn.Module):
         self,
         llm: nn.Module,
         hidden_size: int = 2560,
-        cnn_hidden_size: int = 512,
-        cnn_num_blocks: int = 15,
+        cnn_in_channels: int = 19,
+        cnn_hidden_size: int = 256,
+        cnn_num_blocks: int = 10,
         move_token_id: int = MOVE_TOKEN_ID,
     ):
         super().__init__()
         self.llm = llm
         self.move_token_id = move_token_id
-        # 72M param ResNet (15 blocks, 512 filters, 38-ch input) -> hidden_size dim output
         self.cnn = ChessEncoder(
-            in_channels=38,
+            in_channels=cnn_in_channels,
             hidden_size=cnn_hidden_size,
             num_blocks=cnn_num_blocks,
             out_dim=hidden_size,
@@ -86,18 +94,20 @@ class ChessLMWithEncoder(nn.Module):
         labels: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, tuple]:
-        """Forward pass — splices CNN embeddings into move token positions.
+        """Forward pass — splices 64 CNN embeddings into each sentinel group.
+
+        Each board position occupies exactly BOARD_TOKENS_PER_POSITION (64) consecutive
+        sentinel tokens. The CNN encodes the board tensor into (64, H) per-square
+        embeddings, which replace those sentinels in the embedding sequence.
 
         Args:
-            input_ids: (B, L)
-            board_tensors_flat: (N_total, 38, 8, 8) all board tensors for the
-                batch, concatenated in sequence order across all examples.
-                If None (e.g. TRL log-prob pass on completion-only sequences),
-                zero embeddings are used for all <|move|> positions.
-            move_counts: (B,) number of move tokens per example. Unused in forward
-                (counts are derived from input_ids); kept for API compatibility.
+            input_ids: (B, L) — L includes 64 sentinels per board position.
+            board_tensors_flat: (N_boards, 38, 8, 8) — one tensor per board position
+                (not per token). If None, zero embeddings are used for all sentinels.
+            move_counts: (B,) number of board positions per example. Unused in forward;
+                kept for API compatibility.
             attention_mask: (B, L)
-            labels: (B, L) — move token positions will be set to -100.
+            labels: (B, L) — sentinel positions will be set to -100.
         """
         device = input_ids.device
         dtype = self.embed_tokens.weight.dtype
@@ -106,42 +116,50 @@ class ChessLMWithEncoder(nn.Module):
         # 1. Text embeddings: (B, L, H)
         inputs_embeds = self.embed_tokens(input_ids)
 
-        # 2. Find all <|move|> positions: (N_total, 2) of (batch_idx, seq_idx)
+        # 2. Find all sentinel positions
         move_mask = input_ids == self.move_token_id
-        n_moves = move_mask.sum().item()
+        n_sentinels = move_mask.sum().item()
 
-        if n_moves > 0:
-            # 3. Encode all board tensors in one batched CNN call: (N_total, H)
-            # CNN weights are float32; cast board tensors to CNN weight dtype, not embed dtype
+        if n_sentinels > 0:
+            # 3. N_boards = total sentinel tokens / tokens per board
+            H = inputs_embeds.shape[-1]
+            n_boards = n_sentinels // BOARD_TOKENS_PER_POSITION
+
             if board_tensors_flat is not None and board_tensors_flat.shape[0] > 0:
                 cnn_dtype = next(self.cnn.parameters()).dtype
-                cnn_embs = self.cnn(board_tensors_flat.to(device=device, dtype=cnn_dtype))
-                cnn_embs = cnn_embs.to(dtype=dtype)  # cast output to LLM dtype
-                # Truncate/pad to match actual move token count
-                if cnn_embs.shape[0] != n_moves:
-                    if cnn_embs.shape[0] > n_moves:
-                        cnn_embs = cnn_embs[:n_moves]
-                    else:
-                        pad = torch.zeros(
-                            n_moves - cnn_embs.shape[0],
-                            cnn_embs.shape[-1],
-                            dtype=dtype,
-                            device=device,
-                        )
-                        cnn_embs = torch.cat([cnn_embs, pad], dim=0)
-            else:
-                H = inputs_embeds.shape[-1]
-                cnn_embs = torch.zeros(n_moves, H, dtype=dtype, device=device)
+                # cnn_out: (N_boards, 64, H)
+                cnn_out = self.cnn(board_tensors_flat.to(device=device, dtype=cnn_dtype))
+                cnn_out = cnn_out.to(dtype=dtype)
 
-            # 4. Scatter CNN embeddings directly into inputs_embeds at move positions
-            #    index_put with accumulate=False is differentiable under autocast.
-            move_positions = move_mask.nonzero(as_tuple=False)
+                # Pad/trim to exactly n_boards boards
+                if cnn_out.shape[0] < n_boards:
+                    pad = torch.zeros(
+                        n_boards - cnn_out.shape[0],
+                        BOARD_TOKENS_PER_POSITION,
+                        H,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    cnn_out = torch.cat([cnn_out, pad], dim=0)
+                else:
+                    cnn_out = cnn_out[:n_boards]
+
+                # Flatten to (n_sentinels, H) — matches sentinel positions in order
+                cnn_embs = cnn_out.reshape(n_boards * BOARD_TOKENS_PER_POSITION, H)
+                # Trim to exact sentinel count (handles edge case where n_sentinels
+                # is not a perfect multiple, e.g. due to truncation)
+                cnn_embs = cnn_embs[:n_sentinels]
+            else:
+                cnn_embs = torch.zeros(n_sentinels, H, dtype=dtype, device=device)
+
+            # 4. Scatter into inputs_embeds at all sentinel positions (left-to-right order)
+            move_positions = move_mask.nonzero(as_tuple=False)  # (n_sentinels, 2)
             b_idx = move_positions[:, 0]
             l_idx = move_positions[:, 1]
             inputs_embeds = inputs_embeds.index_put((b_idx, l_idx), cnn_embs, accumulate=False)
 
-        # 5. Mask <|move|> positions in labels — never predict the move token itself
-        if labels is not None and n_moves > 0:
+        # 5. Mask sentinel positions in labels — never predict them
+        if labels is not None and n_sentinels > 0:
             labels = labels.clone()
             labels[move_mask] = -100
 
