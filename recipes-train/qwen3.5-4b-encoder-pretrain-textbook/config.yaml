@@ -1,0 +1,78 @@
+# Qwen3.5-4B + frozen ChessEncoder — Continued Pretraining on Chess Textbooks
+#
+# Loss:    Causal LM on all text tokens. Sentinel positions masked to -100
+#          inside ChessLMWithEncoder.forward() — no gradient through encoder.
+# Encoder: Frozen (weights loaded from pretrain checkpoint, no requires_grad).
+# LLM:     LoRA r=64 — same rank as phase1-SFT so checkpoints are compatible.
+# Data:    20k+ annotated positions from 63 classic textbooks (Chernev, Nimzowitsch,
+#          Vukovic, Reshevsky, Capablanca, Fischer, Kasparov, Smyslov, ...).
+# DDP:     2× RTX 5090  |  effective batch = 32 (4 per device × 2 GPUs × 4 accum)
+
+model:
+  model_name: "Qwen/Qwen3.5-4B"
+  quantization: "none"
+  attn_implementation: "sdpa"
+  torch_dtype: bfloat16
+
+encoder:
+  in_channels: 19
+  hidden_size: 256
+  num_blocks: 10
+  pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-110000/encoder_weights.pt"
+  frozen: true          # encoder weights frozen, no grad flows back
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none
+  task_type: CAUSAL_LM
+
+training:
+  train_file: data/processed/textbook_pretrain.jsonl
+  eval_file:  data/processed/textbook_pretrain_eval.jsonl
+  max_seq_length: 2048
+
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4   # effective batch = 32 (4 × 2 GPUs × 4)
+
+  learning_rate: 5.0e-5            # lower than SFT — pretrain is gentler
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  num_train_epochs: 3              # multiple passes over small corpus
+
+  optim: adamw_8bit
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  gradient_checkpointing: true
+  bf16: true
+  dataloader_num_workers: 4
+  ddp_find_unused_parameters: false
+  use_liger_kernel: false           # ChessLMWithEncoder is not a PreTrainedModel
+
+  logging_steps: 10
+  eval_strategy: steps
+  eval_steps: 100
+  save_strategy: steps
+  save_steps: 200
+  save_total_limit: 3
+
+  seed: 42
+
+output_dir: checkpoints/qwen3.5-4b-encoder-pretrain-textbook
+
+wandb:
+  enabled: false
+  project: "chess-tutor"
+  name: "qwen3.5-4b-encoder-pretrain-textbook"
+  tags: ["encoder-pretrain", "textbook", "causal-lm"]
