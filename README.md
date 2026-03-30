@@ -60,27 +60,31 @@ PYTHONPATH=src uv run uvicorn tutor.web:app --host 0.0.0.0 --port 8080
 
 | Recipe | Purpose | Status |
 |--------|---------|--------|
-| `encoder-pretrain/` | CNN encoder regression on SF15 evals | ✅ Done (`checkpoint-580083`) |
+| `encoder-pretrain/` | CNN encoder: 13 SF15 terms + piece classification (656M positions) | 🔄 Training v2 |
 | `qwen3.5-4b-encoder-phase1-sft/` | SFT: joint task with engine key lines + coaching comment | ✅ Done (`checkpoint-890`) |
-| `qwen3.5-4b-encoder-phase2-grpo/` | GRPO: SF15 annotation accuracy + comment quality rewards | 🔄 Active |
+| `qwen3.5-4b-grpo-phase1/` | GRPO: board reading pretraining (piece location, count, etc.) | 🔄 Active (phase1d) |
+| `qwen3.5-4b-encoder-phase2-grpo/` | GRPO: SF15 annotation accuracy + comment quality rewards | ⏸ Paused |
 
 ### `data/pipeline/`
 
+- `generate_encoder_pretrain_sf15.py` — 656M board positions with SF15 term labels → `encoder_pretrain_sf15.jsonl`
 - `generate_phase2_data.py` — Textbook positions + Stockfish depth-18 → `lines_joint_sft.jsonl`
 - `generate_grpo_joint_prompts.py` — Lichess `lines_30k.jsonl` + SF15 annotations → `grpo_joint_prompts_sf15.jsonl`
-- `generate_encoder_data.py` — Board positions for encoder pretraining
+- `parse_pgn_study.py` — Lichess annotated studies → clean prose text with `[Position: FEN]` tokens
+- `parse_textbook_pgn.py` — Gutenberg ASCII board books (Lasker notation) → clean prose with FEN tokens
 - `sf15_eval.py` — Stockfish 15 classical eval term wrapper (`get_sf15_eval(fen)`)
 
 ### `data/processed/` (active datasets)
 
-| File | Used by |
-|------|---------|
-| `encoder_pretrain_1b.jsonl` | encoder-pretrain |
-| `lines_joint_sft.jsonl` | phase1-sft |
-| `lines_joint_sft_eval.jsonl` | phase1-sft eval |
-| `grpo_joint_prompts_sf15.jsonl` | phase2-grpo (14,950 train) |
-| `grpo_joint_prompts_sf15_eval50.jsonl` | phase2-grpo eval (50 samples) |
-| `lines_30k.jsonl` | source for grpo prompts |
+| File | Records | Used by |
+|------|---------|---------|
+| `encoder_pretrain_sf15.jsonl` | 656M | encoder-pretrain v2 |
+| `encoder_pretrain_sf15_eval.jsonl` | 6.6M | encoder-pretrain v2 eval |
+| `lines_joint_sft.jsonl` | 28k | phase1-sft |
+| `sft_phase1_board_reading.jsonl` | 100k | grpo-phase1 |
+| `grpo_joint_prompts_sf15.jsonl` | 14,950 | phase2-grpo |
+| `lines_30k.jsonl` | 30k | source for grpo prompts |
+| `textbooks/*.txt` | 8 books, ~1,058 positions | future SFT |
 
 ---
 
