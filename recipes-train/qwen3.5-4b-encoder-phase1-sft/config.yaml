@@ -1,8 +1,8 @@
-# Qwen3.5-4B Encoder Phase 1 SFT — Joint annotation + coaching task
-# Qwen3.5-4B + pretrained ChessEncoder (72M params) + QLoRA
-# Joint task: model sees student move + engine key lines as board embeddings in
-# the user prompt; outputs annotated lines + coaching comment (pure text, no sentinels).
-# Dataset: lines_joint_sft (~31k textbook positions with Stockfish lines + expert coaching comments)
+# Qwen3.5-4B Encoder Phase 1 SFT — Board-reading grounding
+# Qwen3.5-4B + pretrained ChessEncoder (72M params) + LoRA
+# Task: model sees one sentinel token (CNN board embedding) + board-reading question;
+# outputs <answer>X</answer> directly (no thinking). Goal: teach LLM to decode encoder embeddings.
+# Dataset: sft_phase1_board_reading (~100k samples, 6 tasks, no "none" for in_check/attacked_by)
 # DDP: 2× RTX 5090  |  effective batch = 32 (1 × 2 GPUs × 16)
 
 model:
@@ -12,8 +12,9 @@ model:
   torch_dtype: bfloat16
 
 encoder:
-  hidden_size: 512      # must match pretrain config
-  num_blocks: 15        # must match pretrain config
+  in_channels: 19       # single board tensor (piece planes + castling + ep + move#)
+  hidden_size: 256      # must match pretrain config
+  num_blocks: 10        # must match pretrain config
   pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-580083/encoder_weights.pt"
 
 lora:
@@ -32,15 +33,15 @@ lora:
   task_type: CAUSAL_LM
 
 training:
-  train_file: data/processed/lines_joint_sft.jsonl
-  eval_file:  data/processed/lines_joint_sft_eval.jsonl
-  max_seq_length: 4400   # max=4311 tokens; covers 100% of samples without truncation
-  keep_think: true       # include <think> blocks in SFT loss
+  train_file: data/processed/sft_phase1_board_reading.jsonl
+  eval_file:  data/processed/sft_phase1_board_reading_eval.jsonl
+  max_seq_length: 512    # short outputs: sentinel + question + <answer>X</answer>
+  keep_think: false      # no thinking — pure grounding SFT
   packing: false
 
-  per_device_train_batch_size: 1
-  per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 16  # effective batch = 32 (1 × 2 GPUs × 16)
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4   # effective batch = 32 (4 × 2 GPUs × 4)
 
   learning_rate: 1.0e-4
   lr_scheduler_type: cosine
@@ -53,15 +54,15 @@ training:
 
   gradient_checkpointing: true
   bf16: true
-  dataloader_num_workers: 8 
-  ddp_find_unused_parameters: false 
+  dataloader_num_workers: 4
+  ddp_find_unused_parameters: false
   use_liger_kernel: false   # ChessLMWithEncoder is not a PreTrainedModel
 
   logging_steps: 10
   eval_strategy: steps
-  eval_steps: 20
+  eval_steps: 100
   save_strategy: steps
-  save_steps: 20
+  save_steps: 100
   save_total_limit: 5
 
   seed: 42
@@ -72,4 +73,4 @@ wandb:
   enabled: false
   project: "chess-tutor"
   name: "qwen3.5-4b-encoder-phase1-sft"
-  tags: ["encoder-sft", "phase1-sft", "joint-task"]
+  tags: ["encoder-sft", "phase1-sft", "board-reading"]

@@ -59,7 +59,7 @@ Rules:
 - Piece questions: color and piece type (e.g. "white rook", "black knight", "empty").
 - Count questions: answer with a single integer (e.g. "3").
 - Material count: two lines, "white: N" then "black: N".
-- Square list questions: one square per line (e.g. "d5"), or "none".
+- Square list questions: one square per line (e.g. "d5").
 """
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -305,13 +305,11 @@ def _score_answer(task: str, predicted: str, gold: str) -> float:
     elif task in ("piece_at",):
         return 1.0 if predicted.lower().strip() == gold.lower().strip() else 0.0
     elif task in ("in_check", "attacked_by"):
-        # Answer is "none" or a newline-separated list of squares — use Jaccard
+        # Answer is always a non-empty list of squares (dataset filtered to exclude "none" answers)
         pred_set = _normalize_move_list(predicted.lower())
         gold_set = _normalize_move_list(gold.lower())
-        if gold_set == {"none"} and pred_set == {"none"}:
-            return 1.0
-        if not gold_set or gold_set == {"none"}:
-            return 1.0 if pred_set == {"none"} or not pred_set else 0.0
+        if not gold_set:
+            return 0.0
         intersection = len(pred_set & gold_set)
         union = len(pred_set | gold_set)
         return intersection / union if union > 0 else 0.0
@@ -346,12 +344,36 @@ def build_reward_fn(train_cfg: dict):
     len_penalty_free = train_cfg.get("len_penalty_free_tokens", 500)
     len_penalty_max = train_cfg.get("len_penalty_max", 0.2)
     len_penalty_cap = train_cfg.get("max_completion_length", 6144)
+    num_generations = train_cfg.get("num_generations", 4)
+    diversity_penalty_max = train_cfg.get("diversity_penalty_max", 0.1)
 
     def _len_penalty(text: str) -> float:
         n = len(text.split())
         excess = max(0, n - len_penalty_free)
         ratio = min(1.0, excess / max(1, len_penalty_cap - len_penalty_free))
         return len_penalty_max * ratio
+
+    def _jaccard(a: str, b: str) -> float:
+        sa, sb = set(a.lower().split()), set(b.lower().split())
+        if not sa and not sb:
+            return 1.0
+        return len(sa & sb) / len(sa | sb)
+
+    def _diversity_penalties(texts: list[str]) -> list[float]:
+        """For each group of num_generations completions, compute mean pairwise Jaccard
+        and return a penalty proportional to similarity (high similarity → high penalty)."""
+        penalties = []
+        n = len(texts)
+        for i in range(0, n, num_generations):
+            group = texts[i : i + num_generations]
+            if len(group) < 2:
+                penalties.extend([0.0] * len(group))
+                continue
+            pairs = [(a, b) for j, a in enumerate(group) for b in group[j + 1 :]]
+            mean_sim = sum(_jaccard(a, b) for a, b in pairs) / len(pairs)
+            penalty = diversity_penalty_max * mean_sim
+            penalties.extend([penalty] * len(group))
+        return penalties
 
     def _completion_text(completion) -> str:
         if isinstance(completion, list):
@@ -368,8 +390,13 @@ def build_reward_fn(train_cfg: dict):
         scores: list[float] = []
         log_records: list[dict] = []
 
-        for prompt, comp, task, gold, fen in zip(prompts, completions, tasks, gold_answers, fens):
-            text = _completion_text(comp)
+        all_texts = [_completion_text(c) for c in completions]
+        div_penalties = _diversity_penalties(all_texts)
+
+        for prompt, comp, task, gold, fen, text, div_penalty in zip(
+            prompts, completions, tasks, gold_answers, fens, all_texts, div_penalties
+        ):
+            text = text  # already extracted above
             # Extract user message text from prompt (last user turn)
             prompt_text = ""
             if isinstance(prompt, list):
@@ -391,9 +418,12 @@ def build_reward_fn(train_cfg: dict):
             predicted = _extract_answer(text)
             exact = _score_answer(task, predicted, gold) if predicted else 0.0
             penalty = _len_penalty(text)
-            # Rewards: tiny format bonus(0.01) + exact(0.99) - length_penalty
+            # Rewards: tiny format bonus(0.01) + exact(0.99) - length_penalty - diversity_penalty
             # Format reward is negligible so model can't game it by guessing
-            score = 0.01 * has_answer_tag + 0.99 * exact - penalty
+            # Reward: exact match + tiny format bonus - length penalty - diversity penalty.
+            # Symmetric length penalty regardless of correctness — prevents the model from
+            # learning to output very short completions (which would cause KL explosion).
+            score = 0.01 * has_answer_tag + 0.99 * exact - penalty - div_penalty
             scores.append(score)
             log_records.append(
                 {
@@ -403,6 +433,7 @@ def build_reward_fn(train_cfg: dict):
                     "predicted": predicted,
                     "score": score,
                     "penalty": penalty,
+                    "div_penalty": div_penalty,
                     "has_tag": bool(has_answer_tag),
                     "prompt": prompt_text,
                     "completion": text,

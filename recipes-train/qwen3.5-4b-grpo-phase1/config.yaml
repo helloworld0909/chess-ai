@@ -32,7 +32,7 @@ training:
   eval_file:  data/processed/grpo_phase1c_board_reading_eval.jsonl
 
   # Curriculum phase 1c: all 6 basic tasks, randomly mixed
-  task_filter: ["piece_at", "in_check", "count_pieces", "piece_positions", "attacked_by", "material_count"]
+  task_filter: ["piece_at", "count_pieces", "piece_positions", "material_count", "in_check", "attacked_by"]
 
   num_generations: 4
   max_completion_length: 1024
@@ -59,6 +59,9 @@ training:
   # Linear length penalty on completion word count
   len_penalty_free_tokens: 100   # no penalty up to this many words
   len_penalty_max: 0.5           # max penalty at max_completion_length
+
+  # Diversity penalty: penalises identical completions within a generation group
+  diversity_penalty_max: 0.1     # max penalty when all completions are identical (Jaccard=1)
 
   temperature: 1.0
   top_p: 0.95

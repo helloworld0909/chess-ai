@@ -45,6 +45,12 @@ Rules:
 - Square list questions: one square per line (e.g. "d5"), or "none".
 """
 
+_BOARD_TOKEN = "<|vision_pad|>"
+_BOARD_TOKENS_PER_POSITION = 64  # one token per square, must match BOARD_TOKENS_PER_POSITION
+# 64 consecutive sentinel tokens represent one board position in the input sequence.
+# The CNN encoder replaces them with 64 per-square embeddings at training time.
+_BOARD_SENTINEL = _BOARD_TOKEN * _BOARD_TOKENS_PER_POSITION
+
 _PIECE_NAMES = {
     chess.PAWN: "pawn",
     chess.KNIGHT: "knight",
@@ -112,21 +118,23 @@ def _task_captures(board: chess.Board) -> tuple[str, str]:
 
 
 def _task_in_check(board: chess.Board) -> tuple[str, str]:
-    """Ask which pieces are giving check (by square), or 'none'."""
-    if board.is_check():
-        king_sq = board.king(board.turn)
-        assert king_sq is not None
-        attacker_color = not board.turn
-        attackers = board.attackers(attacker_color, king_sq)
-        squares = sorted(chess.square_name(sq) for sq in attackers)
-        answer = "\n".join(squares)
-    else:
-        answer = "none"
+    """Ask which pieces are giving check (by square).
+    Only emits for positions where the side to move IS in check — so 'none' never appears.
+    Returns ("", "") to signal skip if not in check.
+    """
+    if not board.is_check():
+        return "", ""
+    king_sq = board.king(board.turn)
+    assert king_sq is not None
+    attacker_color = not board.turn
+    attackers = board.attackers(attacker_color, king_sq)
+    squares = sorted(chess.square_name(sq) for sq in attackers)
+    answer = "\n".join(squares)
     user = (
         f"The image shows the board from {_side(board)}'s perspective "
         f"({_side(board)} to move).\n\n"
         "Which squares have pieces that are giving check to the side to move? "
-        'List one square per line (e.g. "d5"), or answer "none" if not in check.'
+        'List one square per line (e.g. "d5").'
     )
     return user, answer
 
@@ -195,26 +203,30 @@ def _task_piece_positions(board: chess.Board) -> tuple[str, str]:
 
 
 def _task_attacked_by(board: chess.Board) -> tuple[str, str]:
-    """Ask which pieces (by square) attack a given square for a given color."""
-    # Bias toward occupied squares to make the question more interesting
+    """Ask which pieces (by square) attack a given square for a given color.
+    Only emits when there ARE attackers — so 'none' never appears.
+    Tries up to 20 random squares to find one with attackers; returns ("", "") to signal skip if none found.
+    """
     occupied = [sq for sq in chess.SQUARES if board.piece_at(sq) is not None]
-    if occupied and random.random() < 0.6:
-        sq = random.choice(occupied)
-    else:
-        sq = random.randint(0, 63)
-    sq_name = chess.square_name(sq)
     color = random.choice([chess.WHITE, chess.BLACK])
     color_name = _COLOR_NAMES[color]
-    attackers = board.attackers(color, sq)
-    squares = sorted(chess.square_name(a) for a in attackers)
-    answer = "\n".join(squares) if squares else "none"
-    user = (
-        f"The image shows the board from {_side(board)}'s perspective "
-        f"({_side(board)} to move).\n\n"
-        f"Which {color_name} pieces are attacking square {sq_name}? "
-        'List one square per line (e.g. "d5"), or answer "none".'
-    )
-    return user, answer
+
+    # Try to find a square that has attackers of the chosen color
+    candidates = occupied + random.sample(list(chess.SQUARES), min(20, 64))
+    for sq in candidates:
+        attackers = board.attackers(color, sq)
+        if attackers:
+            sq_name = chess.square_name(sq)
+            squares = sorted(chess.square_name(a) for a in attackers)
+            answer = "\n".join(squares)
+            user = (
+                f"The image shows the board from {_side(board)}'s perspective "
+                f"({_side(board)} to move).\n\n"
+                f"Which {color_name} pieces are attacking square {sq_name}? "
+                'List one square per line (e.g. "d5").'
+            )
+            return user, answer
+    return "", ""
 
 
 def _task_material_count(board: chess.Board) -> tuple[str, str]:
@@ -303,6 +315,14 @@ def main() -> None:
     parser.add_argument("--target", type=int, default=100000)
     parser.add_argument("--eval-size", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sft",
+        action="store_true",
+        help=(
+            "SFT mode: inject one sentinel token into user message and add assistant turn "
+            "with <answer>X</answer>. Use for encoder SFT training."
+        ),
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -346,12 +366,23 @@ def main() -> None:
             if not user or not answer:
                 continue
 
+            if args.sft:
+                # SFT mode: prepend sentinel to user message; add assistant answer turn.
+                # The sentinel is replaced by CNN board embeddings by EncoderDataCollator.
+                messages = [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": f"{_BOARD_SENTINEL}\n\n{user}"},
+                    {"role": "assistant", "content": f"<answer>{answer}</answer>"},
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user},
+                ]
+
             rows.append(
                 {
-                    "messages": [
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user", "content": user},
-                    ],
+                    "messages": messages,
                     "metadata": {"fen": fen, "task": task, "answer": answer},
                 }
             )

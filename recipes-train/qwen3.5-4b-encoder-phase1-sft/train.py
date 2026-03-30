@@ -1,4 +1,9 @@
-"""Encoder SFT training — Phase 2 Joint Task"""
+"""Encoder SFT training — Phase 1 Board-Reading Grounding
+
+Each sample has one sentinel token <|vision_pad|> in the user message.
+EncoderDataCollator replaces it with CNN board embeddings at training time.
+Target: <answer>X</answer> with no thinking block.
+"""
 
 import argparse
 import json
@@ -11,7 +16,7 @@ import chess
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from src.encoder import MOVE_TOKEN, MOVE_TOKEN_ID
+from src.encoder import BOARD_TOKEN, BOARD_TOKEN_ID, BOARD_TOKENS_PER_POSITION
 from training.encoder_collator import EncoderDataCollator
 from training.encoder_model import ChessLMWithEncoder
 from training.lib import (
@@ -24,90 +29,18 @@ from training.lib import (
 _logger = logging.getLogger(__name__)
 
 
-def _extract_line_sans(user_content: str) -> list[list[str]]:
-    """Parse ## Engine Key Lines section from user content.
-
-    Handles both "PLAYED LINE: ..." and "Line N: ..." formats.
-    Returns all lines in order (PLAYED LINE first if present).
-    """
-    lines_section_re = re.search(
-        r"## Engine Key Lines\n\n(.*?)(?=\n\n##|\Z)", user_content, re.DOTALL
-    )
-    if not lines_section_re:
-        return []
-
-    result = []
-    lines_text = lines_section_re.group(1).strip().split("\n")
-    for line in lines_text:
-        m = re.match(r"^(?:PLAYED LINE|Line \d+):\s*(.*)", line.strip())
-        if m:
-            parts = m.group(1).split("→")
-            sans = []
-            for part in parts:
-                # Strip sentinel token and SF15 bracket annotations like "[mobility +0.15; ...]"
-                clean = part.replace(MOVE_TOKEN, "").strip()
-                clean = re.sub(r"\s*\[.*?\]", "", clean).strip()
-                if clean:
-                    sans.append(clean)
-            if sans:
-                result.append(sans)
-    return result
-
-
-def _inject_move_tokens(
-    messages: list[dict],
-    student_san: str,
-) -> tuple[list[dict], list[list[str]]]:
-    new_msgs = []
-    line_sans: list[list[str]] = []
-
+def _verify_sentinel(messages: list[dict]) -> None:
+    """Verify exactly BOARD_TOKENS_PER_POSITION sentinel tokens exist in the user message."""
     for msg in messages:
-        content = msg["content"]
-        role = msg["role"]
-
-        if role == "user":
-            if student_san:
-                content = re.sub(
-                    r"(?<=Move:\s)" + re.escape(student_san) + r"(?=\s|$|\n)",
-                    MOVE_TOKEN,
-                    content,
+        if msg["role"] == "user":
+            count = msg["content"].count(BOARD_TOKEN)
+            if count != BOARD_TOKENS_PER_POSITION:
+                _logger.warning(
+                    "Expected %d board sentinels in user message, got %d",
+                    BOARD_TOKENS_PER_POSITION,
+                    count,
                 )
-
-            if "## Engine Key Lines" in content:
-                line_sans = _extract_line_sans(content)
-
-                def replace_key_lines(m: re.Match) -> str:
-                    inner = m.group(1)
-                    new_lines = []
-                    for line in inner.split("\n"):
-                        # Match PLAYED LINE or Line N
-                        line_m = re.match(r"^((?:PLAYED LINE|Line \d+):\s*)(.*)", line)
-                        if line_m:
-                            prefix = line_m.group(1)
-                            moves_str = line_m.group(2)
-                            moves = moves_str.split("→")
-                            injected_moves = []
-                            for move in moves:
-                                move = move.strip()
-                                if not move.startswith(MOVE_TOKEN):
-                                    injected_moves.append(MOVE_TOKEN + move)
-                                else:
-                                    injected_moves.append(move)
-                            new_lines.append(prefix + " → ".join(injected_moves))
-                        else:
-                            new_lines.append(line)
-                    return "## Engine Key Lines\n\n" + "\n".join(new_lines)
-
-                content = re.sub(
-                    r"## Engine Key Lines\n\n(.*?)(?=\n\n##|\Z)",
-                    replace_key_lines,
-                    content,
-                    flags=re.DOTALL,
-                )
-
-        new_msgs.append({"role": role, "content": content})
-
-    return new_msgs, line_sans
+            return
 
 
 def setup_encoder_model(config_path: str) -> tuple:
@@ -127,10 +60,10 @@ def setup_encoder_model(config_path: str) -> tuple:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    actual_id = tokenizer.convert_tokens_to_ids(MOVE_TOKEN)
-    if actual_id != MOVE_TOKEN_ID:
+    actual_id = tokenizer.convert_tokens_to_ids(BOARD_TOKEN)
+    if actual_id != BOARD_TOKEN_ID:
         raise RuntimeError(
-            f"MOVE_TOKEN {MOVE_TOKEN!r} resolved to id={actual_id}, expected {MOVE_TOKEN_ID}."
+            f"BOARD_TOKEN {BOARD_TOKEN!r} resolved to id={actual_id}, expected {BOARD_TOKEN_ID}."
         )
 
     quant_mode = model_cfg.get("quantization", "8bit")
@@ -174,9 +107,10 @@ def setup_encoder_model(config_path: str) -> tuple:
     model = ChessLMWithEncoder(
         llm=peft_llm,
         hidden_size=base_llm.config.hidden_size,
-        cnn_hidden_size=encoder_cfg.get("hidden_size", 512),
-        cnn_num_blocks=encoder_cfg.get("num_blocks", 15),
-        move_token_id=MOVE_TOKEN_ID,
+        cnn_in_channels=encoder_cfg.get("in_channels", 19),
+        cnn_hidden_size=encoder_cfg.get("hidden_size", 256),
+        cnn_num_blocks=encoder_cfg.get("num_blocks", 10),
+        move_token_id=BOARD_TOKEN_ID,
     )
     model.to(torch.bfloat16)
     model.to(f"cuda:{local_rank}")
@@ -226,7 +160,7 @@ def main() -> None:
         )
 
     model, tokenizer = setup_encoder_model(args.config)
-    move_token_id: int = MOVE_TOKEN_ID
+    board_token_id: int = BOARD_TOKEN_ID
 
     keep_think = train_cfg.get("keep_think", True)
     max_seq_length: int = train_cfg.get("max_seq_length", 2400)
@@ -258,12 +192,13 @@ def main() -> None:
 
         meta = example.get("metadata", {})
         fen = meta.get("fen", chess.STARTING_FEN)
-        student_san = meta.get("move_san", "")
 
-        modified_messages, line_sans = _inject_move_tokens(messages, student_san)
+        # Board-reading SFT: sentinel is already in the user message from the dataset.
+        # EncoderDataCollator will replace it with boards_to_tensor(board, None).
+        _verify_sentinel(messages)
 
         tokenized = tokenizer.apply_chat_template(
-            modified_messages,
+            messages,
             tokenize=True,
             return_dict=True,
             add_generation_prompt=False,
@@ -274,15 +209,12 @@ def main() -> None:
         attention_mask = tokenized.get("attention_mask", [1] * len(input_ids))
         labels = _make_labels(input_ids)
 
-        expected_count = (1 if student_san else 0) + sum(len(ls) for ls in line_sans)
         actual_count = input_ids.count(move_token_id)
-        if actual_count != expected_count:
+        if actual_count != 1:
             _logger.warning(
-                "move token count mismatch in _fmt: expected %d got %d (fen=%s san=%s)",
-                expected_count,
+                "move token count mismatch in _fmt: expected 1 got %d (fen=%s)",
                 actual_count,
                 fen,
-                student_san,
             )
 
         return {
@@ -290,8 +222,8 @@ def main() -> None:
             "attention_mask": attention_mask,
             "labels": labels,
             "fen": fen,
-            "move_san": student_san,
-            "line_sans_json": json.dumps(line_sans),
+            "move_san": "",
+            "line_sans_json": "[]",
         }
 
     from datasets import Dataset
