@@ -39,10 +39,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 _POSITION_RE = re.compile(r"\[Position(?:[^]]*?):\s*([^\]]+)\]")
 _SECTION_RE = re.compile(r"^(?=## |### )", re.MULTILINE)
+_PGNDIAGRAM_RE = re.compile(r"\[pgndiagram\]", re.IGNORECASE)
 
 
 def _replace_positions_with_sentinels(text: str, sentinel: str, n: int) -> tuple[str, list[str]]:
-    """Replace every [Position: FEN] with n sentinel tokens; return (text, fens)."""
+    """Replace every [Position: FEN] with n sentinel tokens; return (text, fens).
+
+    Also strips [pgndiagram] artifacts (chesshowler source format) that should
+    have been positions but lack FEN data — remove them rather than leaving
+    raw markup in the training text.
+    """
     fens: list[str] = []
     block = sentinel * n
 
@@ -51,6 +57,7 @@ def _replace_positions_with_sentinels(text: str, sentinel: str, n: int) -> tuple
         return block
 
     replaced = _POSITION_RE.sub(_replace, text)
+    replaced = _PGNDIAGRAM_RE.sub("", replaced)
     return replaced, fens
 
 
@@ -82,16 +89,16 @@ def _chunk_by_tokens(
     while i < len(token_ids):
         chunk_ids = token_ids[i : i + max_tokens]
         chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=False)
-        # Count sentinel tokens in this chunk to get FEN slice
+        # Count sentinel tokens in this chunk to get FEN slice.
+        # Use only COMPLETE boards (n_sent_in_chunk // n_sentinels) — a partial
+        # sentinel block at a chunk boundary means that board is split across chunks
+        # and must not be counted for this chunk's FEN list.
         n_sent_in_chunk = chunk_ids.count(sentinel_id)
-        # Find which FENs correspond to sentinels in this slice
-        # We count sentinels in the prefix up to position i
         prefix_ids = token_ids[:i]
         n_sent_before = prefix_ids.count(sentinel_id)
-        # Each board uses n_sentinels tokens; compute board index range
         board_start = n_sent_before // n_sentinels
-        board_end = (n_sent_before + n_sent_in_chunk) // n_sentinels
-        chunk_fens = fens[board_start:board_end]
+        n_complete_boards = n_sent_in_chunk // n_sentinels
+        chunk_fens = fens[board_start : board_start + n_complete_boards]
         if chunk_text.strip():
             records.append({"text": chunk_text, "fens": chunk_fens, "source": source})
         i += step
@@ -101,7 +108,8 @@ def _chunk_by_tokens(
             chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=False)
             n_sent_in_chunk = chunk_ids.count(sentinel_id)
             board_start = (token_ids[:i].count(sentinel_id)) // n_sentinels
-            chunk_fens = fens[board_start : board_start + n_sent_in_chunk // n_sentinels]
+            n_complete_boards = n_sent_in_chunk // n_sentinels
+            chunk_fens = fens[board_start : board_start + n_complete_boards]
             if chunk_text.strip():
                 records.append({"text": chunk_text, "fens": chunk_fens, "source": source})
             break
