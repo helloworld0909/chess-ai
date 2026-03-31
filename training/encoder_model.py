@@ -20,7 +20,7 @@ class ChessLMWithEncoder(nn.Module):
     """Combines a base LLM (e.g., Qwen3.5-4B) with a ResNet board encoder.
 
     Each board position is represented by BOARD_TOKENS_PER_POSITION (64) consecutive
-    <|vision_pad|> sentinel tokens in the input. The encoder processes the 38-channel
+    <|vision_pad|> sentinel tokens in the input. The encoder processes the 19-channel
     8x8 board tensor and produces 64 per-square embeddings (one per chess square,
     row-major a1..h8), which replace the 64 sentinels in the embedding sequence.
 
@@ -29,13 +29,13 @@ class ChessLMWithEncoder(nn.Module):
     2D learnable positional encoding distinguishing file and rank.
 
     Usage:
-        # collator provides board_tensors_flat (N_boards, 38, 8, 8) and
+        # collator provides board_tensors_flat (N_boards, 19, 8, 8) and
         # move_counts (B,) alongside input_ids. board_tensors_flat/move_counts
         # are optional — omit them (or pass None) for TRL log-prob passes on
         # completion-only sequences; zero embeddings will be used instead.
         out = model(
             input_ids=ids,             # (B, L)  — L includes 64 sentinels per board
-            board_tensors_flat=flat,   # (N_boards, 38, 8, 8)  — optional
+            board_tensors_flat=flat,   # (N_boards, 19, 8, 8)  — optional
             move_counts=counts,        # (B,)  — optional, kept for API compat
             attention_mask=mask,       # (B, L)
             labels=labels,             # (B, L)
@@ -72,6 +72,42 @@ class ChessLMWithEncoder(nn.Module):
         self.config = self.llm.config
         self.name_or_path = getattr(self.llm, "name_or_path", "")
 
+    def freeze_for_alignment(self) -> None:
+        """Freeze everything except the CNN projector for phase0 alignment.
+
+        Mirrors LLaVA-1.5 stage 1: only the projection MLP is trained while
+        both the CNN trunk and the LLM are fully frozen.  This teaches the
+        projector to map CNN spatial features into the LLM's embedding space
+        before any LLM parameters are updated.
+
+        Trainable after this call:
+            - cnn.proj  (2-layer MLP, ~13M params for hidden=256 → out=2560)
+        Frozen:
+            - cnn.conv_input, cnn.blocks, cnn.pos_file, cnn.pos_rank
+            - All LLM / LoRA parameters
+        """
+        # Freeze the entire model first
+        for p in self.parameters():
+            p.requires_grad_(False)
+        # Unfreeze only the projector MLP
+        for p in self.cnn.proj.parameters():
+            p.requires_grad_(True)
+
+    def train(self, mode: bool = True) -> "ChessLMWithEncoder":
+        """Keep CNN trunk in eval mode to prevent BatchNorm statistic drift.
+
+        Trainer calls model.train() before every training step. Without this
+        override, BatchNorm running_mean/running_var in the frozen CNN trunk
+        would be updated with per-batch statistics, corrupting the pretrained
+        representations and causing the projector to chase a moving target.
+        """
+        super().train(mode)
+        # Lock the entire CNN in eval mode — BN stats frozen, dropout off
+        self.cnn.eval()
+        # Projector has no BN/dropout, but set it explicitly for clarity
+        self.cnn.proj.train(mode)
+        return self
+
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Proxy to inner LLM for Trainer compatibility."""
         if hasattr(self.llm, "gradient_checkpointing_enable"):
@@ -102,7 +138,7 @@ class ChessLMWithEncoder(nn.Module):
 
         Args:
             input_ids: (B, L) — L includes 64 sentinels per board position.
-            board_tensors_flat: (N_boards, 38, 8, 8) — one tensor per board position
+            board_tensors_flat: (N_boards, 19, 8, 8) — one tensor per board position
                 (not per token). If None, zero embeddings are used for all sentinels.
             move_counts: (B,) number of board positions per example. Unused in forward;
                 kept for API compatibility.

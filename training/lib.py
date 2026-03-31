@@ -77,7 +77,7 @@ def make_training_args(config: dict):
         gradient_accumulation_steps=train_cfg.get("gradient_accumulation_steps", 16),
         learning_rate=train_cfg.get("learning_rate", 1e-4),
         lr_scheduler_type=train_cfg.get("lr_scheduler_type", "cosine"),
-        warmup_ratio=train_cfg.get("warmup_ratio", 0.03),
+        warmup_steps=train_cfg.get("warmup_steps", 0),
         num_train_epochs=train_cfg.get("num_train_epochs", 3),
         max_steps=train_cfg.get("max_steps", -1),
         optim=train_cfg.get("optim", "adamw_8bit"),

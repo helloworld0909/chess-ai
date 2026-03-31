@@ -1,0 +1,62 @@
+# Qwen3.5-4B + ChessEncoder — Phase 0: Alignment (projector only)
+#
+# Goal:   Align the CNN projector into the LLM's embedding space.
+#         Pure LLaVA stage-1 style — only cnn.proj trains, LLM fully frozen.
+#
+# Frozen: CNN trunk + entire LLM (no LoRA)
+# Trained: cnn.proj only (~7M params, 2-layer MLP + GELU)
+#
+# Prompt: board sentinels + question (position randomized 50/50)
+# Data:   LLaVA-style board description — 1M FENs × 1 task = 1M records
+#         (tail of encoder_pretrain_1b.jsonl — positions unseen during CNN pretraining)
+# DDP:    2× RTX 5090  |  effective batch = 256 (16 × 2 GPUs × 8 accum, LLaVA standard)
+
+model:
+  model_name: "Qwen/Qwen3.5-4B"
+  attn_implementation: "sdpa"
+
+encoder:
+  in_channels: 19
+  hidden_size: 256
+  num_blocks: 10
+  pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt"
+
+training:
+  train_file: data/processed/alignment_board_description.jsonl
+  eval_file:  data/processed/alignment_board_description_eval.jsonl
+  max_seq_length: 384  # p99=373, max=381 — no truncation occurs
+
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 16  # effective batch = 256 (8 × 2 GPUs × 16 accum)
+
+  learning_rate: 1.0e-3
+  lr_scheduler_type: cosine
+  warmup_steps: 116  # 3% of 3867 total steps (990k / (16 × 2 GPUs × 8 accum))
+  num_train_epochs: 1
+
+  optim: adamw_torch  # 7M params only — 8bit quantization noise not worth it
+  weight_decay: 0.0   # LLaVA stage-1 standard: projector needs freedom to find extreme weights
+  max_grad_norm: 1.0
+
+  gradient_checkpointing: false  # LLM frozen — no need for checkpointing
+  bf16: true
+  dataloader_num_workers: 8
+  ddp_find_unused_parameters: false
+
+  logging_steps: 10
+  eval_strategy: steps
+  eval_steps: 200
+  save_strategy: steps
+  save_steps: 200
+  save_total_limit: 3
+
+  seed: 42
+
+output_dir: checkpoints/qwen3.5-4b-encoder-phase0-alignment
+
+wandb:
+  enabled: false
+  project: "chess-tutor"
+  name: "qwen3.5-4b-encoder-phase0-alignment"
+  tags: ["encoder", "alignment", "projector"]
