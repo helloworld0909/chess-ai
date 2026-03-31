@@ -249,11 +249,24 @@ def main() -> None:
         attention_mask = full_ids["attention_mask"]
         prompt_len = len(prompt_ids["input_ids"])
 
-        # Loss only on assistant answer tokens
+        # Loss only on assistant answer tokens.
+        # Also mask the empty <think>\n\n</think>\n\n block Qwen3 always emits —
+        # we don't want the model rewarded for predicting boilerplate think tokens.
         labels = [-100] * prompt_len + input_ids[prompt_len:]
         if len(labels) < len(input_ids):
             labels += [-100] * (len(input_ids) - len(labels))
         labels = labels[: len(input_ids)]
+
+        # Qwen3 chat template with add_generation_prompt=True appends "<think>\n" to the prompt.
+        # So the label region starts with: </think>(248069) \n\n(271) <answer>...
+        # Mask </think> and \n\n so loss is computed only on actual answer tokens.
+        think_end_id = tokenizer.convert_tokens_to_ids("</think>")
+        i = prompt_len
+        if i < len(labels) and input_ids[i] == think_end_id:  # </think>
+            labels[i] = -100
+            i += 1
+        if i < len(labels) and input_ids[i] == 271:  # \n\n
+            labels[i] = -100
 
         return {
             "input_ids": input_ids,
@@ -358,22 +371,91 @@ def main() -> None:
                     deduped[k] = v
             super()._save(output_dir=output_dir, state_dict=deduped)
 
+    # Pick a fixed set of diverse eval examples to log at each eval step
+    _LOG_TASKS = [
+        "piece_abbr_at",
+        "piece_name_at",
+        "side_to_move",
+        "count_piece_type",
+        "find_piece_type",
+        "is_square_occupied",
+        "en_passant",
+        "castling_rights",
+    ]
+    _log_samples: list[dict] = []
+    seen_tasks: set[str] = set()
+    for ex in raw_eval:
+        task = ex.get("metadata", {}).get("task", "")
+        if task in _LOG_TASKS and task not in seen_tasks:
+            seen_tasks.add(task)
+            _log_samples.append(ex)
+        if len(seen_tasks) == len(_LOG_TASKS):
+            break
+
+    from transformers import TrainerCallback
+
+    class SampleLogCallback(TrainerCallback):
+        """Log model predictions on fixed eval samples every eval_steps."""
+
+        def on_evaluate(self, args, state, control, **kwargs):
+            if not state.is_local_process_zero:
+                return
+            import chess as _chess
+
+            model.eval()
+            device = model.llm.device
+            _logger.info("=== Sample predictions at step %d ===", state.global_step)
+            for ex in _log_samples:
+                fen = ex.get("metadata", {}).get("fen", _chess.STARTING_FEN)
+                task = ex.get("metadata", {}).get("task", "")
+                q = next(m["content"] for m in ex["messages"] if m["role"] == "user")
+                expected = next(m["content"] for m in ex["messages"] if m["role"] == "assistant")
+                prompt_text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": _ANCHORED_BOARD + "\n\n" + q}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].to(device)
+                try:
+                    board = _chess.Board(fen)
+                except Exception:
+                    board = _chess.Board()
+                board_tensor = board_to_tensor(board).unsqueeze(0).to(torch.bfloat16).to(device)
+                with torch.no_grad():
+                    cnn_tokens = model.cnn(board_tensor)
+                    text_embeds = model.embed_tokens(input_ids)
+                    sentinel_mask = (input_ids == model.move_token_id)[0]
+                    text_embeds[0, sentinel_mask] = cnn_tokens[0, : sentinel_mask.sum()]
+                    out = model.llm.generate(
+                        inputs_embeds=text_embeds,
+                        max_new_tokens=32,
+                        do_sample=False,
+                        pad_token_id=tokenizer.eos_token_id,
+                    )
+                answer = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+                _logger.info(
+                    "  [%-20s] Q: %-55s | expected: %-15r | got: %r",
+                    task,
+                    q[:55],
+                    expected,
+                    answer,
+                )
+            model.train()
+
     trainer = EncoderTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=collator,
+        callbacks=[SampleLogCallback()],
     )
 
     if args.dry_run:
         _logger.info("Dry run complete — exiting before training.")
         return
 
-    resume = args.resume
-    if resume is True:
-        resume = training_args.output_dir
-    trainer.train(resume_from_checkpoint=resume)
+    trainer.train(resume_from_checkpoint=args.resume)
     trainer.save_model()
     tokenizer.save_pretrained(training_args.output_dir)
     _logger.info("Done.")

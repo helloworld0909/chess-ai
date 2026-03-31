@@ -206,7 +206,7 @@ def _task_file_contents(board: chess.Board, rng: random.Random) -> tuple[str, st
     return rng.choice(q_variants), answer
 
 
-def _task_castling_rights(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_castling_rights(board: chess.Board, rng: random.Random) -> tuple[str, str] | None:
     parts = []
     if board.has_kingside_castling_rights(chess.WHITE):
         parts.append("White O-O")
@@ -216,6 +216,9 @@ def _task_castling_rights(board: chess.Board, rng: random.Random) -> tuple[str, 
         parts.append("Black O-O")
     if board.has_queenside_castling_rights(chess.BLACK):
         parts.append("Black O-O-O")
+    # "none" is ~60% of positions — skip half to prevent always-none bias
+    if not parts and rng.random() < 0.5:
+        return None
     answer = ", ".join(parts) if parts else "none"
     q_variants = [
         "What castling rights remain?",
@@ -225,8 +228,14 @@ def _task_castling_rights(board: chess.Board, rng: random.Random) -> tuple[str, 
     return rng.choice(q_variants), answer
 
 
-def _task_en_passant(board: chess.Board, rng: random.Random) -> tuple[str, str]:
-    answer = _sq(board.ep_square) if board.ep_square is not None else "none"
+def _task_en_passant(board: chess.Board, rng: random.Random) -> tuple[str, str] | None:
+    # En passant is available <1% of random positions — skip 50% of "none" cases
+    # so the model sees roughly equal yes/no examples and can't cheat by always
+    # outputting "none".
+    has_ep = board.ep_square is not None
+    if not has_ep and rng.random() < 0.5:
+        return None  # skip — will be replaced by another task
+    answer = _sq(board.ep_square) if has_ep else "none"
     q_variants = [
         "What is the en passant square, if any?",
         "Is there an en passant target square? If so, which?",
@@ -330,6 +339,9 @@ _TASKS = [
     ("is_square_occupied", _task_is_square_occupied),
 ]
 
+# Tasks that need a top-up pass because their positive examples are rare in random positions.
+_RARE_TASKS = {"castling_rights", "en_passant"}
+
 
 def generate_for_fen(fen: str, rng: random.Random, tasks_per_fen: int = 10) -> list[dict]:
     try:
@@ -412,6 +424,42 @@ def _collect_fens(source: str, max_fens: int | None = None, from_end: bool = Fal
     return fens
 
 
+def _collect_rare_fens(
+    source: str,
+    predicate,
+    max_fens: int,
+    exclude: set[str] | None = None,
+) -> list[str]:
+    """Scan the full source file for FENs matching a predicate.
+
+    Used to collect enough positive examples for rare board states
+    (e.g. en passant available, castling rights present) that are
+    underrepresented in any fixed tail window.
+    """
+    fens: list[str] = []
+    seen: set[str] = set(exclude or [])
+    with open(source) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                fen = rec.get("metadata", {}).get("fen", "") or rec.get("fen", "")
+                if not fen or fen in seen:
+                    continue
+                board = chess.Board(fen)
+                if predicate(board):
+                    seen.add(fen)
+                    fens.append(fen)
+                    if len(fens) >= max_fens:
+                        break
+            except Exception:
+                pass
+    _logger.info("Rare FENs collected: %d (target=%d)", len(fens), max_fens)
+    return fens
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -453,7 +501,7 @@ def main() -> None:
 
     rng = random.Random(args.seed)
 
-    # Collect unique FENs from source
+    # Collect unique FENs from source (tail = unseen by encoder)
     fens = _collect_fens(args.source, max_fens=args.max_fens, from_end=args.from_end)
     _logger.info(
         "Unique FENs collected: %d (max_fens=%s, from_end=%s)",
@@ -462,22 +510,116 @@ def main() -> None:
         args.from_end,
     )
 
+    # Collect extra FENs from full dataset for rare board states.
+    # Target: enough positives so that after trimming nones to 30%, each rare
+    # task has ~5000 examples (5000 * 0.7 positives needed = 3500 each).
+    RARE_TARGET_POSITIVES = 3500
+    fens_set = set(fens)
+    _logger.info("Scanning full dataset for en_passant FENs (target=%d)...", RARE_TARGET_POSITIVES)
+    ep_fens = _collect_rare_fens(
+        args.source,
+        predicate=lambda b: b.ep_square is not None,
+        max_fens=RARE_TARGET_POSITIVES,
+        exclude=fens_set,
+    )
+    _logger.info("Scanning full dataset for castling FENs (target=%d)...", RARE_TARGET_POSITIVES)
+    castling_fens = _collect_rare_fens(
+        args.source,
+        predicate=lambda b: b.has_castling_rights(chess.WHITE)
+        or b.has_castling_rights(chess.BLACK),
+        max_fens=RARE_TARGET_POSITIVES,
+        exclude=fens_set | set(ep_fens),
+    )
+
+    # Rare FENs are kept separate — only used for their respective tasks
+    rare_fens_by_task = {
+        "en_passant": ep_fens,
+        "castling_rights": castling_fens,
+    }
+
     rng.shuffle(fens)
 
     eval_fens = set(fens[: args.eval_fens])
     train_fens = fens[args.eval_fens :]
 
-    def _write(path: str, fen_list: list[str]) -> int:
-        count = 0
-        with open(path, "w") as f:
-            for fen in fen_list:
-                for rec in generate_for_fen(fen, rng, args.tasks_per_fen):
-                    f.write(json.dumps(rec) + "\n")
-                    count += 1
-        return count
+    def _write(path: str, fen_list: list[str], rare_pool: dict[str, list[str]]) -> int:
+        task_counts: dict[str, int] = {name: 0 for name, _ in _TASKS}
+        records_by_task: dict[str, list[dict]] = {name: [] for name, _ in _TASKS}
 
-    n_train = _write(args.output, train_fens)
-    n_eval = _write(args.eval_output, list(eval_fens))
+        # Main pass: all tasks from the regular FEN pool
+        for fen in fen_list:
+            for rec in generate_for_fen(fen, rng, args.tasks_per_fen):
+                t = rec["metadata"]["task"]
+                records_by_task[t].append(rec)
+                task_counts[t] += 1
+
+        # Rare task pass: generate from dedicated rare FEN pools (positives guaranteed)
+        # Then trim "none" answers so they are at most MAX_NONE_RATIO of total.
+        MAX_NONE_RATIO = 0.30
+        topup_rng = random.Random(rng.randint(0, 2**32))
+        rare_fns = {name: fn for name, fn in _TASKS if name in _RARE_TASKS}
+
+        for name, fn in rare_fns.items():
+            pool = rare_pool.get(name, [])
+            for fen in pool:
+                try:
+                    board = chess.Board(fen)
+                except Exception:
+                    continue
+                result = fn(board, topup_rng)
+                if result is None:
+                    continue
+                question, answer = result
+                records_by_task[name].append(
+                    {
+                        "messages": [
+                            {"role": "user", "content": question},
+                            {"role": "assistant", "content": answer},
+                        ],
+                        "metadata": {"fen": fen, "task": name},
+                    }
+                )
+                task_counts[name] += 1
+
+            # Trim nones to MAX_NONE_RATIO
+            positives = [r for r in records_by_task[name] if r["messages"][1]["content"] != "none"]
+            nones = [r for r in records_by_task[name] if r["messages"][1]["content"] == "none"]
+            max_none = int(len(positives) * MAX_NONE_RATIO / (1.0 - MAX_NONE_RATIO))
+            topup_rng.shuffle(nones)
+            kept_nones = nones[:max_none]
+            records_by_task[name] = positives + kept_nones
+            task_counts[name] = len(records_by_task[name])
+            _logger.info(
+                "  rare task %-20s pos=%d none=%d (%.0f%%) total=%d",
+                name,
+                len(positives),
+                len(kept_nones),
+                100 * len(kept_nones) / max(task_counts[name], 1),
+                task_counts[name],
+            )
+
+        for name, cnt in sorted(task_counts.items()):
+            _logger.info("  task %-25s %d", name, cnt)
+
+        # Write all records fully shuffled
+        all_records = [r for recs in records_by_task.values() for r in recs]
+        topup_rng.shuffle(all_records)
+        with open(path, "w") as f:
+            for rec in all_records:
+                f.write(json.dumps(rec) + "\n")
+        return len(all_records)
+
+    # Split rare FENs 90/10 train/eval
+    rare_train: dict[str, list[str]] = {}
+    rare_eval: dict[str, list[str]] = {}
+    for task_name, pool in rare_fens_by_task.items():
+        rng.shuffle(pool)
+        split = max(1, int(len(pool) * 0.9))
+        rare_train[task_name] = pool[:split]
+        rare_eval[task_name] = pool[split:]
+
+    n_train = _write(args.output, train_fens, rare_train)
+    n_eval = _write(args.eval_output, list(eval_fens), rare_eval)
     _logger.info("Train: %d records → %s", n_train, args.output)
     _logger.info("Eval:  %d records → %s", n_eval, args.eval_output)
 

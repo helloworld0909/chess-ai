@@ -1,5 +1,9 @@
 # Claude Code Guidelines for Chess AI Tutor
 
+## Hard Rules — Never Violate Without Explicit Confirmation
+
+- **Never delete checkpoints or training artifacts** without explicit user confirmation. This includes `rm -rf checkpoints/`, deleting checkpoint subdirectories, or any command that destroys training state. Always ask first.
+
 ## Quality Rules
 
 - **Never lower LLM quality parameters** (`max_tokens`, `thinking_budget`, `temperature`) to save compute. Quality is paramount. The current values (`max_tokens=8192`, `thinking_budget=2048`) must not be reduced without explicit user instruction.
