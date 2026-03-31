@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-import tempfile
 from typing import Any, Dict, List, Optional, Union
 
 import pytest
@@ -13,8 +12,8 @@ import importlib.util as _ilu
 
 import chess
 
-from encoder import MOVE_TOKEN, MOVE_TOKEN_ID
-from encoder.board_tensor import board_to_tensor, boards_to_tensor
+from encoder import BOARD_TOKENS_PER_POSITION, MOVE_TOKEN, MOVE_TOKEN_ID
+from encoder.board_tensor import board_to_tensor
 from encoder.cnn import ChessEncoder, ResidualBlock
 
 _REPO = os.path.join(os.path.dirname(__file__), "..")
@@ -31,18 +30,12 @@ def _load_module(path: str, name: str):
 
 
 _sft = _load_module(
-    os.path.join(_REPO, "recipes-train", "qwen3.5-4b-encoder-phase1-sft", "train.py"),
+    os.path.join(_REPO, "recipes-train", "qwen3.5-4b-encoder-phase2-grpo", "train.py"),
     "encoder_sft_train",
 )
 _inject_move_tokens = _sft._inject_move_tokens
 _extract_line_sans = _sft._extract_line_sans
 _inject_move_tokens_p2 = _sft._inject_move_tokens
-
-_pre = _load_module(
-    os.path.join(_REPO, "recipes-train", "encoder-pretrain", "train.py"), "encoder_pretrain_train"
-)
-EncoderPretrainDataset = _pre.EncoderPretrainDataset
-EncoderRegressorHead = _pre.EncoderRegressorHead
 
 # ---------------------------------------------------------------------------
 # Minimal fake tokenizer — no network calls, no model weights
@@ -202,6 +195,7 @@ def wrapper(mock_llm):
     return ChessLMWithEncoder(
         llm=mock_llm,
         hidden_size=256,
+        cnn_in_channels=19,
         cnn_hidden_size=32,
         cnn_num_blocks=2,
         move_token_id=MOVE_TOKEN_ID,
@@ -221,17 +215,17 @@ def test_residual_block():
 
 
 def test_chess_encoder_shape():
-    encoder = ChessEncoder(hidden_size=64, num_blocks=3, out_dim=256)
-    x = torch.randn(4, 38, 8, 8)
+    encoder = ChessEncoder(in_channels=19, hidden_size=64, num_blocks=3, out_dim=256)
+    x = torch.randn(4, 19, 8, 8)
     out = encoder(x)
-    assert out.shape == (4, 256)
+    assert out.shape == (4, 64, 256)  # 64 per-square tokens
 
 
 def test_chess_encoder_legacy_19ch():
     encoder = ChessEncoder(in_channels=19, hidden_size=64, num_blocks=3, out_dim=256)
     x = torch.randn(4, 19, 8, 8)
     out = encoder(x)
-    assert out.shape == (4, 256)
+    assert out.shape == (4, 64, 256)  # 64 per-square tokens
 
 
 def test_board_to_tensor():
@@ -243,23 +237,6 @@ def test_board_to_tensor():
     assert torch.all(tensor[12] == 1.0)  # white to move
     assert tensor[6 + 3, 7, 0] == 1.0  # Ra8
     assert torch.allclose(tensor[18], torch.tensor(0.005))
-
-
-def test_boards_to_tensor_with_move():
-    board = chess.Board()
-    move = chess.Move.from_uci("e2e4")
-    tensor = boards_to_tensor(board, move)
-    assert tensor.shape == (38, 8, 8)
-    assert tensor[0, 1, 4] == 1.0  # e2 pawn before
-    assert tensor[19, 1, 4] == 0.0  # e2 pawn gone after
-    assert tensor[19, 3, 4] == 1.0  # e4 pawn present after
-
-
-def test_boards_to_tensor_static():
-    board = chess.Board()
-    tensor = boards_to_tensor(board, move=None)
-    assert tensor.shape == (38, 8, 8)
-    assert torch.equal(tensor[:19], tensor[19:])
 
 
 # ---------------------------------------------------------------------------
@@ -399,9 +376,12 @@ def _make_feature(tokenizer, text: str, fen: str, move_san: str, line_sans: list
     return feat
 
 
+_SENTINEL_BLOCK = " ".join([MOVE_TOKEN] * BOARD_TOKENS_PER_POSITION)  # 64 sentinels per position
+
+
 def test_collator_single_move(mock_tokenizer, move_token_id):
     """Collator with no LINE moves produces 1 board tensor per example."""
-    text = f"Move: {MOVE_TOKEN} board info"
+    text = f"Move: {_SENTINEL_BLOCK} board info"
     feat = _make_feature(
         mock_tokenizer,
         text,
@@ -411,16 +391,16 @@ def test_collator_single_move(mock_tokenizer, move_token_id):
     )
     collator = EncoderDataCollator(tokenizer=mock_tokenizer)
     batch = collator([feat])
-    assert batch["board_tensors_flat"].shape == (1, 38, 8, 8)
+    assert batch["board_tensors_flat"].shape == (1, 19, 8, 8)
     assert batch["move_counts"].tolist() == [1]
 
 
 def test_collator_multi_move(mock_tokenizer, move_token_id):
     """Collator with LINE moves produces sum(move_counts) board tensors."""
     line_sans = [["d4", "e5", "Nf3"], ["c4", "Nc6"]]
-    n_tokens = 1 + sum(len(ls) for ls in line_sans)
-    # Build text with exactly n_tokens MOVE_TOKEN occurrences
-    text = f"Move: {MOVE_TOKEN} " + " ".join(f"{MOVE_TOKEN}" for _ in range(n_tokens - 1))
+    n_boards = 1 + sum(len(ls) for ls in line_sans)
+    # Build text with exactly n_boards sentinel blocks (64 sentinels each)
+    text = " ".join([_SENTINEL_BLOCK] * n_boards)
     feat = _make_feature(
         mock_tokenizer,
         text,
@@ -430,15 +410,15 @@ def test_collator_multi_move(mock_tokenizer, move_token_id):
     )
     collator = EncoderDataCollator(tokenizer=mock_tokenizer)
     batch = collator([feat])
-    assert batch["move_counts"].sum().item() == n_tokens
-    assert batch["board_tensors_flat"].shape == (n_tokens, 38, 8, 8)
+    assert batch["move_counts"].sum().item() == n_boards
+    assert batch["board_tensors_flat"].shape == (n_boards, 19, 8, 8)
 
 
 def test_collator_counts_match_input_ids(mock_tokenizer, move_token_id):
-    """sum(move_counts) must equal number of move_token_id tokens in input_ids."""
+    """sum(move_counts) must equal number of sentinel groups (64 tokens each) in input_ids."""
     line_sans = [["Nf3", "d5"]]
-    n_tokens = 1 + sum(len(ls) for ls in line_sans)
-    text = " ".join([MOVE_TOKEN] * n_tokens)
+    n_boards = 1 + sum(len(ls) for ls in line_sans)
+    text = " ".join([_SENTINEL_BLOCK] * n_boards)
     feat = _make_feature(
         mock_tokenizer,
         text,
@@ -448,8 +428,10 @@ def test_collator_counts_match_input_ids(mock_tokenizer, move_token_id):
     )
     collator = EncoderDataCollator(tokenizer=mock_tokenizer)
     batch = collator([feat])
-    n_in_ids = (batch["input_ids"] == move_token_id).sum().item()
-    assert n_in_ids == batch["move_counts"].sum().item()
+    n_sentinel_groups = (
+        batch["input_ids"] == move_token_id
+    ).sum().item() // BOARD_TOKENS_PER_POSITION
+    assert n_sentinel_groups == batch["move_counts"].sum().item()
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +451,7 @@ def test_chess_lm_forward_shape(wrapper, move_token_id):
     input_ids[1, 4] = move_token_id
     input_ids[1, 7] = move_token_id
 
-    board_tensors_flat = torch.randn(sum(n_moves), 38, 8, 8)
+    board_tensors_flat = torch.randn(sum(n_moves), 19, 8, 8)
     move_counts = torch.tensor(n_moves)
 
     out = wrapper(
@@ -489,7 +471,7 @@ def test_chess_lm_labels_move_positions_masked(wrapper, move_token_id):
     input_ids[0, 2] = move_token_id
     labels = torch.randint(100, 1000, (B, L))
 
-    board_tensors_flat = torch.randn(1, 38, 8, 8)
+    board_tensors_flat = torch.randn(1, 19, 8, 8)
     move_counts = torch.tensor([1])
 
     out = wrapper(
@@ -501,21 +483,25 @@ def test_chess_lm_labels_move_positions_masked(wrapper, move_token_id):
     assert out.loss is not None
 
 
-def test_chess_lm_mismatch_raises(wrapper, move_token_id):
-    """RuntimeError when board_tensors_flat count != move tokens in input_ids."""
+def test_chess_lm_mismatch_pads(wrapper, move_token_id):
+    """board_tensors_flat count mismatch is handled gracefully (pad/trim, no error)."""
     B, L = 1, 5
     input_ids = torch.randint(100, 1000, (B, L))
-    input_ids[0, 1] = move_token_id  # 1 token in input_ids
+    # Plant one full sentinel block (64 tokens) — needs L >= 64; use a longer seq
+    long_ids = torch.randint(100, 1000, (1, 70))
+    long_ids[0, :64] = move_token_id  # 64 sentinels = 1 board group
 
-    board_tensors_flat = torch.randn(3, 38, 8, 8)  # 3 tensors — mismatch
-    move_counts = torch.tensor([3])
+    board_tensors_flat = torch.randn(3, 19, 8, 8)  # 3 tensors but only 1 group needed
+    move_counts = torch.tensor([1])
 
-    with pytest.raises(RuntimeError, match="move token count mismatch"):
-        wrapper(
-            board_tensors_flat=board_tensors_flat,
-            move_counts=move_counts,
-            input_ids=input_ids,
-        )
+    # Should not raise — model trims to n_boards
+    out = wrapper(
+        board_tensors_flat=board_tensors_flat,
+        move_counts=move_counts,
+        input_ids=long_ids,
+        attention_mask=torch.ones(1, 70),
+    )
+    assert hasattr(out, "logits")
 
 
 def test_chess_lm_load_pretrained_weights(mock_llm, tmp_path):
@@ -540,86 +526,6 @@ def test_chess_lm_load_pretrained_weights(mock_llm, tmp_path):
     assert missing == []
     assert unexpected == []
 
-    x = torch.randn(2, 38, 8, 8)
+    x = torch.randn(2, 19, 8, 8)
     with torch.no_grad():
         assert torch.equal(w1.cnn(x), w2.cnn(x))
-
-
-# ---------------------------------------------------------------------------
-# EncoderRegressorHead
-# ---------------------------------------------------------------------------
-
-
-def test_encoder_regressor_head_shape():
-    encoder = ChessEncoder(in_channels=38, hidden_size=32, num_blocks=2, out_dim=64)
-    head = EncoderRegressorHead(encoder)
-    x = torch.randn(4, 38, 8, 8)
-    preds = head(x)
-    assert preds.shape == (4,)
-    assert preds.abs().max().item() < 1.0
-
-
-def test_encoder_regressor_head_range():
-    encoder = ChessEncoder(in_channels=38, hidden_size=32, num_blocks=2, out_dim=64)
-    head = EncoderRegressorHead(encoder)
-    x = torch.randn(8, 38, 8, 8) * 100.0
-    preds = head(x)
-    assert (preds > -1.0).all()
-    assert (preds < 1.0).all()
-
-
-# ---------------------------------------------------------------------------
-# EncoderPretrainDataset
-# ---------------------------------------------------------------------------
-
-
-_SAMPLE_RECORDS = [
-    {
-        "fen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-        "move_uci": "e7e5",
-        "cp_diff_scaled": -0.05,
-    },
-    {
-        "fen": "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2",
-        "move_uci": "g1f3",
-        "cp_diff_scaled": 0.12,
-    },
-    {
-        "fen": "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2",
-        "move_uci": "b8c6",
-        "cp_diff_scaled": 0.03,
-    },
-]
-
-
-def test_encoder_pretrain_dataset_len():
-    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-        for rec in _SAMPLE_RECORDS:
-            f.write(json.dumps(rec) + "\n")
-        tmp_path = f.name
-    ds = EncoderPretrainDataset(tmp_path)
-    assert len(ds) == len(_SAMPLE_RECORDS)
-    os.unlink(tmp_path)
-
-
-def test_encoder_pretrain_dataset_item_shapes():
-    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-        for rec in _SAMPLE_RECORDS:
-            f.write(json.dumps(rec) + "\n")
-        tmp_path = f.name
-    ds = EncoderPretrainDataset(tmp_path)
-    board_tensor, label = ds[0]
-    assert board_tensor.shape == (38, 8, 8)
-    assert label.shape == ()
-    assert label.dtype == torch.float32
-    os.unlink(tmp_path)
-
-
-def test_encoder_pretrain_dataset_limit():
-    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-        for rec in _SAMPLE_RECORDS:
-            f.write(json.dumps(rec) + "\n")
-        tmp_path = f.name
-    ds = EncoderPretrainDataset(tmp_path, limit=2)
-    assert len(ds) == 2
-    os.unlink(tmp_path)

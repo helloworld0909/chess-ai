@@ -10,19 +10,9 @@ Single-board tensor — (19, 8, 8):
   16:    Black queenside castling right
   17:    En passant file (1 in the EP file column)
   18:    Move number (normalized to [0,1], assuming max ~200)
-
-Combined before+after tensor — (38, 8, 8):
-  0-18:  Board before the move  (19 channels above)
-  19-37: Board after the move   (19 channels above)
-
-When no move is provided (static position query), channels 19-37 = channels 0-18
-(identity / null-move convention). The ResNet sees zero delta and learns to represent
-the position without any move context.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import chess
 import torch
@@ -74,32 +64,3 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
     tensor[18, :, :] = move_num
 
     return tensor
-
-
-def boards_to_tensor(board: chess.Board, move: Optional[chess.Move] = None) -> torch.Tensor:
-    """Convert a position (and optional move) into a (38, 8, 8) float32 tensor.
-
-    Channels 0-18:  board before the move.
-    Channels 19-37: board after the move.
-
-    If move is None (static position query), channels 19-37 are identical to
-    channels 0-18 — the null-move / identity convention. The ResNet sees zero
-    spatial delta and learns to represent the bare position.
-
-    Args:
-        board: Position before the move. Not mutated.
-        move:  Legal move to apply, or None for a static position query.
-
-    Returns:
-        Tensor of shape (38, 8, 8), dtype float32.
-    """
-    before = board_to_tensor(board)
-
-    if move is None:
-        after = before  # identity — zero delta
-    else:
-        board_after = board.copy()
-        board_after.push(move)
-        after = board_to_tensor(board_after)
-
-    return torch.cat([before, after], dim=0)

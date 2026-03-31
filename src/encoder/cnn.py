@@ -2,7 +2,6 @@
 
 Architecture loosely based on Leela Chess Zero (LCZero) trunks:
 - Input: 19-channel 8x8 spatial tensor (piece planes + castling + ep + move#).
-  Legacy 38-channel input (before+after move) is still supported for phase2 coaching.
 - Blocks: Configurable number of ResidualBlocks ( Conv -> BN -> ReLU -> Conv -> BN -> + )
 - Head: 2D learnable positional encoding -> project each of 64 spatial cells to out_dim
   Output: (B, 64, out_dim) — one token per square, row-major a1..h1, a2..h2, ..., a8..h8.
@@ -48,9 +47,7 @@ class ChessEncoder(nn.Module):
         """ResNet trunk producing 64 per-square tokens with 2D positional encoding.
 
         Args:
-            in_channels: Depth of the board tensor.
-                38 = before (19) + after (19). For static positions, before == after.
-                19 = single board (legacy / ablation use).
+            in_channels: Depth of the board tensor (19-channel single-board format).
             hidden_size: Number of filters in the ResNet trunk.
             num_blocks: Number of Residual blocks to chain.
             out_dim: Output dimension per token (must match LLM hidden_size).
@@ -75,8 +72,14 @@ class ChessEncoder(nn.Module):
         nn.init.trunc_normal_(self.pos_file, std=0.02)
         nn.init.trunc_normal_(self.pos_rank, std=0.02)
 
-        # Project each spatial cell from hidden_size → out_dim
-        self.proj = nn.Linear(hidden_size, out_dim)
+        # Project each spatial cell from hidden_size → out_dim.
+        # 2-layer MLP with GELU (LLaVA-1.5 standard) gives the alignment phase
+        # enough capacity to map CNN features into the LLM's embedding space.
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_size, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
 
     def spatial_features(self, x: torch.Tensor) -> torch.Tensor:
         """Return pre-projection spatial features in CNN hidden space.

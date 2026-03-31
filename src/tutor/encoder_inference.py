@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.encoder import MOVE_TOKEN, MOVE_TOKEN_ID
-from src.encoder.board_tensor import boards_to_tensor
+from src.encoder.board_tensor import board_to_tensor
 from training.lib import load_config
 
 _logger = logging.getLogger(__name__)
@@ -133,44 +133,38 @@ def build_board_tensors(
         played_line_sans: PLAYED LINE SANs, starting with student's move, then continuation
 
     Returns:
-        Tensor of shape (N, 38, 8, 8)
+        Tensor of shape (N, 19, 8, 8)
     """
     tensors: list[torch.Tensor] = []
 
     board = chess.Board(fen)
 
-    # 1. Student move tensor (for the "Move:" sentinel)
-    student_move: chess.Move | None = None
-    if move_san:
-        try:
-            student_move = board.parse_san(move_san)
-        except Exception:
-            pass
-    tensors.append(boards_to_tensor(board, student_move))
+    # 1. Student move tensor (for the "Move:" sentinel) — pre-move board
+    tensors.append(board_to_tensor(board))
 
-    # 2. Played line tensors — replay from pre-move board
+    # 2. Played line tensors — pre-move board at each step
     if played_line_sans:
         pl_board = board.copy()
         for san in played_line_sans:
+            tensors.append(board_to_tensor(pl_board))
             try:
                 mv = pl_board.parse_san(san)
-                tensors.append(boards_to_tensor(pl_board, mv))
                 pl_board.push(mv)
             except Exception:
-                tensors.append(boards_to_tensor(pl_board, None))
+                pass
 
-    # 3. Engine line tensors — replay from pre-move board
+    # 3. Engine line tensors — pre-move board at each step
     for line_sans in key_lines:
         line_board = board.copy()
         for san in line_sans:
+            tensors.append(board_to_tensor(line_board))
             try:
                 mv = line_board.parse_san(san)
-                tensors.append(boards_to_tensor(line_board, mv))
                 line_board.push(mv)
             except Exception:
-                tensors.append(boards_to_tensor(line_board, None))
+                pass
 
-    return torch.stack(tensors)  # (N, 38, 8, 8)
+    return torch.stack(tensors)  # (N, 19, 8, 8)
 
 
 # ---------------------------------------------------------------------------

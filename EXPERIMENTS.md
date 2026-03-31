@@ -7,27 +7,57 @@ Documents completed and abandoned training experiments.
 ## Active Training Pipeline
 
 ```
-encoder-pretrain (v2, 656M positions) → qwen3.5-4b-encoder-phase1-sft → qwen3.5-4b-encoder-phase2-grpo
-                                                                        ↗
-qwen3.5-4b-grpo-phase1 (board-reading pretraining, phase1d, step ~145)
+encoder-pretrain (v2, 656M positions)
+        ↓
+qwen3.5-4b-encoder-phase0-alignment   ← NEW: MLP projector alignment (LLM + CNN frozen)
+        ↓
+qwen3.5-4b-encoder-pretrain-textbook  (textbook causal LM, encoder frozen, LoRA on LLM)
+        ↓
+qwen3.5-4b-encoder-phase1-sft         (board-reading Q&A + joint task)
+        ↓
+qwen3.5-4b-encoder-phase2-grpo        (RL on coaching quality)
 ```
 
-### encoder-pretrain (v2 — current)
+### qwen3.5-4b-encoder-phase0-alignment (planned)
+- **Goal**: Align the CNN encoder's output into the LLM's embedding space before any LLM training. Analogous to LLaVA-1.5 stage 1 — train only the projection layer while both the CNN encoder and the LLM are fully frozen.
+- **Motivation**: Without this phase, CNN embeddings land in a foreign region of the LLM's embedding space (large-magnitude floats never seen during LLM pretraining). This causes the LLM to immediately predict EOS when sentinel tokens are present — confirmed experimentally on `checkpoint-291` of textbook pretrain: `with_board` always generates empty string while `no_board` generates coherent text.
+- **Architecture change needed**: Replace the single linear `proj` layer inside `ChessEncoder` with a **2-layer MLP + GELU** (LLaVA-1.5 standard). The MLP projector is the only trainable component in this phase.
+- **Training setup**:
+  - CNN encoder: frozen
+  - LLM + LoRA: frozen
+  - MLP projector: trained
+  - Data: board-reading Q&A pairs (`sft_phase1_board_reading.jsonl`) — 100k positions, 6 tasks
+  - Loss: causal LM on assistant answer tokens only (not sentinel positions)
+  - Expected duration: short (projector is small, ~5M params); a few hundred steps
+- **Success criterion**: `with_board` accuracy on probe tasks > `no_board` accuracy; board token lift > 0
+- **Status**: Planned — not yet implemented
+
+### encoder-pretrain (v2 — complete)
 - **Goal**: Pretrain ResNet CNN board encoder via regression on 13 Stockfish 15 classical eval terms + total eval score + per-square piece classification
 - **Architecture**: ChessEncoder (19-ch, 10 blocks, 256 filters) → (B,64,256) spatial tokens → EncoderSF15Head (14 cross-attention queries) + piece_head (Linear 256→13 per square)
 - **Loss**: `term_weight(1.0)×MSE(13 SF15 terms) + eval_weight(3.0)×MSE(eval_score) + piece_weight(1.0)×CE(piece_labels)`
 - **Data**: `encoder_pretrain_sf15.jsonl` — 656M board positions with SF15 eval term targets + piece labels; eval set 6.6M samples
 - **Dataset**: Streaming `IterableDataset` (zero RAM overhead); resume uses `islice` skip (~27s for 163M lines)
 - **v1 result**: `checkpoints/encoder-pretrain/v1-checkpoint-580083/` (100M positions, scalar eval only) — superseded
-- **v2 status**: Training in progress from checkpoint-80000 (eval_loss=0.043 → target <0.035); ~259k steps remaining (~9h)
+- **v2 result**: `checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt` ✅ — used by all downstream recipes
+
+### qwen3.5-4b-encoder-pretrain-textbook
+- **Goal**: Continued causal LM pretraining on annotated chess textbook prose. Each `[Position: FEN]` in the source text is replaced by 64 `<|vision_pad|>` sentinels; the frozen CNN injects spatial board embeddings at those positions during the forward pass.
+- **Architecture**: CNN encoder frozen; LoRA r=64 on LLM (same rank as phase1-sft for checkpoint compatibility); causal LM loss on all text tokens; sentinel positions masked to -100.
+- **Data**: `textbook_pretrain.jsonl` — 3,093 chunks, ~2.7M tokens from 64 classic textbooks (Chernev, Nimzowitsch, Vukovic, Capablanca, Fischer, Kasparov, Smyslov, Reshevsky, …)
+- **Encoder checkpoint**: `checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt`
+- **Result**: `checkpoints/qwen3.5-4b-encoder-pretrain-textbook/checkpoint-291` (epoch 1 complete)
+- **Eval finding**: After epoch 1, `with_board` always generates empty string (EOS immediately). Root cause: CNN embeddings are out-of-distribution for the LLM — the phase0 alignment step was skipped. `no_board` generates coherent chess prose, confirming the LoRA+LLM is healthy. Board token lift is 0% at this stage; meaningful lift requires phase0 alignment first.
+- **Status**: Epoch 1 complete; paused pending phase0 alignment implementation
 
 ### qwen3.5-4b-encoder-phase1-sft
 - **Goal**: SFT — joint task; CNN board embeddings in user prompt for each move in Engine Key Lines; assistant outputs annotated lines + coaching comment
 - **Base model**: `Qwen/Qwen3.5-4B` + pretrained encoder
 - **Data**: `lines_joint_sft.jsonl` (28k textbook positions with SF15 annotations, Stockfish depth-18 lines)
-- **Result**: `checkpoints/qwen3.5-4b-encoder-phase1-sft/checkpoint-890` ✅ (used by phase2 GRPO)
+- **Result**: `checkpoints/qwen3.5-4b-encoder-phase1-sft/checkpoint-890` ✅
+- **Status**: Complete (superseded by revised pipeline — phase0 alignment must precede this)
 
-### qwen3.5-4b-grpo-phase1 (current)
+### qwen3.5-4b-grpo-phase1 (paused)
 - **Goal**: GRPO board-reading pretraining — teach the model to read chess positions from board images before tackling coaching tasks
 - **Base model**: `Qwen/Qwen3.5-4B` base (not SFT checkpoint — encoder-phase1-sft was broken)
 - **Data**: `grpo_phase1c_board_reading.jsonl` — 100k samples, 16,750 unique positions × 6 tasks
@@ -57,14 +87,14 @@ qwen3.5-4b-grpo-phase1 (board-reading pretraining, phase1d, step ~145)
   - Model uses pixel-like grid coordinates `[4, 10]` to describe piece positions — Qwen3.5-4B vision not natively chess-coordinate-aware; `piece_at` works well (0.99 score) but spatial tasks harder
   - Board orientation confusion ("from Black's perspective") causes systematic errors; a learned skill
 - **Checkpoints**: checkpoint-50, checkpoint-100 (clean), checkpoint-150 (partially trained with bad reward)
-- **Status**: In progress (phase1d, step ~145 from checkpoint-100)
+- **Status**: Paused — superseded by encoder pipeline; phase0 alignment + encoder SFT is the preferred path
 
-### qwen3.5-4b-encoder-phase2-grpo
+### qwen3.5-4b-encoder-phase2-grpo (blocked)
 - **Goal**: GRPO RL on the joint coaching task; rewards for SF15 annotation accuracy, comment quality, move legality
 - **Base model**: phase1-sft checkpoint-890
 - **Data**: `grpo_joint_prompts_sf15.jsonl` (14,950 Lichess positions with SF15 term annotations)
 - **Rewards**: R0 format, R1 legality, R3b SF15 annotation, RC_tone, RC_educ
-- **Status**: Paused (blocked on board-reading pretraining completing phase1d)
+- **Status**: Blocked on phase0 alignment + revised phase1-sft completing
 
 ---
 
@@ -120,10 +150,21 @@ qwen3.5-4b-grpo-phase1 (board-reading pretraining, phase1d, step ~145)
 | `lines_30k.jsonl` | Lichess pipeline | source for grpo prompts | **active** (source) |
 | `grpo_phase1c_board_reading.jsonl` | `generate_grpo_phase1_board_reading.py` | grpo-phase1 train | **active** |
 | `grpo_phase1c_board_reading_eval.jsonl` | same script | grpo-phase1 eval (disabled) | **active** |
+| `textbook_pretrain.jsonl` | `generate_textbook_pretrain.py` | encoder-pretrain-textbook train | **active** (3,093 chunks, ~2.7M tokens) |
+| `textbook_pretrain_eval.jsonl` | same script | encoder-pretrain-textbook eval | **active** |
 
 ---
 
 ## Key Architecture Decisions
+
+### Vision encoder alignment (ViT → LLM, industry lessons)
+Research into LLaVA, Flamingo, Qwen-VL, InternVL, LLaMA-3.2-Vision reveals a universal training pattern:
+- **Phase 0 (alignment)**: Only the projection layer is trained; both encoder and LLM are frozen. This teaches the projection to map encoder features into the LLM's embedding space. Without this, encoder embeddings land in a foreign part of LLM embedding space and cause immediate EOS.
+- **Phase 1+ (pretraining/SFT)**: LLM (or LoRA) is unfrozen; encoder usually stays frozen until a later high-quality data phase.
+- **Projection design**: LLaVA-1.5 standardized on 2-layer MLP + GELU; single linear layers are insufficient. Q-Former (BLIP-2) compresses heavily (→32 tokens) but loses spatial detail; MLP with dynamic tiling (InternVL, LLaVA-NeXT) is now preferred.
+- **Loss**: Causal LM on text tokens only in all major systems; visual/board token positions always masked to -100.
+- **Encoder unfreeze**: Only done in later phases with high-quality data and lower LR on the encoder (Qwen-VL stage 2, InternVL2 stage 2, Qwen2-VL). For chess, the CNN is already domain-pretrained so freezing it longer is safe.
+- **Application to us**: Our `ChessEncoder.proj` (single linear) needs to become a 2-layer MLP. Phase0 alignment (projector only, frozen encoder + frozen LLM) must precede textbook pretraining and SFT.
 
 ### Encoder pipeline (phase2)
 - **Sentinel injection**: `<|vision_pad|>` (token ID 151654) replaces each SAN in user prompt; CNN injects board embeddings at these positions

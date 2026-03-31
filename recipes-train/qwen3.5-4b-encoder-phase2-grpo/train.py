@@ -37,7 +37,7 @@ from trl import GRPOTrainer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.encoder import MOVE_TOKEN, MOVE_TOKEN_ID
-from src.encoder.board_tensor import boards_to_tensor
+from src.encoder.board_tensor import board_to_tensor
 from training.encoder_model import ChessLMWithEncoder
 
 log = logging.getLogger(__name__)
@@ -135,25 +135,19 @@ def _build_board_tensors(
     tensors: list[torch.Tensor] = []
     board = chess.Board(fen)
 
-    # Student move
-    student_move = None
-    if student_san:
-        try:
-            student_move = board.parse_san(student_san)
-        except Exception:
-            pass
-    tensors.append(boards_to_tensor(board, student_move))
+    # Student move — pre-move board
+    tensors.append(board_to_tensor(board))
 
-    # Line moves — replay from pre-student-move board
+    # Line moves — pre-move board at each step
     for line in line_sans:
         line_board = board.copy()
         for san in line:
+            tensors.append(board_to_tensor(line_board))
             try:
                 mv = line_board.parse_san(san)
-                tensors.append(boards_to_tensor(line_board, mv))
                 line_board.push(mv)
             except Exception:
-                tensors.append(boards_to_tensor(line_board, None))
+                pass
 
     return tensors
 
@@ -575,14 +569,14 @@ class GRPOEncoderCollator:
             input_ids = tokenized["input_ids"][len(move_counts)]
             n_tokens = (input_ids == MOVE_TOKEN_ID).sum().item()
             while len(tensors) < n_tokens:
-                tensors.append(boards_to_tensor(chess.Board(fen), None))
+                tensors.append(board_to_tensor(chess.Board(fen)))
             tensors = tensors[:n_tokens]
             move_counts.append(len(tensors))
             all_tensors.extend(tensors)
 
         result = dict(tokenized)
         result["board_tensors_flat"] = (
-            torch.stack(all_tensors) if all_tensors else torch.zeros(0, 38, 8, 8)
+            torch.stack(all_tensors) if all_tensors else torch.zeros(0, 19, 8, 8)
         )
         result["move_counts"] = torch.tensor(move_counts, dtype=torch.long)
         result["fen"] = fens
