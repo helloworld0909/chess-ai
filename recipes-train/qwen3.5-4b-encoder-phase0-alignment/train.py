@@ -1,17 +1,21 @@
-"""Phase 0: MLP Projector Alignment
+"""Phase 0: MLP Projector + LoRA Alignment (run 4)
 
-Trains only the CNN projector (cnn.proj, 2-layer MLP + GELU) while keeping the
-CNN trunk and the entire LLM frozen. This aligns the CNN's spatial board features
-into the LLM's embedding space before any LLM parameters are updated.
+Trains cnn.proj (2-layer MLP + LayerNorm) + LoRA on LLM jointly.
+CNN trunk is frozen. LLM base weights are frozen; only LoRA adapters train.
+
+Key fix vs run 2: heavily asymmetric LRs — projector at 1e-3, LoRA at 5e-6 (200× slower).
+LoRA can't exploit text coordinate labels fast enough; projector establishes alignment first.
+LayerNorm at projector output stabilizes training.
 
 Data format: alignment_board_description.jsonl
-  {"messages": [{"role": "system", ...}, {"role": "user", ...}, {"role": "assistant", ...}],
+  {"messages": [{"role": "user", ...}, {"role": "assistant", ...}],
    "metadata": {"fen": ..., "task": ...}}
 
 The user message does NOT contain sentinel tokens.
 This script injects the 64-sentinel block into the user content at data-loading time,
 randomly placing it before or after the question (50/50) so the model learns to attend
 to board tokens at any position. Labels are set so loss is only computed on the assistant answer.
+Think block tokens (<think>\n\n</think>\n\n) are masked from loss.
 """
 
 import argparse
@@ -51,13 +55,22 @@ for _rank in range(0, 8):  # rank 1→8, matching CNN output order (a1=idx0 ... 
     _ANCHORED_BOARD_LINES.append(" ".join(_cells))
 _ANCHORED_BOARD = "\n".join(_ANCHORED_BOARD_LINES)
 
+_SYSTEM_PROMPT = (
+    "You are a chess assistant. The board is encoded as a grid of square labels (a1–h8), "
+    "each immediately followed by a vision token that encodes the piece occupying that square. "
+    "To answer questions, attend to the vision token after each square label to identify the piece — "
+    "do not try to parse the square labels as text notation."
+)
+
 
 def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
+    from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     config = load_config(config_path)
     model_cfg = config.get("model", {})
     encoder_cfg = config.get("encoder", {})
+    lora_cfg = config.get("lora", {})
     model_name = model_cfg["model_name"]
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
@@ -76,9 +89,22 @@ def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
         attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
     )
 
+    lora_config = LoraConfig(
+        r=lora_cfg.get("r", 64),
+        lora_alpha=lora_cfg.get("alpha", 128),
+        target_modules=lora_cfg.get(
+            "target_modules",
+            ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        ),
+        lora_dropout=lora_cfg.get("dropout", 0.0),
+        bias=lora_cfg.get("bias", "none"),
+        task_type="CAUSAL_LM",
+    )
+    peft_llm = get_peft_model(base_llm, lora_config)
+
     _logger.info("Wrapping with ChessLMWithEncoder...")
     model = ChessLMWithEncoder(
-        llm=base_llm,
+        llm=peft_llm,
         hidden_size=base_llm.config.hidden_size,
         cnn_in_channels=encoder_cfg.get("in_channels", 19),
         cnn_hidden_size=encoder_cfg.get("hidden_size", 256),
@@ -94,7 +120,6 @@ def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
         state = torch.load(
             encoder_weights_path, map_location=f"cuda:{local_rank}", weights_only=True
         )
-        # Load into CNN trunk only (proj weights are randomly initialised — that's the point)
         trunk_state = {k: v for k, v in state.items() if not k.startswith("proj.")}
         missing, unexpected = model.cnn.load_state_dict(trunk_state, strict=False)
         if missing:
@@ -112,16 +137,13 @@ def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
     else:
         _logger.warning("No encoder.pretrained_weights set — encoder is randomly initialised!")
 
-    # Optionally load projector weights from a prior phase0 checkpoint
-    # (for continuing on new data with a warm projector rather than random init).
+    # Optionally warm-init projector from a prior phase0 checkpoint
     if init_proj_path:
+        import glob as _glob
         import os as _os
 
         ckpt_file = _os.path.join(init_proj_path, "pytorch_model.bin")
         if not _os.path.exists(ckpt_file):
-            # safetensors shards
-            import glob as _glob
-
             shards = sorted(_glob.glob(_os.path.join(init_proj_path, "model*.safetensors")))
             if shards:
                 from safetensors.torch import load_file as _load_safetensors
@@ -147,10 +169,8 @@ def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
             _logger.warning("Missing proj keys from init checkpoint: %s", other_missing)
         _logger.info("Loaded cnn.proj weights from %s (warm init)", init_proj_path)
 
-    # Phase 0: freeze everything except cnn.proj.
-    # LLM fully frozen (no LoRA) — pure LLaVA stage-1 style.
-    # Only the projector MLP learns to map CNN features into LLM embedding space.
-    for param in model.parameters():
+    # Freeze CNN trunk. LoRA adapters + cnn.proj are trainable.
+    for param in model.cnn.parameters():
         param.requires_grad_(False)
     for param in model.cnn.proj.parameters():
         param.requires_grad_(True)
@@ -207,7 +227,7 @@ def main() -> None:
 
         board_before = random.random() < 0.5
 
-        patched_messages = []
+        patched_messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
         for msg in messages:
             if msg["role"] == "user":
                 q = msg["content"]
@@ -338,19 +358,21 @@ def main() -> None:
 
     from transformers import Trainer
 
-    projector_lr = train_cfg.get("projector_learning_rate", training_args.learning_rate * 10)
+    lora_lr = train_cfg.get("lora_learning_rate", 5e-6)
 
     class EncoderTrainer(Trainer):
         def create_optimizer(self):
-            """Only the projector is trainable — single param group, native AdamW.
-
-            7M params = ~56MB optimizer state in fp32 — no need for 8bit quantization.
-            Native AdamW gives cleaner gradients during the sensitive random-init phase.
-            """
+            """Two param groups: projector at 1e-3, LoRA at 5e-6 (200× slower)."""
             proj_params = list(self.model.cnn.proj.parameters())
+            proj_ids = {id(p) for p in proj_params}
+            lora_params = [
+                p for p in self.model.parameters() if p.requires_grad and id(p) not in proj_ids
+            ]
             self.optimizer = torch.optim.AdamW(
-                proj_params,
-                lr=self.args.learning_rate,
+                [
+                    {"params": proj_params, "lr": self.args.learning_rate},
+                    {"params": lora_params, "lr": lora_lr},
+                ],
                 betas=(self.args.adam_beta1, self.args.adam_beta2),
                 eps=self.args.adam_epsilon,
                 weight_decay=self.args.weight_decay,
@@ -371,26 +393,14 @@ def main() -> None:
                     deduped[k] = v
             super()._save(output_dir=output_dir, state_dict=deduped)
 
-    # Pick a fixed set of diverse eval examples to log at each eval step
-    _LOG_TASKS = [
-        "piece_abbr_at",
-        "piece_name_at",
-        "side_to_move",
-        "count_piece_type",
-        "find_piece_type",
-        "is_square_occupied",
-        "en_passant",
-        "castling_rights",
-    ]
+    # Pick one fixed example per task type for eval logging
     _log_samples: list[dict] = []
     seen_tasks: set[str] = set()
     for ex in raw_eval:
         task = ex.get("metadata", {}).get("task", "")
-        if task in _LOG_TASKS and task not in seen_tasks:
+        if task and task not in seen_tasks:
             seen_tasks.add(task)
             _log_samples.append(ex)
-        if len(seen_tasks) == len(_LOG_TASKS):
-            break
 
     from transformers import TrainerCallback
 
@@ -410,35 +420,44 @@ def main() -> None:
                 task = ex.get("metadata", {}).get("task", "")
                 q = next(m["content"] for m in ex["messages"] if m["role"] == "user")
                 expected = next(m["content"] for m in ex["messages"] if m["role"] == "assistant")
-                prompt_text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": _ANCHORED_BOARD + "\n\n" + q}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].to(device)
                 try:
                     board = _chess.Board(fen)
                 except Exception:
                     board = _chess.Board()
                 board_tensor = board_to_tensor(board).unsqueeze(0).to(torch.bfloat16).to(device)
-                with torch.no_grad():
-                    cnn_tokens = model.cnn(board_tensor)
-                    text_embeds = model.embed_tokens(input_ids)
-                    sentinel_mask = (input_ids == model.move_token_id)[0]
-                    text_embeds[0, sentinel_mask] = cnn_tokens[0, : sentinel_mask.sum()]
-                    out = model.llm.generate(
-                        inputs_embeds=text_embeds,
-                        max_new_tokens=32,
-                        do_sample=False,
-                        pad_token_id=tokenizer.eos_token_id,
+
+                results = {}
+                for think in (False, True):
+                    prompt_text = tokenizer.apply_chat_template(
+                        [
+                            {"role": "system", "content": _SYSTEM_PROMPT},
+                            {"role": "user", "content": _ANCHORED_BOARD + "\n\n" + q},
+                        ],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=think,
                     )
-                answer = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+                    input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].to(device)
+                    with torch.no_grad():
+                        cnn_tokens = model.cnn(board_tensor)
+                        text_embeds = model.embed_tokens(input_ids)
+                        sentinel_mask = (input_ids == model.move_token_id)[0]
+                        text_embeds[0, sentinel_mask] = cnn_tokens[0, : sentinel_mask.sum()]
+                        out = model.llm.generate(
+                            inputs_embeds=text_embeds,
+                            max_new_tokens=64,
+                            do_sample=False,
+                            pad_token_id=tokenizer.eos_token_id,
+                        )
+                    results[think] = tokenizer.decode(out[0], skip_special_tokens=False).strip()
+
                 _logger.info(
-                    "  [%-20s] Q: %-55s | expected: %-15r | got: %r",
+                    "  [%-20s] Q: %-45s | expected: %-12r | no-think: %-15r | think: %r",
                     task,
-                    q[:55],
+                    q[:45],
                     expected,
-                    answer,
+                    results[False],
+                    results[True],
                 )
             model.train()
 

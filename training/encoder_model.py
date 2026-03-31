@@ -71,6 +71,7 @@ class ChessLMWithEncoder(nn.Module):
         # Expose HF model attributes that SFTTrainer / Trainer expect
         self.config = self.llm.config
         self.name_or_path = getattr(self.llm, "name_or_path", "")
+        self._keys_to_ignore_on_save = getattr(self.llm, "_keys_to_ignore_on_save", None)
 
     def freeze_for_alignment(self) -> None:
         """Freeze everything except the CNN projector for phase0 alignment.

@@ -145,6 +145,7 @@ def main():
                 [{"role": "user", "content": _ANCHORED_BOARD + "\n\n" + q}],
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=False,
             )
             input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].to("cuda:0")
 

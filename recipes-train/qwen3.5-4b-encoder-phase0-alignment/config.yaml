@@ -1,15 +1,15 @@
-# Qwen3.5-4B + ChessEncoder — Phase 0: Alignment (projector only)
+# Qwen3.5-4B + ChessEncoder — Phase 0: Alignment (projector + LoRA, run 4)
 #
-# Goal:   Align the CNN projector into the LLM's embedding space.
-#         Pure LLaVA stage-1 style — only cnn.proj trains, LLM fully frozen.
+# Goal:   Align cnn.proj into LLM embedding space with LoRA at 200× lower LR.
+#         Projector (1e-3) moves fast; LoRA (5e-6) too slow to exploit text escape hatch.
+#         LayerNorm at projector output stabilizes training.
 #
-# Frozen: CNN trunk + entire LLM (no LoRA)
-# Trained: cnn.proj only (~7M params, 2-layer MLP + GELU)
+# Frozen: CNN trunk + LLM base weights
+# Trained: cnn.proj (~7M) + LoRA r=64 (~85M, but at 5e-6 LR)
 #
-# Prompt: board sentinels + question (position randomized 50/50)
-# Data:   LLaVA-style board description — 1M FENs × 1 task = 1M records
-#         (tail of encoder_pretrain_1b.jsonl — positions unseen during CNN pretraining)
-# DDP:    2× RTX 5090  |  effective batch = 256 (16 × 2 GPUs × 8 accum, LLaVA standard)
+# Prompt: system prompt + board sentinels + question (position randomized 50/50)
+# Data:   LLaVA-style board description — 897k FENs × 14 tasks
+# DDP:    2× RTX 5090  |  effective batch = 256 (4 × 2 GPUs × 32 accum)
 
 model:
   model_name: "Qwen/Qwen3.5-4B"
@@ -21,25 +21,40 @@ encoder:
   num_blocks: 10
   pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt"
 
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none
+
 training:
   train_file: data/processed/alignment_board_description.jsonl
   eval_file:  data/processed/alignment_board_description_eval.jsonl
-  max_seq_length: 384  # p99=373, max=381 — no truncation occurs
+  max_seq_length: 512  # with system prompt: p99=459, max=467 — no truncation
 
-  per_device_train_batch_size: 8
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 16  # effective batch = 256 (8 × 2 GPUs × 16 accum)
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 32  # effective batch = 256 (4 × 2 GPUs × 32 accum)
 
-  learning_rate: 1.0e-3
+  learning_rate: 1.0e-3        # projector LR — aggressive, random init
+  lora_learning_rate: 5.0e-6  # LoRA LR — 200× slower, can't exploit text escape hatch
   lr_scheduler_type: cosine
-  warmup_steps: 116  # 3% of 3867 total steps (990k / (16 × 2 GPUs × 8 accum))
+  warmup_steps: 100
   num_train_epochs: 1
 
-  optim: adamw_torch  # 7M params only — 8bit quantization noise not worth it
-  weight_decay: 0.0   # LLaVA stage-1 standard: projector needs freedom to find extreme weights
+  optim: adamw_torch  # overridden by create_optimizer (two param groups)
+  weight_decay: 0.0
   max_grad_norm: 1.0
 
-  gradient_checkpointing: false  # LLM frozen — no need for checkpointing
+  gradient_checkpointing: false  # LLM fully frozen — no grad through LLM, checkpointing wastes time
   bf16: true
   dataloader_num_workers: 8
   ddp_find_unused_parameters: false

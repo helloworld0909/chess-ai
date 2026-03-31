@@ -75,10 +75,14 @@ class ChessEncoder(nn.Module):
         # Project each spatial cell from hidden_size → out_dim.
         # 2-layer MLP with GELU (LLaVA-1.5 standard) gives the alignment phase
         # enough capacity to map CNN features into the LLM's embedding space.
+        # LayerNorm at the output anchors the projected vectors to the same
+        # norm/distribution as the LLM's token embeddings, preventing the
+        # 14× norm mismatch that killed gradient flow in run 2.
         self.proj = nn.Sequential(
             nn.Linear(hidden_size, out_dim),
             nn.GELU(),
             nn.Linear(out_dim, out_dim),
+            nn.LayerNorm(out_dim),
         )
 
     def spatial_features(self, x: torch.Tensor) -> torch.Tensor:

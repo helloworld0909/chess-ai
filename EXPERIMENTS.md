@@ -9,8 +9,8 @@ Documents completed and abandoned training experiments.
 ```
 encoder-pretrain (v2, 656M positions)
         ↓
-qwen3.5-4b-encoder-phase0-alignment   ← NEW: MLP projector alignment (LLM + CNN frozen)
-        ↓
+[CLIP-style alignment]   ← NEW: retrain CNN with contrastive loss against LLM text embeddings
+        ↓                         (replaces failed MLP projector phase0 — see architecture notes)
 qwen3.5-4b-encoder-pretrain-textbook  (textbook causal LM, encoder frozen, LoRA on LLM)
         ↓
 qwen3.5-4b-encoder-phase1-sft         (board-reading Q&A + joint task)
@@ -18,19 +18,58 @@ qwen3.5-4b-encoder-phase1-sft         (board-reading Q&A + joint task)
 qwen3.5-4b-encoder-phase2-grpo        (RL on coaching quality)
 ```
 
-### qwen3.5-4b-encoder-phase0-alignment (planned)
+### qwen3.5-4b-encoder-phase0-alignment (abandoned — architecture mismatch)
+
 - **Goal**: Align the CNN encoder's output into the LLM's embedding space before any LLM training. Analogous to LLaVA-1.5 stage 1 — train only the projection layer while both the CNN encoder and the LLM are fully frozen.
 - **Motivation**: Without this phase, CNN embeddings land in a foreign region of the LLM's embedding space (large-magnitude floats never seen during LLM pretraining). This causes the LLM to immediately predict EOS when sentinel tokens are present — confirmed experimentally on `checkpoint-291` of textbook pretrain: `with_board` always generates empty string while `no_board` generates coherent text.
-- **Architecture change needed**: Replace the single linear `proj` layer inside `ChessEncoder` with a **2-layer MLP + GELU** (LLaVA-1.5 standard). The MLP projector is the only trainable component in this phase.
-- **Training setup**:
-  - CNN encoder: frozen
-  - LLM + LoRA: frozen
-  - MLP projector: trained
-  - Data: board-reading Q&A pairs (`sft_phase1_board_reading.jsonl`) — 100k positions, 6 tasks
-  - Loss: causal LM on assistant answer tokens only (not sentinel positions)
-  - Expected duration: short (projector is small, ~5M params); a few hundred steps
-- **Success criterion**: `with_board` accuracy on probe tasks > `no_board` accuracy; board token lift > 0
-- **Status**: Planned — not yet implemented
+- **Architecture**: 2-layer MLP projector (256→2560→2560, GELU, LayerNorm). LoRA r=64 on all LLM attention+MLP layers (85M trainable). CNN trunk frozen.
+- **Data**: `alignment_board_description.jsonl` — 897,628 FEN positions × 14 board-reading tasks (piece lookup, counts, castling, en passant, side to move, file/rank contents, full piece lists)
+- **Prompt format**: `_ANCHORED_BOARD` prepended to user message — 64 square labels each immediately followed by `<|vision_pad|>` sentinel in row-major order (a1..h8), matching CNN output token order exactly
+
+#### Run 1 (projector-only, no LoRA — abandoned step ~540)
+Only `cnn.proj` trained, LLM fully frozen. Eval accuracy ~0/8 at step 540. Loss plateaued at 0.54. Abandoned — frozen LLM cannot route attention through foreign sentinel positions.
+
+#### Run 2 (projector + LoRA, LR=5e-5/2e-4 — checkpoint-1000)
+- Loss curve: 2.31→0.59 in first 100 steps (warmup), then 0.59→0.48 over steps 100–1000 (near-flat plateau)
+- Eval loss: 0.579 → 0.531 over 5 evals — essentially flat
+- Eval accuracy at step 600: 3/14 tasks correct (piece_abbr_at, count_piece_type, find_piece_type)
+- Grad norm: 0.015–0.022 throughout — near-zero, bootstrap deadlock confirmed
+- Model thinking: "I need to parse this text format" — ignoring CNN tokens, solving from text labels only
+
+#### Root cause diagnosis (checkpoint-1000 post-mortem)
+
+| Metric | Value | Expected |
+|--------|-------|----------|
+| Projected token norm | **9.37 ± 6.35** | ~0.66 (LLM embed norm) |
+| LLM embed token norm | 0.66 ± 0.07 | — |
+| Norm ratio | **14.3×** | ~1× |
+| Best cosine sim to full vocab | 0.07–0.10 | >0.3 for aligned tokens |
+| Mean cosine sim to random 1k tokens | -0.004 | — |
+| CNN inter-token cosine sim | mean=0.21, std=0.28 | — (CNN itself is fine) |
+
+**Root cause — Bootstrap deadlock:** The LLM can partially answer board-reading questions from the text coordinate labels alone (e.g. "a1" tells it which square). This gives the LLM an "escape hatch": it ignores the CNN sentinel tokens (which land far from its embedding manifold) and solves partial tasks from text. Gradient flows primarily through the text path → projector receives near-zero gradient → never learns to map into the LLM's embedding space.
+
+#### Run 3 (projector-only + LayerNorm, LLM frozen — abandoned)
+Added `nn.LayerNorm(out_dim)` at projector output. Removed LoRA to eliminate text escape hatch. But with frozen LLM, there is no way for the model to learn to attend to sentinel positions — loss plateaued identically. Removing LoRA eliminates the escape hatch but also eliminates the capacity to exploit CNN tokens. A frozen LLM cannot adapt.
+
+#### Run 4 (projector + LoRA at 200× asymmetric LR, system prompt — abandoned step ~228)
+- Projector LR=1e-3, LoRA LR=5e-6 (200× slower) to prevent LoRA from learning text escape hatch before projector aligns
+- Added system prompt: "attend to the vision token after each square label, do not parse labels as text"
+- Added LayerNorm at projector output
+- Result: loss=0.57 at step 210, eval_loss=0.609 at step 200. Grad norm ~0.02 — still near-zero. No improvement.
+- Model still ignores CNN tokens even at step 200+. Asymmetric LR slowed LoRA but did not fix projector alignment.
+
+#### Root cause — architectural mismatch (final conclusion)
+
+**The LLaVA method requires a CLIP-style encoder. Our CNN was not trained like CLIP.**
+
+LLaVA's "train only the projector" works because the ViT encoder was pretrained with CLIP: contrastive learning against text descriptions forces the visual features to lie on a manifold that is already semantically aligned with language. A 2-layer MLP projector just needs to rotate/scale that already-aligned manifold into the LLM's specific embedding space. The hard work (text↔vision alignment) was done during CLIP pretraining.
+
+Our CNN encoder was pretrained on SF15 regression terms + piece classification (MSE + cross-entropy) — a purely numerical/categorical objective with **no language supervision whatsoever**. The CNN features encode chess evaluation signals (mobility, king safety, pawn structure, etc.) in an arbitrary 256-dim space that has no relationship to Qwen3.5-4B's token embedding manifold. A 2-layer MLP projector has nowhere near enough capacity or signal to learn that mapping from scratch via next-token prediction alone.
+
+**The fix**: Retrain the CNN encoder with CLIP-style contrastive alignment against text — board positions paired with natural language descriptions → InfoNCE loss aligns the CNN's 64-token output with the LLM's text embedding space before any projection is needed.
+
+- **Status**: Abandoned — all 4 runs plateau at 0.53–0.61 eval loss with near-zero useful gradient; fundamental architecture mismatch
 
 ### encoder-pretrain (v2 — complete)
 - **Goal**: Pretrain ResNet CNN board encoder via regression on 13 Stockfish 15 classical eval terms + total eval score + per-square piece classification
@@ -156,6 +195,40 @@ qwen3.5-4b-encoder-phase2-grpo        (RL on coaching quality)
 ---
 
 ## Key Architecture Decisions
+
+### Phase0 alignment — what actually goes wrong (empirical)
+
+From 4 runs of `qwen3.5-4b-encoder-phase0-alignment`, all plateauing at 0.53–0.61 eval loss:
+
+- **Text escape hatch kills gradient to the projector.** When the LLM can partially solve the task from text tokens alone (square labels like "a1" carry positional meaning), it learns to ignore the CNN sentinel tokens. The projector then receives near-zero gradient and never converges.
+- **Norm mismatch is a symptom, not the root cause.** Projected token norm 9.37 vs LLM embed norm 0.66 (14× gap). Adding LayerNorm at projector output fixes the norm but does not fix the direction — the features are still random in the LLM's embedding space.
+- **Cosine sim to vocab is the right diagnostic.** Well-aligned vision tokens should have cosine sim >0.3 to semantically related text tokens. Cosine sim ~0.07–0.10 = random = alignment has failed regardless of loss curve.
+- **Grad norm is a lagging indicator.** Grad norm 0.015–0.022 looked "healthy" but projector was receiving near-zero useful gradient. Loss plateau + tiny grad norm = bootstrap deadlock, not convergence.
+- **The LLaVA method requires a CLIP-pretrained encoder.** See "CLIP-style encoder alignment" section below for the architectural fix.
+
+### CLIP-style chess encoder alignment (planned — next iteration)
+
+**Why LLaVA works and our approach fails:**
+
+LLaVA's projector-only stage works because the ViT was pretrained with CLIP — contrastive learning against image-text pairs forces visual features onto a manifold that is already semantically aligned with language. The projector only needs to rotate/scale this already-aligned manifold into the LLM's specific embedding space.
+
+Our CNN was pretrained on SF15 regression + piece classification — a purely numerical objective with no language supervision. The CNN features exist in an arbitrary 256-dim space with no relationship to any language model's embedding manifold. No projector can bridge this gap from next-token prediction signal alone.
+
+**Plan: retrain the CNN encoder with CLIP-style contrastive alignment:**
+
+1. **Text encoder**: Freeze Qwen3.5-4B and use it to embed board descriptions (piece lists, square contents, game state) into the LLM's hidden space. These text embeddings serve as CLIP's "language tower".
+2. **Board encoder (vision tower)**: The ChessEncoder CNN produces a board-level representation (e.g., pool 64 square tokens → 1 board vector, or use a CLS token).
+3. **Contrastive objective (InfoNCE)**: Minimize InfoNCE loss between board embedding and its paired text description embedding, maximize distance to negatives (other boards in the batch). This forces CNN features to align with the LLM's semantic geometry.
+4. **After CLIP alignment**: The CNN features now lie on the LLM's language manifold. A simple 2-layer MLP projector (per LLaVA-1.5) should then work as intended: just rotate/scale 256-dim CNN space into 2560-dim LLM space.
+
+**Architecture options:**
+- **Board pooling**: Mean-pool 64 square tokens → (B, 256) board vector, project to LLM hidden dim, InfoNCE against text embedding. Simple, fast to iterate.
+- **Multi-vector CLIP**: Align each of the 64 square tokens to the text embedding of the corresponding square's content ("white rook on a1"). Richer supervision; aligns spatial structure.
+
+**Text supervision candidates (for the language tower):**
+- Full board description (FEN → natural language: "White: Ra1 Kg1 ..., Black: ra8 kg8 ...")
+- Per-square descriptions ("a1: white rook", "b1: empty", ...)
+- SF15 term descriptions ("White has mobility advantage, weak king safety, ...")
 
 ### Vision encoder alignment (ViT → LLM, industry lessons)
 Research into LLaVA, Flamingo, Qwen-VL, InternVL, LLaMA-3.2-Vision reveals a universal training pattern:
