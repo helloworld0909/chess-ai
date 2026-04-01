@@ -7,11 +7,11 @@ from .cnn import ChessEncoder
 # The collator replaces each sentinel with a CNN board embedding at embedding time;
 # the token ID itself is never predicted (label = -100).
 #
-# Each board position is represented by BOARD_TOKENS_PER_POSITION (64) consecutive
-# sentinel tokens — one per chess square, in row-major order (a1..h8).
+# Each board position is represented by BOARD_TOKENS_PER_POSITION (65) consecutive
+# sentinel tokens — 64 per-square (row-major a1..h8) + 1 global summary token.
 BOARD_TOKEN = "<|vision_pad|>"
 BOARD_TOKEN_ID = 248055  # Qwen3 vocab ID for <|vision_pad|> — unused in text-only model
-BOARD_TOKENS_PER_POSITION = 64  # one token per square
+BOARD_TOKENS_PER_POSITION = 65  # 64 per-square tokens + 1 global summary token (token 64)
 
 # Legacy aliases — kept for imports that haven't been updated yet
 MOVE_TOKEN = BOARD_TOKEN

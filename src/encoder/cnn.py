@@ -1,14 +1,18 @@
-"""ResNet CNN trunk to encode an 8x8 chess board into 64 per-square LLM tokens.
+"""ResNet CNN trunk to encode an 8x8 chess board into 65 LLM tokens.
 
 Architecture loosely based on Leela Chess Zero (LCZero) trunks:
 - Input: 19-channel 8x8 spatial tensor (piece planes + castling + ep + move#).
 - Blocks: Configurable number of ResidualBlocks ( Conv -> BN -> ReLU -> Conv -> BN -> + )
-- Head: 2D learnable positional encoding -> project each of 64 spatial cells to out_dim
-  Output: (B, 64, out_dim) — one token per square, row-major a1..h1, a2..h2, ..., a8..h8.
+- Head: 2D learnable positional encoding -> project each of 64 spatial cells to out_dim,
+  plus a 65th global token produced by cross-attention over the 64 spatial features.
+  Output: (B, 65, out_dim) — 64 per-square tokens + 1 global summary token.
 
 Each spatial token at position (file, rank) encodes all relationships of that square:
 what piece occupies it, what attacks/defends it, pawn structure around it, etc.
 The ResNet's receptive field covers the full board, so each cell has global context.
+
+The 65th global token aggregates board-level evaluation signals (material balance,
+king safety, mobility imbalance) into a single summary vector for the LLM.
 """
 
 import torch
@@ -40,11 +44,11 @@ class ChessEncoder(nn.Module):
     def __init__(
         self,
         in_channels: int = 19,
-        hidden_size: int = 256,
-        num_blocks: int = 10,
+        hidden_size: int = 128,
+        num_blocks: int = 6,
         out_dim: int = 2560,  # Qwen3.5-4B hidden size
     ):
-        """ResNet trunk producing 64 per-square tokens with 2D positional encoding.
+        """ResNet trunk producing 65 tokens: 64 per-square + 1 global summary.
 
         Args:
             in_channels: Depth of the board tensor (19-channel single-board format).
@@ -52,11 +56,13 @@ class ChessEncoder(nn.Module):
             num_blocks: Number of Residual blocks to chain.
             out_dim: Output dimension per token (must match LLM hidden_size).
 
-        Output shape: (B, 64, out_dim) — 64 tokens, one per square in row-major order
-            (a1=0, b1=1, ..., h1=7, a2=8, ..., h8=63).
+        Output shape: (B, 65, out_dim)
+            Tokens 0–63: per-square tokens in row-major order (a1=0, b1=1, ..., h8=63).
+            Token 64: global summary token aggregated via cross-attention.
         """
         super().__init__()
         self.in_channels = in_channels
+        self.hidden_size = hidden_size
         self.conv_input = nn.Sequential(
             nn.Conv2d(in_channels, hidden_size, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(hidden_size),
@@ -77,8 +83,22 @@ class ChessEncoder(nn.Module):
         # enough capacity to map CNN features into the LLM's embedding space.
         # LayerNorm at the output anchors the projected vectors to the same
         # norm/distribution as the LLM's token embeddings, preventing the
-        # 14× norm mismatch that killed gradient flow in run 2.
+        # 14× norm mismatch that killed gradient flow in phase0 runs.
         self.proj = nn.Sequential(
+            nn.Linear(hidden_size, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
+
+        # Global token: 1 learnable query attending over the 64 spatial features.
+        # Same cross-attention pattern as EncoderSF15Head in encoder-pretrain.
+        # Operates in the small hidden_size space before projection for efficiency.
+        self.global_query = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        nn.init.trunc_normal_(self.global_query, std=0.02)
+        self.global_k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.global_v = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.global_proj = nn.Sequential(
             nn.Linear(hidden_size, out_dim),
             nn.GELU(),
             nn.Linear(out_dim, out_dim),
@@ -103,13 +123,48 @@ class ChessEncoder(nn.Module):
         x = x.permute(0, 2, 3, 1)  # (B, 8, 8, H)
         return x.reshape(B, 64, H)  # (B, 64, H)
 
+    def _compute_global(self, spatial: torch.Tensor) -> torch.Tensor:
+        """Compute global summary token via cross-attention over 64 spatial features.
+
+        Args:
+            spatial: (B, 64, hidden_size)
+
+        Returns:
+            (B, 1, out_dim)
+        """
+        B = spatial.size(0)
+        q = self.global_query.expand(B, -1, -1)  # (B, 1, H)
+        k = self.global_k(spatial)  # (B, 64, H)
+        v = self.global_v(spatial)  # (B, 64, H)
+        scale = self.hidden_size**-0.5
+        attn = torch.softmax(q @ k.transpose(-2, -1) * scale, dim=-1)  # (B, 1, 64)
+        out = attn @ v  # (B, 1, H)
+        return self.global_proj(out)  # (B, 1, out_dim)
+
+    def forward_clip(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning grid and global tokens separately (for CLIP training).
+
+        Args:
+            x: (B, in_channels, 8, 8)
+
+        Returns:
+            grid_tokens: (B, 64, out_dim) — per-square tokens.
+            global_token: (B, 1, out_dim) — board-level summary token.
+        """
+        spatial = self.spatial_features(x)  # (B, 64, H)
+        grid_tokens = self.proj(spatial)  # (B, 64, out_dim)
+        global_token = self._compute_global(spatial)  # (B, 1, out_dim)
+        return grid_tokens, global_token
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass returning all 65 tokens concatenated.
 
         Args:
             x: (B, in_channels, 8, 8) float tensor.
 
         Returns:
-            (B, 64, out_dim) — 64 per-square tokens in row-major order.
+            (B, 65, out_dim) — tokens 0–63 are per-square (row-major a1..h8),
+            token 64 is the global summary token.
         """
-        return self.proj(self.spatial_features(x))  # (B, 64, out_dim)
+        grid_tokens, global_token = self.forward_clip(x)
+        return torch.cat([grid_tokens, global_token], dim=1)  # (B, 65, out_dim)

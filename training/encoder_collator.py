@@ -22,9 +22,9 @@ class EncoderDataCollator:
     """Collates token IDs and computes board tensors for every board position.
 
     Each training example contains one board position represented by
-    BOARD_TOKENS_PER_POSITION (64) consecutive <|vision_pad|> sentinel tokens
+    BOARD_TOKENS_PER_POSITION (65) consecutive <|vision_pad|> sentinel tokens
     in the input. The collator builds one (19, 8, 8) board tensor per board
-    position; the CNN forward pass expands each tensor to 64 per-square tokens.
+    position; the CNN forward pass expands each to 65 tokens (64 per-square + 1 global).
 
     The collator produces:
       batch["board_tensors_flat"]: (N_boards, 19, 8, 8) — one tensor per board

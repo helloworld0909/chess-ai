@@ -1,0 +1,61 @@
+# Chess-CLIP encoder alignment
+#
+# Trains ChessEncoder (19-ch, 10 blocks, 256 hidden) + global cross-attention token
+# against frozen Qwen3.5-4B text embeddings via InfoNCE loss.
+#
+# Loss: L_grid (per-position InfoNCE, 64×B×B) + L_global (board-level InfoNCE, B×B)
+# Anchor text generated on-the-fly from FEN:
+#   Grid   — "white knight on d4, attacked by black pawn on e5, controls 6 squares"
+#   Global — "White has a clear advantage, driven by: White leads in Mobility, ..."
+#
+# Memory budget per GPU (32GB RTX 5090):
+#   Qwen3.5-4B frozen (bf16): ~8GB | encoder + grads: ~0.2GB | cache: ~0.5GB
+#   Total: ~11GB — comfortable
+#
+# DDP: torchrun --nproc_per_node=2 recipes-train/encoder-clip/train.py
+# Single GPU: uv run python recipes-train/encoder-clip/train.py
+
+encoder:
+  in_channels: 19       # 19-channel single-board tensor
+  hidden_size: 256      # ResNet filters
+  num_blocks: 10         # depth
+  out_dim: 2560         # must match Qwen3.5-4B hidden_size
+
+clip:
+  qwen_model: Qwen/Qwen3.5-4B
+  temperature_init: 0.07    # learnable; exp clamped to [0.01, 0.5]
+  global_loss_weight: 0.5   # L = L_grid + 0.5 × L_global
+  cache_maxsize: 5000000       # LRU embedding cache entries (~50GB CPU)
+
+training:
+  # Dataset must be .bin (map-style, O(1) FEN access) or .jsonl (streaming)
+  train_file: data/processed/encoder_pretrain_sf15.jsonl
+  eval_file:  data/processed/encoder_pretrain_sf15_eval.jsonl
+  train_limit: 10000000     # 10M positions for initial CLIP training (~4-5h on 2×RTX5090)
+  eval_limit:  2000
+
+  per_device_train_batch_size: 1024   # 2048 effective (2 GPUs)
+  per_device_eval_batch_size: 1024
+  dataloader_num_workers: 4
+
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 50
+  max_steps: 5000           # ~10M positions / 2048 eff_batch ≈ 5K steps
+  max_grad_norm: 1.0
+
+  logging_steps: 1
+  eval_steps: 200
+  save_steps: 100
+  save_total_limit: 20
+
+output_dir: checkpoints/encoder-clip
+
+wandb:
+  enabled: false
+  project: chess-tutor
+  name: encoder-clip
+  tags:
+    - encoder-clip
+    - contrastive
+    - chess-clip

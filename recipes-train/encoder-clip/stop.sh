@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-PID_FILE="/tmp/encoder-pretrain.pid"
+PID_FILE="/tmp/encoder-clip.pid"
 if [[ ! -f "$PID_FILE" ]]; then echo "No PID file ($PID_FILE). Not running?"; exit 0; fi
 PID=$(cat "$PID_FILE")
 if kill -0 "$PID" 2>/dev/null; then

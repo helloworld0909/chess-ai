@@ -1,6 +1,8 @@
+import importlib.util as _ilu
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import pytest
@@ -8,7 +10,6 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-import importlib.util as _ilu
 
 import chess
 
@@ -218,14 +219,18 @@ def test_chess_encoder_shape():
     encoder = ChessEncoder(in_channels=19, hidden_size=64, num_blocks=3, out_dim=256)
     x = torch.randn(4, 19, 8, 8)
     out = encoder(x)
-    assert out.shape == (4, 64, 256)  # 64 per-square tokens
+    assert out.shape == (4, 65, 256)  # 64 per-square tokens + 1 global token
+
+    grid, glob = encoder.forward_clip(x)
+    assert grid.shape == (4, 64, 256)
+    assert glob.shape == (4, 1, 256)
 
 
 def test_chess_encoder_legacy_19ch():
     encoder = ChessEncoder(in_channels=19, hidden_size=64, num_blocks=3, out_dim=256)
     x = torch.randn(4, 19, 8, 8)
     out = encoder(x)
-    assert out.shape == (4, 64, 256)  # 64 per-square tokens
+    assert out.shape == (4, 65, 256)  # 64 per-square tokens + 1 global token
 
 
 def test_board_to_tensor():
@@ -529,3 +534,107 @@ def test_chess_lm_load_pretrained_weights(mock_llm, tmp_path):
     x = torch.randn(2, 19, 8, 8)
     with torch.no_grad():
         assert torch.equal(w1.cnn(x), w2.cnn(x))
+
+
+# ---------------------------------------------------------------------------
+# _pawn_structure_parts tests
+# ---------------------------------------------------------------------------
+
+import importlib.util as _ilu
+
+
+def _load_clip_train():
+    spec = _ilu.spec_from_file_location(
+        "encoder_clip_train",
+        str(Path(__file__).parent.parent / "recipes-train/encoder-clip/train.py"),
+    )
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_clip = _load_clip_train()
+_pawn_structure_parts = _clip._pawn_structure_parts
+
+
+def _board(fen: str) -> chess.Board:
+    return chess.Board(fen)
+
+
+def test_pawn_structure_start_no_flags():
+    # Starting position: no pawn qualifies as passed, isolated, or doubled.
+    board = _board(chess.STARTING_FEN)
+    for sq in chess.SquareSet(board.pieces(chess.PAWN, chess.WHITE)):
+        parts = _pawn_structure_parts(board, sq, chess.WHITE)
+        assert parts == [], f"e2-h2 pawn {chess.square_name(sq)} should have no flags, got {parts}"
+
+
+def test_pawn_structure_passed_white():
+    # White pawn on e5, no black pawns on d/e/f files ahead of rank 4.
+    board = _board("8/8/8/4P3/8/8/8/8 w - - 0 1")
+    parts = _pawn_structure_parts(board, chess.E5, chess.WHITE)
+    assert "passed pawn" in parts
+
+
+def test_pawn_structure_not_passed_blocked():
+    # Black pawn on e7 directly ahead of white pawn on e5 → not passed.
+    board = _board("8/4p3/8/4P3/8/8/8/8 w - - 0 1")
+    parts = _pawn_structure_parts(board, chess.E5, chess.WHITE)
+    assert "passed pawn" not in parts
+
+
+def test_pawn_structure_not_passed_adjacent_file():
+    # Black pawn on d6 (adjacent file, ahead) blocks white pawn on e5.
+    board = _board("8/8/3p4/4P3/8/8/8/8 w - - 0 1")
+    parts = _pawn_structure_parts(board, chess.E5, chess.WHITE)
+    assert "passed pawn" not in parts
+
+
+def test_pawn_structure_passed_black():
+    # Black pawn on d4, no white pawns on c/d/e files ahead (rank < 3).
+    board = _board("8/8/8/8/3p4/8/8/8 b - - 0 1")
+    parts = _pawn_structure_parts(board, chess.D4, chess.BLACK)
+    assert "passed pawn" in parts
+
+
+def test_pawn_structure_isolated():
+    # White pawn on h4, no white pawns on g-file → isolated.
+    board = _board("8/8/8/8/7P/8/8/8 w - - 0 1")
+    parts = _pawn_structure_parts(board, chess.H4, chess.WHITE)
+    assert "isolated pawn" in parts
+
+
+def test_pawn_structure_not_isolated_has_neighbor():
+    # White pawns on e4 and f2 → e4 pawn not isolated (f-file neighbor).
+    board = _board("8/8/8/8/4P3/8/5P2/8 w - - 0 1")
+    parts = _pawn_structure_parts(board, chess.E4, chess.WHITE)
+    assert "isolated pawn" not in parts
+
+
+def test_pawn_structure_isolated_rook_pawn():
+    # White pawn on a4, no white pawns on b-file → isolated (a-file has only one neighbor).
+    board = _board("8/8/8/8/P7/8/8/8 w - - 0 1")
+    parts = _pawn_structure_parts(board, chess.A4, chess.WHITE)
+    assert "isolated pawn" in parts
+
+
+def test_pawn_structure_doubled():
+    # White pawns on e4 and e2 → both are doubled.
+    board = _board("8/8/8/8/4P3/8/4P3/8 w - - 0 1")
+    assert "doubled pawn" in _pawn_structure_parts(board, chess.E4, chess.WHITE)
+    assert "doubled pawn" in _pawn_structure_parts(board, chess.E2, chess.WHITE)
+
+
+def test_pawn_structure_not_doubled_solo():
+    # Single white pawn on e4 → not doubled.
+    board = _board("8/8/8/8/4P3/8/8/8 w - - 0 1")
+    parts = _pawn_structure_parts(board, chess.E4, chess.WHITE)
+    assert "doubled pawn" not in parts
+
+
+def test_pawn_structure_passed_isolated_combined():
+    # White pawn on a5, no black pawns on a/b files → passed AND isolated.
+    board = _board("8/8/8/P7/8/8/8/8 w - - 0 1")
+    parts = _pawn_structure_parts(board, chess.A5, chess.WHITE)
+    assert "passed pawn" in parts
+    assert "isolated pawn" in parts

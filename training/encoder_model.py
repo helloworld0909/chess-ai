@@ -7,22 +7,17 @@ from typing import Optional, Union
 import torch
 import torch.nn as nn
 
-from src.encoder import MOVE_TOKEN_ID
+from src.encoder import BOARD_TOKENS_PER_POSITION, MOVE_TOKEN_ID
 from src.encoder.cnn import ChessEncoder
-
-# Number of sentinel tokens injected per board position.
-# Must match the number of <|vision_pad|> tokens in the user message and the
-# CNN output sequence length (64 = one token per square).
-BOARD_TOKENS_PER_POSITION = 64
 
 
 class ChessLMWithEncoder(nn.Module):
     """Combines a base LLM (e.g., Qwen3.5-4B) with a ResNet board encoder.
 
-    Each board position is represented by BOARD_TOKENS_PER_POSITION (64) consecutive
+    Each board position is represented by BOARD_TOKENS_PER_POSITION (65) consecutive
     <|vision_pad|> sentinel tokens in the input. The encoder processes the 19-channel
-    8x8 board tensor and produces 64 per-square embeddings (one per chess square,
-    row-major a1..h8), which replace the 64 sentinels in the embedding sequence.
+    8x8 board tensor and produces 65 embeddings (64 per-square tokens in row-major
+    a1..h8 order, plus 1 global summary token), which replace the 65 sentinels.
 
     Each per-square token encodes the full board context from that square's perspective
     (receptive field covers the entire board via deep ResNet convolutions), plus a
@@ -34,7 +29,7 @@ class ChessLMWithEncoder(nn.Module):
         # are optional — omit them (or pass None) for TRL log-prob passes on
         # completion-only sequences; zero embeddings will be used instead.
         out = model(
-            input_ids=ids,             # (B, L)  — L includes 64 sentinels per board
+            input_ids=ids,             # (B, L)  — L includes 65 sentinels per board
             board_tensors_flat=flat,   # (N_boards, 19, 8, 8)  — optional
             move_counts=counts,        # (B,)  — optional, kept for API compat
             attention_mask=mask,       # (B, L)
@@ -90,8 +85,10 @@ class ChessLMWithEncoder(nn.Module):
         # Freeze the entire model first
         for p in self.parameters():
             p.requires_grad_(False)
-        # Unfreeze only the projector MLP
+        # Unfreeze both projector MLPs (grid + global)
         for p in self.cnn.proj.parameters():
+            p.requires_grad_(True)
+        for p in self.cnn.global_proj.parameters():
             p.requires_grad_(True)
 
     def train(self, mode: bool = True) -> "ChessLMWithEncoder":
@@ -105,8 +102,9 @@ class ChessLMWithEncoder(nn.Module):
         super().train(mode)
         # Lock the entire CNN in eval mode — BN stats frozen, dropout off
         self.cnn.eval()
-        # Projector has no BN/dropout, but set it explicitly for clarity
+        # Projector layers have no BN/dropout but set them explicitly for clarity
         self.cnn.proj.train(mode)
+        self.cnn.global_proj.train(mode)
         return self
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
@@ -131,11 +129,11 @@ class ChessLMWithEncoder(nn.Module):
         labels: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, tuple]:
-        """Forward pass — splices 64 CNN embeddings into each sentinel group.
+        """Forward pass — splices 65 CNN embeddings into each sentinel group.
 
-        Each board position occupies exactly BOARD_TOKENS_PER_POSITION (64) consecutive
-        sentinel tokens. The CNN encodes the board tensor into (64, H) per-square
-        embeddings, which replace those sentinels in the embedding sequence.
+        Each board position occupies exactly BOARD_TOKENS_PER_POSITION (65) consecutive
+        sentinel tokens. The CNN encodes the board tensor into (65, H) embeddings
+        (64 per-square + 1 global summary), which replace those sentinels.
 
         Args:
             input_ids: (B, L) — L includes 64 sentinels per board position.
