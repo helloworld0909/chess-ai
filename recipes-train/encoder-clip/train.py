@@ -46,11 +46,12 @@ from pathlib import Path
 import chess
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.encoder.board_tensor import board_to_tensor
@@ -99,7 +100,7 @@ _EVAL_TIERS = [
 class ChessClipBinDataset(Dataset):
     """Binary map-style dataset (210 bytes/record, O(1) random access).
 
-    Yields: (board_tensor, sf15, eval_score, piece_labels, fen)
+    Yields: (board_tensor, sf15, eval_score, fen)
     """
 
     _FEN_BYTES = 90
@@ -132,16 +133,14 @@ class ChessClipBinDataset(Dataset):
         fen = raw[: self._FEN_BYTES].rstrip(b"\x00").decode("utf-8")
         sf15_vals = struct.unpack_from(f"{N_TERMS}f", raw, self._FEN_BYTES)
         eval_val = struct.unpack_from("f", raw, self._FEN_BYTES + N_TERMS * 4)[0]
-        piece_vals = raw[self._FEN_BYTES + N_TERMS * 4 + 4 :]
         sf15 = torch.tensor(sf15_vals, dtype=torch.float32)
         eval_score = torch.tensor(eval_val, dtype=torch.float32)
-        piece_labels = torch.frombuffer(bytearray(piece_vals), dtype=torch.uint8).to(torch.long)
         board = chess.Board(fen)
-        return board_to_tensor(board), sf15, eval_score, piece_labels, fen
+        return board_to_tensor(board), sf15, eval_score, fen
 
 
 class ChessClipJsonlDataset(torch.utils.data.IterableDataset):
-    """Streaming JSONL dataset. Yields: (board_tensor, sf15, eval_score, piece_labels, fen)
+    """Streaming JSONL dataset. Yields: (board_tensor, sf15, eval_score, fen)
 
     DDP sharding: inject _rank / _world_size attributes before creating DataLoader.
     """
@@ -151,6 +150,7 @@ class ChessClipJsonlDataset(torch.utils.data.IterableDataset):
         self.limit = limit
         self._rank = 0
         self._world_size = 1
+        self._resume_examples = 0
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -159,10 +159,16 @@ class ChessClipJsonlDataset(torch.utils.data.IterableDataset):
 
         global_stride = num_workers * self._world_size
         my_slot = self._rank * num_workers + worker_id
+        start_example = self._resume_examples
+        if my_slot >= start_example:
+            start_idx = my_slot
+        else:
+            steps = (start_example - my_slot + global_stride - 1) // global_stride
+            start_idx = my_slot + steps * global_stride
 
         emitted = 0
         with open(self.path, "rb") as f:
-            for raw in itertools.islice(f, my_slot, None, global_stride):
+            for raw in itertools.islice(f, start_idx, None, global_stride):
                 raw = raw.strip()
                 if not raw:
                     continue
@@ -172,14 +178,7 @@ class ChessClipJsonlDataset(torch.utils.data.IterableDataset):
                     sf15 = torch.tensor(rec["sf15_terms"], dtype=torch.float32)
                     eval_score = torch.tensor(rec["eval_score"], dtype=torch.float32)
                     board = chess.Board(fen)
-                    piece_labels = torch.zeros(64, dtype=torch.long)
-                    for sq in chess.SQUARES:
-                        p = board.piece_at(sq)
-                        if p:
-                            piece_labels[sq] = (
-                                p.piece_type if p.color == chess.WHITE else p.piece_type + 6
-                            )
-                    yield board_to_tensor(board), sf15, eval_score, piece_labels, fen
+                    yield board_to_tensor(board), sf15, eval_score, fen
                     emitted += 1
                     if self.limit and emitted * global_stride >= self.limit:
                         break
@@ -197,9 +196,8 @@ def _collate(batch):
     boards = torch.stack([b[0] for b in batch])
     sf15 = torch.stack([b[1] for b in batch])
     eval_scores = torch.stack([b[2] for b in batch])
-    piece_labels = torch.stack([b[3] for b in batch])
-    fens = [b[4] for b in batch]
-    return boards, sf15, eval_scores, piece_labels, fens
+    fens = [b[3] for b in batch]
+    return boards, sf15, eval_scores, fens
 
 
 # ---------------------------------------------------------------------------
@@ -375,11 +373,12 @@ def describe_square(board: chess.Board, sq: int) -> str:
 
 
 class EmbeddingCache:
-    """LRU dict: text → (D,) float32 CPU tensor, with disk persistence."""
+    """LRU dict: text → (D,) CPU tensor matching the model embedding dtype."""
 
-    def __init__(self, maxsize: int = 50_000) -> None:
+    def __init__(self, maxsize: int = 50_000, dtype: torch.dtype = torch.bfloat16) -> None:
         self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._maxsize = maxsize
+        self._dtype = dtype
         self.hits = 0
         self.misses = 0
         self._save_thread: threading.Thread | None = None
@@ -398,7 +397,7 @@ class EmbeddingCache:
         else:
             if len(self._cache) >= self._maxsize:
                 self._cache.popitem(last=False)
-        self._cache[key] = value.cpu()
+        self._cache[key] = value.to(dtype=self._dtype, device="cpu")
 
     @property
     def hit_rate(self) -> float:
@@ -409,10 +408,10 @@ class EmbeddingCache:
         return len(self._cache)
 
     def save(self, path: str | Path) -> None:
-        """Save cache to disk as float16 in a background thread (non-blocking)."""
+        """Save cache to disk in the cache dtype in a background thread (non-blocking)."""
         if self._save_thread and self._save_thread.is_alive():
             return  # previous save still running — skip this one
-        snapshot = {k: v.half() for k, v in self._cache.items()}
+        snapshot = dict(self._cache)
 
         def _write() -> None:
             tmp = Path(str(path) + ".tmp")
@@ -437,7 +436,7 @@ class EmbeddingCache:
             return 0
         data: dict[str, torch.Tensor] = torch.load(path, map_location="cpu", weights_only=True)
         for k, v in data.items():
-            self.put(k, v.float())  # respects maxsize + LRU order
+            self.put(k, v)  # respects maxsize + LRU order
         logger.info("EmbeddingCache: loaded %d entries from %s", len(data), path)
         return len(data)
 
@@ -448,7 +447,7 @@ def embed_texts(
     tokenizer,
     texts: list[str],
     device: torch.device,
-    batch_size: int = 64,
+    batch_size: int = 128,
 ) -> torch.Tensor:
     """Embed texts using Qwen last-layer last-token hidden state.
 
@@ -467,12 +466,36 @@ def embed_texts(
             # 64 covers grid descriptions (max=53 tokens) and global descriptions (max=57 tokens).
         ).to(device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = qwen(**enc, output_hidden_states=True)
-        last_layer = out.hidden_states[-1].float()  # (B, L, D)
+            out = qwen(**enc, use_cache=False)
+        last_layer = out.last_hidden_state  # (B, L, D)
         seq_lens = enc.attention_mask.sum(dim=1) - 1  # last non-padding token index
         embs = last_layer[torch.arange(len(chunk), device=device), seq_lens]
         all_embs.append(embs)
     return torch.cat(all_embs, dim=0)
+
+
+def _all_gather_cat(tensor: torch.Tensor, *, require_grad: bool) -> torch.Tensor:
+    """Gather first-dimension batches across ranks, preserving gradients when requested."""
+    if not dist.is_initialized():
+        return tensor
+    if require_grad:
+        return torch.cat(dist_nn.all_gather(tensor), dim=0)
+
+    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, tensor.contiguous())
+    return torch.cat(gathered, dim=0)
+
+
+def maybe_gather_negatives(
+    tensor: torch.Tensor,
+    *,
+    require_grad: bool,
+    enabled: bool,
+) -> torch.Tensor:
+    """Optionally gather negatives across ranks while keeping local tensors unchanged otherwise."""
+    if not enabled:
+        return tensor
+    return _all_gather_cat(tensor, require_grad=require_grad)
 
 
 def get_anchor_embeddings(
@@ -531,6 +554,7 @@ def clip_loss(
     global_anchor: torch.Tensor,
     tau: torch.Tensor,
     global_weight: float,
+    grid_chunk_size: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-position InfoNCE (64 × B×B) + global InfoNCE (B×B).
 
@@ -542,20 +566,26 @@ def clip_loss(
     Returns:
         total_loss, L_grid, L_global
     """
-    L_grid = grid_tokens.new_zeros(())
-    for s in range(64):
-        L_grid = L_grid + _infonce(
-            F.normalize(grid_tokens[:, s, :], dim=-1),
-            F.normalize(grid_anchors[:, s, :], dim=-1),
-            tau,
-        )
-    L_grid = L_grid / 64
+    grid_tokens = F.normalize(grid_tokens, dim=-1)
+    grid_anchors = F.normalize(grid_anchors, dim=-1)
+    global_token = F.normalize(global_token, dim=-1)
+    global_anchor = F.normalize(global_anchor, dim=-1)
 
-    L_global = _infonce(
-        F.normalize(global_token, dim=-1),
-        F.normalize(global_anchor, dim=-1),
-        tau,
-    )
+    n_squares = grid_tokens.size(1)
+    labels = torch.arange(grid_tokens.size(0), device=grid_tokens.device)
+    L_grid = grid_tokens.new_zeros(())
+    for start in range(0, n_squares, grid_chunk_size):
+        end = min(start + grid_chunk_size, n_squares)
+        tok_chunk = grid_tokens[:, start:end, :]
+        anc_chunk = grid_anchors[:, start:end, :]
+        logits = torch.einsum("bsd,csd->sbc", tok_chunk, anc_chunk) / tau
+        chunk_labels = labels.unsqueeze(0).expand(end - start, -1).reshape(-1)
+        v2t = F.cross_entropy(logits.reshape(-1, logits.size(-1)), chunk_labels)
+        t2v = F.cross_entropy(logits.transpose(1, 2).reshape(-1, logits.size(-1)), chunk_labels)
+        L_grid = L_grid + (v2t + t2v) * (end - start) / 2
+    L_grid = L_grid / n_squares
+
+    L_global = _infonce(global_token, global_anchor, tau)
     return L_grid + global_weight * L_global, L_grid, L_global
 
 
@@ -616,6 +646,8 @@ def main() -> None:
 
     global_loss_weight: float = clip_cfg.get("global_loss_weight", 0.5)
     cache_maxsize: int = clip_cfg.get("cache_maxsize", 50_000)
+    grid_loss_chunk_size: int = clip_cfg.get("grid_loss_chunk_size", 8)
+    cross_rank_negatives: bool = clip_cfg.get("cross_rank_negatives", False)
     qwen_model_name: str = clip_cfg.get("qwen_model", "Qwen/Qwen3.5-4B")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
@@ -629,15 +661,17 @@ def main() -> None:
     if is_iterable:
         train_ds._rank = rank
         train_ds._world_size = world_size
+        train_batch_size = train_cfg.get("per_device_train_batch_size", 256)
         train_sampler = None
         train_shuffle = False
     else:
+        train_batch_size = train_cfg.get("per_device_train_batch_size", 256)
         train_sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
         train_shuffle = train_sampler is None
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=train_cfg.get("per_device_train_batch_size", 256),
+        batch_size=train_batch_size,
         sampler=train_sampler,
         shuffle=train_shuffle,
         num_workers=num_workers,
@@ -667,9 +701,9 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    qwen = AutoModelForCausalLM.from_pretrained(
+    qwen = AutoModel.from_pretrained(
         qwen_model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation="flash_attention_2",
     ).to(device)
@@ -726,8 +760,13 @@ def main() -> None:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
+        if is_iterable:
+            train_ds._resume_examples = ckpt.get(
+                "samples_seen",
+                resume_step * train_batch_size * world_size,
+            )
 
-    emb_cache = EmbeddingCache(maxsize=cache_maxsize)
+    emb_cache = EmbeddingCache(maxsize=cache_maxsize, dtype=qwen.dtype)
     cache_path = output_dir / "embedding_cache.pt"
     n_loaded = emb_cache.load(cache_path)
     if n_loaded:
@@ -754,6 +793,7 @@ def main() -> None:
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "step": step,
+                "samples_seen": step * train_batch_size * world_size,
                 "eval_loss": eval_loss,
             },
             ckpt_dir / "checkpoint.pt",
@@ -794,12 +834,34 @@ def main() -> None:
         totals = {"loss": 0.0, "grid": 0.0, "global": 0.0, "n": 0.0}
         tau = log_temperature.exp().clamp(0.01, 0.5)
         with torch.no_grad():
-            for boards, sf15, eval_score, _, fens in eval_loader:
+            for boards, sf15, eval_score, fens in eval_loader:
                 boards = boards.to(device, non_blocking=True)
                 sf15_dev = sf15.to(device, non_blocking=True)
                 eval_dev = eval_score.to(device, non_blocking=True)
                 grid_anchors, global_anchor = build_anchors(fens, sf15_dev, eval_dev)
-                grid_tokens, global_token = raw_enc.forward_clip(boards)
+                tokens = encoder(boards)
+                grid_tokens = tokens[:, :64, :]
+                global_token = tokens[:, 64:, :]
+                grid_tokens = maybe_gather_negatives(
+                    grid_tokens,
+                    require_grad=False,
+                    enabled=cross_rank_negatives,
+                )
+                global_token = maybe_gather_negatives(
+                    global_token,
+                    require_grad=False,
+                    enabled=cross_rank_negatives,
+                )
+                grid_anchors = maybe_gather_negatives(
+                    grid_anchors,
+                    require_grad=False,
+                    enabled=cross_rank_negatives,
+                )
+                global_anchor = maybe_gather_negatives(
+                    global_anchor,
+                    require_grad=False,
+                    enabled=cross_rank_negatives,
+                )
                 loss, L_grid, L_global = clip_loss(
                     grid_tokens,
                     grid_anchors,
@@ -807,6 +869,7 @@ def main() -> None:
                     global_anchor,
                     tau,
                     global_loss_weight,
+                    grid_chunk_size=grid_loss_chunk_size,
                 )
                 bs = boards.size(0)
                 totals["loss"] += loss.item() * bs
@@ -839,7 +902,7 @@ def main() -> None:
     t0 = time.time()
     running = {"loss": 0.0, "grid": 0.0, "global": 0.0, "n": 0}
 
-    for boards, sf15, eval_score, _, fens in train_loader:
+    for boards, sf15, eval_score, fens in train_loader:
         if global_step >= max_steps:
             break
 
@@ -850,8 +913,29 @@ def main() -> None:
         grid_anchors, global_anchor = build_anchors(fens, sf15_dev, eval_dev)
 
         optimizer.zero_grad()
-        raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
-        grid_tokens, global_token = raw_enc.forward_clip(boards)
+        tokens = encoder(boards)
+        grid_tokens = tokens[:, :64, :]
+        global_token = tokens[:, 64:, :]
+        grid_tokens = maybe_gather_negatives(
+            grid_tokens,
+            require_grad=True,
+            enabled=cross_rank_negatives,
+        )
+        global_token = maybe_gather_negatives(
+            global_token,
+            require_grad=True,
+            enabled=cross_rank_negatives,
+        )
+        grid_anchors = maybe_gather_negatives(
+            grid_anchors,
+            require_grad=False,
+            enabled=cross_rank_negatives,
+        )
+        global_anchor = maybe_gather_negatives(
+            global_anchor,
+            require_grad=False,
+            enabled=cross_rank_negatives,
+        )
 
         tau = log_temperature.exp().clamp(0.01, 0.5)
         loss, L_grid, L_global = clip_loss(
@@ -861,6 +945,7 @@ def main() -> None:
             global_anchor,
             tau,
             global_loss_weight,
+            grid_chunk_size=grid_loss_chunk_size,
         )
 
         loss.backward()
