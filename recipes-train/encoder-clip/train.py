@@ -226,6 +226,33 @@ def _term_qual_label(term_name: str, val: float) -> str | None:
     return f"{side} {verb} {term_name}"
 
 
+_MATERIAL_VALUES = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+}
+
+
+def _material_summary(board: chess.Board) -> str:
+    syms = {
+        chess.QUEEN: "Q",
+        chess.ROOK: "R",
+        chess.BISHOP: "B",
+        chess.KNIGHT: "N",
+        chess.PAWN: "P",
+    }
+    imbalances = []
+    for pt in (chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN):
+        diff = len(board.pieces(pt, chess.WHITE)) - len(board.pieces(pt, chess.BLACK))
+        if diff > 0:
+            imbalances.append(f"white +{diff}{syms[pt]}")
+        elif diff < 0:
+            imbalances.append(f"black +{-diff}{syms[pt]}")
+    return "material: " + (", ".join(imbalances) if imbalances else "equal")
+
+
 def build_global_description(sf15_terms: list[float], eval_score: float, board: chess.Board) -> str:
     """Position-specific global description: eval tier + SF15 imbalances + board state facts.
 
@@ -233,9 +260,8 @@ def build_global_description(sf15_terms: list[float], eval_score: float, board: 
     each description near-unique, preventing Qwen embeddings from clustering by template
     and ensuring the global InfoNCE loss has well-separated negatives.
     """
-    # Side to move and move number
     stm = "White" if board.turn == chess.WHITE else "Black"
-    header = f"{stm} to move, move {board.fullmove_number}"
+    header = f"{stm} to move"
 
     # Castling rights
     castling_parts = []
@@ -247,7 +273,9 @@ def build_global_description(sf15_terms: list[float], eval_score: float, board: 
         castling_parts.append("black kingside")
     if board.has_queenside_castling_rights(chess.BLACK):
         castling_parts.append("black queenside")
-    castling = f"castling: {', '.join(castling_parts)}" if castling_parts else "no castling"
+    castling = (
+        f"castling available: {', '.join(castling_parts)}" if castling_parts else "no castling"
+    )
 
     # En passant
     ep = f"en passant: {chess.square_name(board.ep_square)}" if board.ep_square else None
@@ -258,10 +286,13 @@ def build_global_description(sf15_terms: list[float], eval_score: float, board: 
     labels = [_term_qual_label(name, val) for name, val in ranked[:3]]
     labels = [lb for lb in labels if lb is not None]
     eval_part = f"{prefix}, driven by: {', '.join(labels)}." if labels else f"{prefix}."
+    material = _material_summary(board)
 
-    parts = [f"{header}.", castling + ".", eval_part]
+    parts = [f"{header}.", material + ".", castling + ".", eval_part]
     if ep:
         parts.insert(2, ep + ".")
+    if board.is_check():
+        parts.insert(1, "King is in check!")
     return " ".join(parts)
 
 
@@ -295,15 +326,118 @@ def _pawn_structure_parts(board: chess.Board, sq: int, color: chess.Color) -> li
     return parts
 
 
+_PIECE_VAL = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+    chess.KING: 100,
+}
+
+
+def _xray_target(board: chess.Board, sq: int) -> str | None:
+    """Return description if an enemy sliding piece x-rays through `sq` to a higher-value piece."""
+    piece = board.piece_at(sq)
+    if piece is None:
+        return None
+    enemy = not piece.color
+    piece_val = _PIECE_VAL.get(piece.piece_type, 0)
+    dist_sq = chess.square_distance  # alias
+
+    best: tuple[int, str] | None = None  # (target_value, description)
+    for atk_sq in board.attackers(enemy, sq):
+        attacker = board.piece_at(atk_sq)
+        if attacker is None or attacker.piece_type not in (chess.BISHOP, chess.ROOK, chess.QUEEN):
+            continue
+        ray = chess.BB_RAYS[atk_sq][sq]
+        if not ray:
+            continue
+        d_to_sq = dist_sq(atk_sq, sq)
+        # Walk squares on the ray beyond sq (farther from attacker than sq)
+        for target_sq in sorted(
+            (
+                s
+                for s in chess.SquareSet(ray)
+                if s != atk_sq and s != sq and dist_sq(atk_sq, s) > d_to_sq
+            ),
+            key=lambda s: dist_sq(sq, s),
+        ):
+            target = board.piece_at(target_sq)
+            if target is not None:
+                tval = _PIECE_VAL.get(target.piece_type, 0)
+                if tval > piece_val and (best is None or tval > best[0]):
+                    tcol = "white" if target.color == chess.WHITE else "black"
+                    best = (
+                        tval,
+                        f"x-rays {tcol} {chess.piece_name(target.piece_type)} on {chess.square_name(target_sq)}",
+                    )
+                break  # first piece behind sq along this ray
+
+    return best[1] if best else None
+
+
 def _file_type(board: chess.Board, sq: int) -> str:
     fi = chess.square_file(sq)
     wp = any(chess.square_file(p) == fi for p in board.pieces(chess.PAWN, chess.WHITE))
     bp = any(chess.square_file(p) == fi for p in board.pieces(chess.PAWN, chess.BLACK))
     if not wp and not bp:
         return "open file"
-    if not wp or not bp:
-        return "half-open file"
+    if not wp:
+        return "half-open file for white"
+    if not bp:
+        return "half-open file for black"
     return "closed file"
+
+
+def _rank_type(board: chess.Board, sq: int) -> str:
+    ri = chess.square_rank(sq)
+    wp = any(chess.square_rank(p) == ri for p in board.pieces(chess.PAWN, chess.WHITE))
+    bp = any(chess.square_rank(p) == ri for p in board.pieces(chess.PAWN, chess.BLACK))
+    if not wp and not bp:
+        return "open rank"
+    if not wp:
+        return "half-open rank for white"
+    if not bp:
+        return "half-open rank for black"
+    return "closed rank"
+
+
+def _nearest_pawn_on_file(board: chess.Board, sq: int) -> str | None:
+    """Distance to nearest pawn (either color) on the same file. None if no pawns."""
+    fi = chess.square_file(sq)
+    ri = chess.square_rank(sq)
+    min_dist = None
+    for color in (chess.WHITE, chess.BLACK):
+        for p in board.pieces(chess.PAWN, color):
+            if chess.square_file(p) == fi:
+                d = abs(chess.square_rank(p) - ri)
+                if min_dist is None or d < min_dist:
+                    min_dist = d
+    if min_dist is None:
+        return None
+    return f"{min_dist} square{'s' if min_dist != 1 else ''} from nearest pawn on file"
+
+
+def _is_outpost(board: chess.Board, sq: int, color: chess.Color) -> bool:
+    """True if no enemy pawn can ever attack sq (outpost for `color`)."""
+    fi = chess.square_file(sq)
+    ri = chess.square_rank(sq)
+    enemy = not color
+    for p in board.pieces(chess.PAWN, enemy):
+        pf = chess.square_file(p)
+        pr = chess.square_rank(p)
+        if abs(pf - fi) == 1:
+            # Enemy pawn on adjacent file: can it reach a rank where it attacks sq?
+            # White outpost: black pawns advance by decreasing rank; attack sq at rank ri
+            # from rank ri+1. Black pawn at pr can reach ri+1 if pr >= ri+1 (black moves down).
+            # Black outpost: white pawns advance by increasing rank; attack sq at rank ri
+            # from rank ri-1. White pawn at pr can reach ri-1 if pr <= ri-1 (white moves up).
+            if color == chess.WHITE and pr >= ri + 1:
+                return False
+            if color == chess.BLACK and pr <= ri - 1:
+                return False
+    return True
 
 
 _PIECE_SYM = {
@@ -326,12 +460,70 @@ def describe_square(board: chess.Board, sq: int) -> str:
     sq_name = chess.square_name(sq)
     col = lambda c: "white" if c == chess.WHITE else "black"  # noqa: E731
 
+    white_attackers = sorted(board.attackers(chess.WHITE, sq))
+    black_attackers = sorted(board.attackers(chess.BLACK, sq))
+
+    _PIECE_VALUE = {
+        chess.QUEEN: 9,
+        chess.ROOK: 5,
+        chess.BISHOP: 3,
+        chess.KNIGHT: 3,
+        chess.PAWN: 1,
+        chess.KING: 0,
+    }
+
+    def _by_value(sq: int) -> int:
+        p = board.piece_at(sq)
+        return -_PIECE_VALUE.get(p.piece_type, 0) if p else 0
+
+    def _summarize_attackers(squares: list[int], color: chess.Color, limit: int = 2) -> str:
+        if not squares:
+            return "none"
+        names = []
+        for attacker_sq in sorted(squares, key=_by_value)[:limit]:
+            attacker = board.piece_at(attacker_sq)
+            if attacker is not None:
+                names.append(
+                    f"{'white' if color == chess.WHITE else 'black'} "
+                    f"{chess.piece_name(attacker.piece_type)} on {chess.square_name(attacker_sq)}"
+                )
+        return "; ".join(names)
+
+    def _control_summary(squares: list[int], color: chess.Color) -> str:
+        count = len(squares)
+        side = "white" if color == chess.WHITE else "black"
+        piece_word = "piece" if count == 1 else "pieces"
+        if count == 0:
+            return ""
+        return (
+            f"{count} {side} {piece_word} including {_summarize_attackers(squares, color, limit=1)}"
+        )
+
+    sq_color = "light" if chess.BB_LIGHT_SQUARES & chess.BB_SQUARES[sq] else "dark"
+
     if piece is None:
-        desc = f"empty square on {sq_name}"
+        desc = (
+            f"square {sq_name}. occupancy: empty, {sq_color} square"
+            f", {_file_type(board, sq)}, {_rank_type(board, sq)}"
+        )
+        pawn_dist = _nearest_pawn_on_file(board, sq)
+        if pawn_dist:
+            desc += f", {pawn_dist}"
+        # Outpost for the side to move — can a friendly piece sit here unchallenged?
+        if _is_outpost(board, sq, board.turn):
+            stm_str = "white" if board.turn == chess.WHITE else "black"
+            desc += f", outpost for {stm_str}"
     else:
         sym = _PIECE_SYM[piece.piece_type]
+        # Bishop: prefix with square color complex (light-squared / dark-squared)
+        piece_name = (
+            f"{sq_color}-squared {chess.piece_name(piece.piece_type)}"
+            if piece.piece_type == chess.BISHOP
+            else chess.piece_name(piece.piece_type)
+        )
         desc = (
-            f"{col(piece.color)} {chess.piece_name(piece.piece_type)} on {sq_name} {sym}{sq_name}"
+            f"square {sq_name}. occupancy: {col(piece.color)} "
+            f"{piece_name} ({sym}{sq_name}), {sq_color} square"
         )
         # board.attacks(sq) is turn-independent — correct for both sides
         mobility = len(board.attacks(sq))
@@ -342,27 +534,36 @@ def describe_square(board: chess.Board, sq: int) -> str:
             if parts:
                 desc += f", {', '.join(parts)}"
         if piece.piece_type in (chess.ROOK, chess.QUEEN):
-            desc += f", on {_file_type(board, sq)}"
-
-    def _attackers_str(color: chess.Color) -> list[str]:
-        c = "white" if color == chess.WHITE else "black"
-        return [
-            f"{c} {chess.piece_name(board.piece_at(s).piece_type)} on {chess.square_name(s)}"
-            for s in sorted(board.attackers(color, sq))
-            if board.piece_at(s)
-        ]
+            desc += f", on {_file_type(board, sq)}, {_rank_type(board, sq)}"
+        if board.is_pinned(piece.color, sq):
+            desc += ", pinned to king"
 
     if piece is None:
-        # Empty square: show which side(s) control it
-        ctrl_parts = _attackers_str(chess.WHITE) + _attackers_str(chess.BLACK)
-        desc += f", controlled by {' and '.join(ctrl_parts)}" if ctrl_parts else ", not controlled"
+        control_parts = [
+            part
+            for part in (
+                _control_summary(white_attackers, chess.WHITE),
+                _control_summary(black_attackers, chess.BLACK),
+            )
+            if part
+        ]
+        desc += (
+            f", controlled by {' and '.join(control_parts)}"
+            if control_parts
+            else ", not controlled"
+        )
     else:
         enemy = not piece.color
         friendly = piece.color
-        enemy_atk = _attackers_str(enemy)
-        friendly_def = _attackers_str(friendly)
-        desc += f", attacked by {' and '.join(enemy_atk)}" if enemy_atk else ", not attacked"
-        desc += f", defended by {' and '.join(friendly_def)}" if friendly_def else ", not defended"
+        enemy_atk = black_attackers if enemy == chess.BLACK else white_attackers
+        friendly_def = white_attackers if friendly == chess.WHITE else black_attackers
+        if enemy_atk:
+            desc += f", attacked by {_summarize_attackers(enemy_atk, enemy)}"
+        if friendly_def:
+            desc += f", defended by {_summarize_attackers(friendly_def, friendly)}"
+        xray = _xray_target(board, sq)
+        if xray:
+            desc += f", {xray}"
 
     return desc
 
@@ -462,8 +663,8 @@ def embed_texts(
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=64,
-            # 64 covers grid descriptions (max=53 tokens) and global descriptions (max=57 tokens).
+            max_length=96,
+            # 96 covers grid (max=58) and global (max=89 for imbalance-only material + all castling + ep).
         ).to(device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = qwen(**enc, use_cache=False)
@@ -710,7 +911,6 @@ def main() -> None:
     qwen.eval()
     for p in qwen.parameters():
         p.requires_grad_(False)
-
     # ── Encoder (trainable) ───────────────────────────────────────────────────
     encoder = ChessEncoder(
         in_channels=encoder_cfg.get("in_channels", 19),
