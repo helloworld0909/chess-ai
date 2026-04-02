@@ -7,7 +7,7 @@ Documents completed and abandoned training experiments.
 ## Active Training Pipeline
 
 ```
-encoder-pretrain (v2, 656M positions) ✅ complete → checkpoint-310000
+encoder-pretrain (v2, 656M positions) ✅ complete → checkpoint-310000 (abandoned as upstream; encoder-clip retrains from scratch)
         ↓
 encoder-clip (CLIP alignment, InfoNCE)  ← ACTIVE (step ~5710/20000)
         ↓
@@ -78,7 +78,8 @@ Our CNN encoder was pretrained on SF15 regression terms + piece classification (
 - **Data**: `encoder_pretrain_sf15.jsonl` — 656M board positions with SF15 eval term targets + piece labels; eval set 6.6M samples
 - **Dataset**: Streaming `IterableDataset` (zero RAM overhead); resume uses `islice` skip (~27s for 163M lines)
 - **v1 result**: `checkpoints/encoder-pretrain/v1-checkpoint-580083/` (100M positions, scalar eval only) — superseded
-- **v2 result**: `checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt` ✅ — used by all downstream recipes
+- **v2 result**: `checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt` ✅
+- **Status**: Abandoned as upstream — encoder-clip retrains the CNN from scratch with CLIP-style contrastive alignment, producing a better-aligned encoder. checkpoint-310000 still used by the old phase1-sft but will be superseded.
 
 ### qwen3.5-4b-encoder-pretrain-textbook
 - **Goal**: Continued causal LM pretraining on annotated chess textbook prose. Each `[Position: FEN]` in the source text is replaced by 64 `<|vision_pad|>` sentinels; the frozen CNN injects spatial board embeddings at those positions during the forward pass.
