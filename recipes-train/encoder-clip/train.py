@@ -594,15 +594,18 @@ class EmbeddingCache:
     def get(self, key: str) -> torch.Tensor | None:
         val = self._cache.get(key)
         if val is not None:
+            self._cache.move_to_end(key)  # promote to MRU end
             self.hits += 1
             return val
         self.misses += 1
         return None
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        if key not in self._cache:
+        if key in self._cache:
+            self._cache.move_to_end(key)  # promote existing entry
+        else:
             if len(self._cache) >= self._maxsize:
-                self._cache.popitem(last=False)
+                self._cache.popitem(last=False)  # evict LRU (oldest) end
             self._cache[key] = value.to(dtype=self._dtype, device="cpu")
 
     @property

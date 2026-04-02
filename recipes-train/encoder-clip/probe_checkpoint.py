@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Probe encoder checkpoint alignment quality — CPU-only, pure PyTorch + matplotlib.
 
-Four probes:
-  1. Linear piece-identity probe — single linear layer (SGD, CPU) on frozen encoder
+Three probes:
+  1. Linear piece-identity probe — single linear layer (Adam, CPU) on frozen encoder
      tokens predicts (color × piece_type): 13 classes.
 
   2. Spatial geometry heatmap — mean cos_sim(anchor_sq, every_sq) across N positions.
@@ -10,15 +10,9 @@ Four probes:
 
   3. Confusion matrix — row-normalised heatmap of piece-type confusions.
 
-  4. Retrieval metrics (tau-agnostic lie detectors) — computed from raw cosine
-     similarities between encoder grid tokens and Qwen text anchors, with no
-     temperature scaling:
-       - Top-1 retrieval accuracy (random baseline ≈ 1/N)
-       - Positive sim S_pos, hard-negative sim S_hard_neg, margin
-       - Fixed-tau (0.07) InfoNCE loss — decoupled from learned tau
-       - Top-1 accuracy heatmap per board square (8×8 PNG)
-
 All compute is CPU. GPU is left entirely for training.
+Note: retrieval metrics (Top-1, margin, fixed-tau loss) are logged live during
+training via top1=grid/global in the step log — no need to re-run Qwen here.
 """
 
 from __future__ import annotations
@@ -37,18 +31,8 @@ import torch.nn.functional as F
 from transformers.utils import logging as hf_logging
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RECIPE_DIR = Path(__file__).resolve().parent
-for _p in (str(REPO_ROOT), str(RECIPE_DIR)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from train import (  # noqa: E402  (train.py is in the same directory)
-    EmbeddingCache,
-    build_global_description,
-    describe_square,
-    embed_texts,
-    get_anchor_embeddings,
-)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.encoder.board_tensor import board_to_tensor
 from src.encoder.cnn import ChessEncoder
@@ -132,8 +116,8 @@ def encode_positions(encoder: ChessEncoder, fens: list[str]) -> tuple[torch.Tens
 # ---------------------------------------------------------------------------
 
 
-def probe_linear(tokens: torch.Tensor, labels: torch.Tensor) -> None:
-    """Single linear layer trained with SGD on CPU — no sklearn."""
+def probe_linear(tokens: torch.Tensor, labels: torch.Tensor, out_dir: Path) -> None:
+    """Single linear layer trained with Adam on CPU — no sklearn."""
     n = len(tokens)
     split = int(n * 0.8)
     perm = torch.randperm(n)
@@ -143,7 +127,7 @@ def probe_linear(tokens: torch.Tensor, labels: torch.Tensor) -> None:
     n_cls = 13
     D = tokens.shape[1]
     linear = torch.nn.Linear(D, n_cls, bias=True)
-    opt = torch.optim.SGD(linear.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
+    opt = torch.optim.Adam(linear.parameters(), lr=1e-2, weight_decay=1e-4)
 
     # Inverse-frequency class weights so minority piece types get equal gradient weight
     counts = torch.bincount(y_train, minlength=n_cls).float()
@@ -151,7 +135,7 @@ def probe_linear(tokens: torch.Tensor, labels: torch.Tensor) -> None:
     class_weights = class_weights / class_weights.sum() * n_cls  # normalize to mean=1
 
     batch = 4096
-    for epoch in range(20):
+    for epoch in range(50):
         perm2 = torch.randperm(len(X_train))
         total_loss = 0.0
         for i in range(0, len(X_train), batch):
@@ -162,7 +146,7 @@ def probe_linear(tokens: torch.Tensor, labels: torch.Tensor) -> None:
             loss.backward()
             opt.step()
             total_loss += loss.item()
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 10 == 0:
             logger.info("  epoch %d  loss=%.4f", epoch + 1, total_loss)
 
     with torch.no_grad():
@@ -170,17 +154,49 @@ def probe_linear(tokens: torch.Tensor, labels: torch.Tensor) -> None:
     acc = (preds == y_test).float().mean().item()
 
     # Per-class accuracy
-    print("\n=== Probe 1: Linear Piece-Identity (PyTorch SGD) ===")
+    print("\n=== Probe 1: Linear Piece-Identity (PyTorch Adam) ===")
     print(f"Overall accuracy: {acc:.3f}  (random baseline: {1 / 13:.3f})")
     print(f"{'Class':<8} {'Correct':>8} {'Total':>8} {'Acc':>8}")
+    class_accs: list[tuple[str, float]] = []
     for cls_id, name in enumerate(_CLASS_NAMES):
         mask = y_test == cls_id
         if mask.sum() == 0:
             continue
         cls_acc = (preds[mask] == cls_id).float().mean().item()
+        class_accs.append((name, cls_acc))
         print(
             f"{name:<8} {(preds[mask] == cls_id).sum().item():>8} {mask.sum().item():>8} {cls_acc:>8.3f}"
         )
+
+    # Bar chart
+    names_plot = [c[0] for c in class_accs]
+    accs_plot = [c[1] for c in class_accs]
+    colors = [
+        "#4e79a7" if n.startswith("w") else "#f28e2b" if n.startswith("b") else "#76b7b2"
+        for n in names_plot
+    ]
+    _, ax = plt.subplots(figsize=(10, 4))
+    bars = ax.bar(names_plot, accs_plot, color=colors)
+    ax.axhline(acc, color="black", linestyle="--", linewidth=1, label=f"overall {acc:.3f}")
+    ax.axhline(1 / 13, color="red", linestyle=":", linewidth=1, label="random 0.077")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Probe 1: Linear piece-identity accuracy per class")
+    ax.legend()
+    for bar, v in zip(bars, accs_plot):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            v + 0.01,
+            f"{v:.2f}",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+        )
+    plt.tight_layout()
+    out_path = out_dir / "linear_probe.png"
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close()
+    print(f"Saved → {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -250,13 +266,13 @@ def probe_confusion(tokens: torch.Tensor, labels: torch.Tensor, out_dir: Path) -
     n_cls = 13
     D = tokens.shape[1]
     linear = torch.nn.Linear(D, n_cls, bias=True)
-    opt = torch.optim.SGD(linear.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
+    opt = torch.optim.Adam(linear.parameters(), lr=1e-2, weight_decay=1e-4)
 
     counts = torch.bincount(y_train, minlength=n_cls).float()
     class_weights = 1.0 / counts.clamp(min=1)
     class_weights = class_weights / class_weights.sum() * n_cls
 
-    for _ in range(20):
+    for _ in range(50):
         perm2 = torch.randperm(len(X_train))
         for i in range(0, len(X_train), 4096):
             idx = perm2[i : i + 4096]
@@ -308,196 +324,6 @@ def probe_confusion(tokens: torch.Tensor, labels: torch.Tensor, out_dir: Path) -
 
 
 # ---------------------------------------------------------------------------
-# Probe 4: Retrieval metrics — tau-agnostic lie detectors
-# ---------------------------------------------------------------------------
-
-_FIXED_TAU = 0.07  # OpenAI CLIP default — used for fixed-tau eval loss
-
-
-def _compute_qwen_anchors(
-    fens: list[str],
-    sf15_rows: list[list[float]],
-    eval_scores: list[float],
-    qwen_model_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Load Qwen on CPU and compute (N, 64, D) grid anchors + (N, D) global anchors.
-
-    Uses embed_texts + get_anchor_embeddings from train.py — single source of truth
-    for label generation so probed anchors exactly match training targets.
-    """
-    from transformers import AutoModel, AutoTokenizer
-
-    logger.info("Probe 4: loading Qwen %s on CPU for anchor embeddings...", qwen_model_name)
-    tokenizer = AutoTokenizer.from_pretrained(qwen_model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    qwen = AutoModel.from_pretrained(
-        qwen_model_name,
-        dtype=torch.float32,
-        attn_implementation="eager",
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    qwen.eval()
-
-    cache = EmbeddingCache(maxsize=len(fens) * 65 + 100, dtype=torch.float32)
-    device = torch.device("cpu")
-
-    N = len(fens)
-    grid_descs: list[str] = []
-    global_descs: list[str] = []
-    for i, fen in enumerate(fens):
-        board = chess.Board(fen)
-        for sq in range(64):
-            grid_descs.append(describe_square(board, sq))
-        global_descs.append(build_global_description(sf15_rows[i], eval_scores[i], board))
-
-    logger.info(
-        "  embedding %d grid + %d global descriptions...", len(grid_descs), len(global_descs)
-    )
-    all_embs = get_anchor_embeddings(grid_descs + global_descs, cache, qwen, tokenizer, device)
-
-    del qwen  # free ~16GB CPU RAM
-    grid_anchors = F.normalize(all_embs[: N * 64].reshape(N, 64, -1).float(), dim=-1)
-    global_anchors = F.normalize(all_embs[N * 64 :].float(), dim=-1)
-    return grid_anchors, global_anchors
-
-
-def probe_retrieval(
-    encoder: ChessEncoder,
-    fens: list[str],
-    sf15_rows: list[list[float]],
-    eval_scores: list[float],
-    qwen_model_name: str,
-    out_dir: Path,
-) -> None:
-    """Tau-agnostic retrieval metrics between CNN grid tokens and Qwen text anchors.
-
-    For each of 64 square positions independently:
-      - Top-1 retrieval accuracy: does argmax(sim[i, :]) == i?
-      - Positive sim S_pos: mean diagonal cosine similarity
-      - Hard-negative sim S_hard: mean of max off-diagonal per row
-      - Margin: S_pos - S_hard
-      - Fixed-tau InfoNCE at tau=0.07 (decoupled from learned tau)
-
-    Saves a per-square Top-1 accuracy heatmap (8×8 PNG).
-    """
-    N = len(fens)
-
-    # Encode all positions — (N, 64, D) normalised grid tokens + (N, D) global
-    logger.info("Probe 4: encoding %d positions...", N)
-    grid_tokens_list: list[torch.Tensor] = []
-    global_tokens_list: list[torch.Tensor] = []
-    with torch.no_grad():
-        for fen in fens:
-            out = encoder(board_to_tensor(chess.Board(fen)).unsqueeze(0))  # (1, 65, D)
-            grid_tokens_list.append(F.normalize(out[0, :64].float(), dim=-1))
-            global_tokens_list.append(F.normalize(out[0, 64].float(), dim=0))
-    grid_tokens = torch.stack(grid_tokens_list, dim=0)  # (N, 64, D)
-    global_tokens = torch.stack(global_tokens_list, dim=0)  # (N, D)
-
-    # Compute Qwen anchors (loads Qwen, slow)
-    grid_anchors, global_anchors = _compute_qwen_anchors(
-        fens, sf15_rows, eval_scores, qwen_model_name
-    )
-
-    # ── Per-square retrieval metrics ──────────────────────────────────────────
-    sq_top1 = np.zeros(64)
-    sq_pos_sim = np.zeros(64)
-    sq_hard_sim = np.zeros(64)
-
-    labels = torch.arange(N)
-    with torch.no_grad():
-        for sq in range(64):
-            v = grid_tokens[:, sq, :]  # (N, D) CNN
-            t = grid_anchors[:, sq, :]  # (N, D) Qwen
-            sim = v @ t.T  # (N, N) raw cosine (both L2-normalised)
-
-            preds = sim.argmax(dim=1)
-            sq_top1[sq] = (preds == labels).float().mean().item()
-
-            pos = sim.diagonal().mean().item()
-            mask = torch.eye(N, dtype=torch.bool)
-            hard = sim.masked_fill(mask, -1.0).max(dim=1).values.mean().item()
-            sq_pos_sim[sq] = pos
-            sq_hard_sim[sq] = hard
-
-    # ── Global token retrieval ────────────────────────────────────────────────
-    with torch.no_grad():
-        sim_global = global_tokens @ global_anchors.T  # (N, N)
-        global_top1 = (sim_global.argmax(dim=1) == labels).float().mean().item()
-        global_pos = sim_global.diagonal().mean().item()
-        mask = torch.eye(N, dtype=torch.bool)
-        global_hard = sim_global.masked_fill(mask, -1.0).max(dim=1).values.mean().item()
-
-    # ── Fixed-tau InfoNCE ─────────────────────────────────────────────────────
-    with torch.no_grad():
-        # Mean over all 64 squares
-        fixed_tau_losses = []
-        for sq in range(64):
-            v = grid_tokens[:, sq, :]
-            t = grid_anchors[:, sq, :]
-            logits = (v @ t.T) / _FIXED_TAU
-            lbl = torch.arange(N)
-            loss = (F.cross_entropy(logits, lbl) + F.cross_entropy(logits.T, lbl)) / 2
-            fixed_tau_losses.append(loss.item())
-        fixed_tau_grid = float(np.mean(fixed_tau_losses))
-
-        logits_g = sim_global / _FIXED_TAU
-        fixed_tau_global = (
-            (F.cross_entropy(logits_g, labels) + F.cross_entropy(logits_g.T, labels)) / 2
-        ).item()
-
-    # ── Print summary ─────────────────────────────────────────────────────────
-    mean_top1 = sq_top1.mean()
-    mean_pos = sq_pos_sim.mean()
-    mean_hard = sq_hard_sim.mean()
-    mean_margin = mean_pos - mean_hard
-    random_baseline = 1.0 / N
-
-    print(f"\n=== Probe 4: Retrieval Metrics (tau-agnostic) ===")
-    print(f"N={N}  random_baseline={random_baseline:.4f}")
-    print(f"                   Grid (mean/64sq)   Global")
-    print(
-        f"  Top-1 accuracy:  {mean_top1:.4f}            {global_top1:.4f}  (random: {random_baseline:.4f})"
-    )
-    print(f"  S_pos  (diag):   {mean_pos:.4f}            {global_pos:.4f}")
-    print(f"  S_hard (max neg):{mean_hard:.4f}            {global_hard:.4f}")
-    print(f"  Margin:          {mean_margin:.4f}            {global_pos - global_hard:.4f}")
-    print(
-        f"  Fixed-tau loss (tau={_FIXED_TAU}): grid={fixed_tau_grid:.4f}  global={fixed_tau_global:.4f}"
-    )
-
-    # ── Top-1 accuracy heatmap (8×8) ─────────────────────────────────────────
-    heat = np.zeros((8, 8))
-    for sq in range(64):
-        heat[chess.square_rank(sq), chess.square_file(sq)] = sq_top1[sq]
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(
-        heat[::-1],
-        vmin=0,
-        vmax=max(sq_top1.max(), random_baseline * 3),
-        cmap="RdYlGn",
-        aspect="equal",
-    )
-    ax.set_xticks(range(8))
-    ax.set_xticklabels(list("abcdefgh"))
-    ax.set_yticks(range(8))
-    ax.set_yticklabels(list("87654321"))
-    ax.set_title(f"Top-1 retrieval accuracy per square (N={N}, random={random_baseline:.4f})")
-    for sq in range(64):
-        r, f = chess.square_rank(sq), chess.square_file(sq)
-        ax.text(f, 7 - r, f"{sq_top1[sq]:.2f}", ha="center", va="center", fontsize=6)
-    plt.colorbar(im, ax=ax)
-    plt.tight_layout()
-    out_path = out_dir / "retrieval_heatmap.png"
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved → {out_path}")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -520,32 +346,19 @@ def main() -> None:
 
     logger.info("Loading %d FENs from %s", args.n_positions, args.data)
     fens: list[str] = []
-    sf15_rows: list[list[float]] = []
-    eval_scores: list[float] = []
     with open(args.data) as f:
         for i, line in enumerate(f):
             if i >= args.n_positions:
                 break
-            rec = json.loads(line)
-            fens.append(rec["fen"])
-            sf15_rows.append(rec.get("sf15_terms", [0.0] * 11))
-            eval_scores.append(float(rec.get("eval_score", 0.0)))
+            fens.append(json.loads(line)["fen"])
 
     logger.info("Encoding %d positions on CPU...", len(fens))
     tokens, labels = encode_positions(encoder, fens)
     logger.info("tokens: %s  labels: %s", tuple(tokens.shape), tuple(labels.shape))
 
-    probe_linear(tokens, labels)
+    probe_linear(tokens, labels, out_dir)
     probe_spatial_geometry(encoder, fens[:500], out_dir)
     probe_confusion(tokens, labels, out_dir)
-    probe_retrieval(
-        encoder,
-        fens,
-        sf15_rows,
-        eval_scores,
-        config["clip"]["qwen_model"],
-        out_dir,
-    )
     print(f"\nOutput saved to {out_dir}/")
 
 
