@@ -1124,7 +1124,14 @@ def main() -> None:
 
     encoder.train()
     t0 = time.time()
-    running = {"loss": 0.0, "grid": 0.0, "global": 0.0, "n": 0}
+    running = {
+        "loss": 0.0,
+        "grid": 0.0,
+        "global": 0.0,
+        "top1_grid": 0.0,
+        "top1_global": 0.0,
+        "n": 0,
+    }
 
     for boards, sf15, eval_score, fens in train_loader:
         if global_step >= max_steps:
@@ -1187,18 +1194,40 @@ def main() -> None:
         running["global"] += L_global.item() * bs
         running["n"] += bs
 
+        # Top-1 retrieval accuracy — tau-agnostic, computed from raw cosine sims
+        with torch.no_grad():
+            _lbl = torch.arange(grid_tokens.size(0), device=grid_tokens.device)
+            _gn = F.normalize(grid_tokens.detach(), dim=-1)
+            _an = F.normalize(grid_anchors.detach(), dim=-1)
+            # Mean top-1 over all 64 squares: for each sq (B,D)@(D,B)→(B,B), argmax==diag
+            _top1_grid = 0.0
+            for _sq in range(grid_tokens.size(1)):
+                _s = _gn[:, _sq, :] @ _an[:, _sq, :].T  # (B, B)
+                _top1_grid += (_s.argmax(dim=1) == _lbl).float().mean().item()
+            _top1_grid /= grid_tokens.size(1)
+            _gn_g = F.normalize(global_token.squeeze(1).detach(), dim=-1)
+            _an_g = F.normalize(global_anchor.detach(), dim=-1)
+            _top1_global = (_gn_g @ _an_g.T).argmax(dim=1).eq(_lbl).float().mean().item()
+        running["top1_grid"] += _top1_grid * bs
+        running["top1_global"] += _top1_global * bs
+
         if is_main and global_step % logging_steps == 0:
             n = running["n"]
-            avg = {k: running[k] / n for k in ("loss", "grid", "global")}
+            avg = {
+                k: running[k] / n for k in ("loss", "grid", "global", "top1_grid", "top1_global")
+            }
             lr_now = scheduler.get_last_lr()[0]
             logger.info(
-                "step=%d  loss=%.4f grid=%.4f global=%.4f  tau=%.4f  lr=%.2e  cache_hit=%.1f%%  %.1fs",
+                "step=%d  loss=%.4f grid=%.4f global=%.4f  tau=%.4f  lr=%.2e  "
+                "top1=%.3f/%.3f  cache_hit=%.1f%%  %.1fs",
                 global_step,
                 avg["loss"],
                 avg["grid"],
                 avg["global"],
                 tau.item(),
                 lr_now,
+                avg["top1_grid"],
+                avg["top1_global"],
                 emb_cache.hit_rate * 100,
                 time.time() - t0,
             )
@@ -1212,11 +1241,20 @@ def main() -> None:
                         "train/loss_global": avg["global"],
                         "train/temperature": tau.item(),
                         "train/lr": lr_now,
+                        "train/top1_grid": avg["top1_grid"],
+                        "train/top1_global": avg["top1_global"],
                         "train/cache_hit_rate": emb_cache.hit_rate,
                     },
                     step=global_step,
                 )
-            running = {"loss": 0.0, "grid": 0.0, "global": 0.0, "n": 0}
+            running = {
+                "loss": 0.0,
+                "grid": 0.0,
+                "global": 0.0,
+                "top1_grid": 0.0,
+                "top1_global": 0.0,
+                "n": 0,
+            }
             emb_cache.reset_stats()  # keep counters small
             t0 = time.time()
 
