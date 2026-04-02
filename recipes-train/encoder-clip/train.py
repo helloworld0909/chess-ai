@@ -30,6 +30,7 @@ Usage (single GPU):
 from __future__ import annotations
 
 import argparse
+import gc
 import itertools
 import json
 import logging
@@ -62,6 +63,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("kernels").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 SF15_TERMS = [
@@ -605,14 +609,25 @@ class EmbeddingCache:
         total = self.hits + self.misses
         return self.hits / total if total > 0 else 0.0
 
+    def reset_stats(self) -> None:
+        self.hits = 0
+        self.misses = 0
+
     def __len__(self) -> int:
         return len(self._cache)
 
     def save(self, path: str | Path) -> None:
-        """Save cache to disk in the cache dtype in a background thread (non-blocking)."""
+        """Save cache to disk in a background thread (non-blocking).
+
+        Joins any in-flight save first so we never hold two full snapshots
+        simultaneously (each snapshot is ~20 GB at 4 M entries).
+        """
         if self._save_thread and self._save_thread.is_alive():
-            return  # previous save still running — skip this one
-        snapshot = dict(self._cache)
+            self._save_thread.join()  # wait for previous save — don't double-buffer
+        # Take a lightweight view of current keys/values without copying tensors.
+        # list() snapshots the item pairs at this point in time; the tensors
+        # themselves are not duplicated (bfloat16 CPU, referenced not copied).
+        snapshot = list(self._cache.items())
 
         def _write() -> None:
             tmp = Path(str(path) + ".tmp")
@@ -635,11 +650,13 @@ class EmbeddingCache:
         path = Path(path)
         if not path.exists():
             return 0
-        data: dict[str, torch.Tensor] = torch.load(path, map_location="cpu", weights_only=True)
-        for k, v in data.items():
+        raw = torch.load(path, map_location="cpu", weights_only=True)
+        # Support both old dict format and new list-of-pairs format.
+        items: list[tuple[str, torch.Tensor]] = raw.items() if isinstance(raw, dict) else raw
+        for k, v in items:
             self.put(k, v)  # respects maxsize + LRU order
-        logger.info("EmbeddingCache: loaded %d entries from %s", len(data), path)
-        return len(data)
+        logger.info("EmbeddingCache: loaded %d entries from %s", len(self), path)
+        return len(self)
 
 
 @torch.no_grad()
@@ -670,8 +687,9 @@ def embed_texts(
             out = qwen(**enc, use_cache=False)
         last_layer = out.last_hidden_state  # (B, L, D)
         seq_lens = enc.attention_mask.sum(dim=1) - 1  # last non-padding token index
-        embs = last_layer[torch.arange(len(chunk), device=device), seq_lens]
+        embs = last_layer[torch.arange(len(chunk), device=device), seq_lens].detach()
         all_embs.append(embs)
+        del out, last_layer, enc  # free full hidden states immediately; don't wait for loop end
     return torch.cat(all_embs, dim=0)
 
 
@@ -820,6 +838,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", "-c", default="recipes-train/encoder-clip/config.yaml")
     parser.add_argument("--resume", default=None, help="Path to checkpoint.pt")
+    parser.add_argument(
+        "--reset-scheduler",
+        action="store_true",
+        help="Do not restore scheduler state on resume (resets LR to peak).",
+    )
     args = parser.parse_args()
 
     rank, local_rank, world_size = setup_ddp()
@@ -958,7 +981,7 @@ def main() -> None:
     if ckpt is not None:
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt:
+        if "scheduler" in ckpt and not args.reset_scheduler:
             scheduler.load_state_dict(ckpt["scheduler"])
         if is_iterable:
             train_ds._resume_examples = ckpt.get(
@@ -1193,6 +1216,8 @@ def main() -> None:
                     step=global_step,
                 )
             running = {"loss": 0.0, "grid": 0.0, "global": 0.0, "n": 0}
+            emb_cache.reset_stats()  # keep counters small
+            gc.collect()  # return pymalloc arenas to OS; helps with steady RSS growth
             t0 = time.time()
 
         if global_step % eval_steps_cfg == 0:

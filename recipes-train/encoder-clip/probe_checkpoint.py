@@ -56,21 +56,6 @@ _PIECE_CLASS = {
     (chess.BLACK, chess.KING): 12,
 }
 _CLASS_NAMES = ["empty", "wP", "wN", "wB", "wR", "wQ", "wK", "bP", "bN", "bB", "bR", "bQ", "bK"]
-_COLORS = [
-    "#aaaaaa",  # empty
-    "#ffe066",
-    "#ffd700",
-    "#ffb300",
-    "#ff8c00",
-    "#ff4500",
-    "#cc0000",  # white P N B R Q K
-    "#a8d8f0",
-    "#74b9ff",
-    "#0984e3",
-    "#636e72",
-    "#6c5ce7",
-    "#1a1a2e",  # black P N B R Q K
-]
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,7 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint.pt")
     parser.add_argument("--data", default="data/processed/encoder_pretrain_sf15_eval.jsonl")
     parser.add_argument("--n-positions", type=int, default=2000)
-    parser.add_argument("--out-dir", default="checkpoints/encoder-clip/probe")
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="Output directory for PNGs. Defaults to the checkpoint's parent folder.",
+    )
     return parser.parse_args()
 
 
@@ -139,6 +128,11 @@ def probe_linear(tokens: torch.Tensor, labels: torch.Tensor) -> None:
     linear = torch.nn.Linear(D, n_cls, bias=True)
     opt = torch.optim.SGD(linear.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
 
+    # Inverse-frequency class weights so minority piece types get equal gradient weight
+    counts = torch.bincount(y_train, minlength=n_cls).float()
+    class_weights = 1.0 / counts.clamp(min=1)
+    class_weights = class_weights / class_weights.sum() * n_cls  # normalize to mean=1
+
     batch = 4096
     for epoch in range(20):
         perm2 = torch.randperm(len(X_train))
@@ -146,7 +140,7 @@ def probe_linear(tokens: torch.Tensor, labels: torch.Tensor) -> None:
         for i in range(0, len(X_train), batch):
             idx = perm2[i : i + batch]
             logits = linear(X_train[idx])
-            loss = F.cross_entropy(logits, y_train[idx])
+            loss = F.cross_entropy(logits, y_train[idx], weight=class_weights)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -221,44 +215,78 @@ def probe_spatial_geometry(encoder: ChessEncoder, fens: list[str], out_dir: Path
 
 
 # ---------------------------------------------------------------------------
-# Probe 3: PCA clustering
+# Probe 3: Confusion matrix (text)
 # ---------------------------------------------------------------------------
 
 
-def probe_pca(tokens: torch.Tensor, labels: torch.Tensor, out_dir: Path) -> None:
-    """PCA (torch.pca_lowrank) to 2D, colored by piece type — saved as PNG."""
-    logger.info("Probe 3: PCA clustering (%d tokens)", len(tokens))
+def probe_confusion(tokens: torch.Tensor, labels: torch.Tensor, out_dir: Path) -> None:
+    """Confusion matrix heatmap — row-normalized so each row sums to 100%.
 
-    # Subsample to 20k max for speed
-    max_pts = 20000
-    if len(tokens) > max_pts:
-        idx = torch.randperm(len(tokens))[:max_pts]
-        tokens, labels = tokens[idx], labels[idx]
+    Diagonal = correct predictions (want high). Off-diagonal = confusions.
+    """
+    n = len(tokens)
+    split = int(n * 0.8)
+    perm = torch.randperm(n)
+    X_train, X_test = tokens[perm[:split]], tokens[perm[split:]]
+    y_train, y_test = labels[perm[:split]], labels[perm[split:]]
 
-    # Center before PCA
-    X = tokens - tokens.mean(dim=0, keepdim=True)
-    _, _, V = torch.pca_lowrank(X, q=2, niter=4)
-    emb = (X @ V).numpy()  # (N, 2)
-    labels_np = labels.numpy()
+    n_cls = 13
+    D = tokens.shape[1]
+    linear = torch.nn.Linear(D, n_cls, bias=True)
+    opt = torch.optim.SGD(linear.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    for cls_id, name in enumerate(_CLASS_NAMES):
-        mask = labels_np == cls_id
-        if mask.sum() == 0:
-            continue
-        ax.scatter(
-            emb[mask, 0], emb[mask, 1], c=_COLORS[cls_id], label=name, s=4, alpha=0.6, linewidths=0
-        )
+    counts = torch.bincount(y_train, minlength=n_cls).float()
+    class_weights = 1.0 / counts.clamp(min=1)
+    class_weights = class_weights / class_weights.sum() * n_cls
 
-    ax.legend(markerscale=4, loc="best", fontsize=8)
-    ax.set_title("PCA of encoder grid tokens, colored by piece type")
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
+    for _ in range(20):
+        perm2 = torch.randperm(len(X_train))
+        for i in range(0, len(X_train), 4096):
+            idx = perm2[i : i + 4096]
+            loss = F.cross_entropy(linear(X_train[idx]), y_train[idx], weight=class_weights)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
 
-    out_path = out_dir / "pca_clusters.png"
+    with torch.no_grad():
+        preds = linear(X_test).argmax(dim=1)
+
+    # Build row-normalized confusion matrix
+    conf = torch.zeros(n_cls, n_cls, dtype=torch.float)
+    for t, p in zip(y_test.tolist(), preds.tolist()):
+        conf[t, p] += 1
+    row_sums = conf.sum(dim=1, keepdim=True).clamp(min=1)
+    conf_pct = (conf / row_sums * 100).numpy()
+
+    present = [i for i in range(n_cls) if conf[i].sum() > 0]
+    names = [_CLASS_NAMES[i] for i in present]
+    mat = conf_pct[np.ix_(present, present)]
+
+    _, ax = plt.subplots(figsize=(9, 7))
+    im = ax.imshow(mat, vmin=0, vmax=100, cmap="Blues", aspect="equal")
+    plt.colorbar(im, ax=ax, label="%")
+
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=45, ha="right")
+    ax.set_yticks(range(len(names)))
+    ax.set_yticklabels(names)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Confusion matrix (row-normalized %)")
+
+    # Annotate cells with value if ≥ 1%
+    for i in range(len(present)):
+        for j in range(len(present)):
+            val = mat[i, j]
+            if val >= 1:
+                color = "white" if val > 60 else "black"
+                ax.text(j, i, f"{val:.0f}", ha="center", va="center", fontsize=7, color=color)
+
+    plt.tight_layout()
+    out_path = out_dir / "confusion_matrix.png"
     plt.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close()
-    print(f"\n=== Probe 3: PCA Clustering ===")
+    print(f"\n=== Probe 3: Confusion Matrix ===")
     print(f"Saved → {out_path}")
 
 
@@ -276,7 +304,7 @@ def main() -> None:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else checkpoint_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
     config = load_config(args.config)
@@ -297,9 +325,8 @@ def main() -> None:
 
     probe_linear(tokens, labels)
     probe_spatial_geometry(encoder, fens[:500], out_dir)
-    probe_pca(tokens, labels, out_dir)
-
-    print(f"\nAll outputs saved to {out_dir}/")
+    probe_confusion(tokens, labels, out_dir)
+    print(f"\nOutput saved to {out_dir}/")
 
 
 if __name__ == "__main__":

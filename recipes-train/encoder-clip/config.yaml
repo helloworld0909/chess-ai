@@ -26,7 +26,7 @@ clip:
   temperature_init: 0.07    # learnable; exp clamped to [0.01, 0.5]
   global_loss_weight: 1.0   # L = L_grid + L_global
   cross_rank_negatives: true  # gather contrastive negatives across DDP ranks
-  cache_maxsize: 2000000       # LRU embedding cache entries (~50GB CPU)
+  cache_maxsize: 4000000       # LRU embedding cache entries (~20GB CPU per rank, 40GB total)
 
 training:
   # Dataset must be .bin (map-style, O(1) FEN access) or .jsonl (streaming)
@@ -39,10 +39,10 @@ training:
   per_device_eval_batch_size: 1024
   dataloader_num_workers: 4
 
-  learning_rate: 1.0e-4
+  learning_rate: 3.0e-4
   weight_decay: 0.01
   warmup_steps: 50
-  max_steps: 20000          # ~40M positions at 2048 eff_batch
+  max_steps: 20000
   max_grad_norm: 1.0
 
   logging_steps: 10
