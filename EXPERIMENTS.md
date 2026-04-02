@@ -206,6 +206,63 @@ From 4 runs of `qwen3.5-4b-encoder-phase0-alignment`, all plateauing at 0.53–0
 - **Grad norm is a lagging indicator.** Grad norm 0.015–0.022 looked "healthy" but projector was receiving near-zero useful gradient. Loss plateau + tiny grad norm = bootstrap deadlock, not convergence.
 - **The LLaVA method requires a CLIP-pretrained encoder.** See "CLIP-style encoder alignment" section below for the architectural fix.
 
+### encoder-clip (active — step ~5700)
+
+**Goal**: CLIP-style contrastive alignment of the ResNet CNN encoder against frozen Qwen3.5-4B text embeddings. Replaces the failed MLP projector phase0.
+
+**Architecture**:
+- CNN: `ChessEncoder` (26M params, 19-ch, 10 blocks, 256 filters) → (65, 2560) tokens via linear projection. 64 grid tokens + 1 global token.
+- Text tower: Qwen3.5-4B frozen (bfloat16), last-layer last-token hidden state as anchor.
+- Loss: Symmetric InfoNCE. `L = L_grid + L_global` with `global_loss_weight=1.0`.
+  - `L_grid`: 64 independent 2048-way classifications (per square position across batch)
+  - `L_global`: 2048-way classification (whole-board summary token)
+- Effective batch: 2048 (2× RTX 5090, DDP, cross-rank negatives via `all_gather`)
+
+**Text labels** (generated on-the-fly from FEN):
+- Grid: piece type + color + sq_color + bishop color complex + is_pinned + x-ray attacker + attack/defense counts + pawn structure
+- Global: eval tier + top-3 SF15 term diffs + material imbalance + castling rights + en passant + check/checkmate/stalemate status
+
+**Hyperparameters**:
+- `lr=3e-4` (sqrt-scaled for B=2048 per CLIP literature), cosine schedule, warmup=50
+- `tau`: learnable log-temperature, exp clamped [0.01, 0.5]; currently ~0.034 at step 5700
+- `cache_maxsize=5M` (~25GB/rank) — embedding cache for Qwen anchor texts; FIFO eviction
+
+**Training runs**:
+
+| Steps | LR | Notes |
+|-------|----|-------|
+| 0→4500 | 1e-4 | Initial run; cache warming |
+| 4500→5100 | 3e-4 | Reset scheduler; global loss spike step 4570 (5.58→5.44), recovered |
+| 5100→5500 | 3e-4 | Memory fixes: CoW leak, cache save OOM, num_workers=0 |
+| 5500→ | 3e-4 | Top-1 logging added; cache 5M; checkmate/stalemate labels |
+
+**Probe results** (linear piece-identity, 2000 positions, random baseline=0.077):
+
+| Checkpoint | Overall | wP   | wN   | wB   | wR   | wQ   | wK   | bP   | bN   | bB   | bR   | bQ   | bK   |
+|------------|---------|------|------|------|------|------|------|------|------|------|------|------|------|
+| ckpt-4600  | 0.920   | 0.767| 0.918| 0.936| 0.796| 0.866| 0.896| 0.702| 0.902| 0.933| 0.673| 0.905| 0.844|
+| ckpt-5100  | 0.921   | 0.756| 0.886| 0.961| 0.794| 0.919| 0.859| 0.720| 0.895| 0.964| 0.711| 0.859| 0.963|
+| ckpt-5300  | 0.919   | 0.748| 0.916| 0.957| 0.811| 0.932| 0.904| 0.716| 0.837| 0.912| 0.769| 0.783| 0.839|
+
+**Retrieval metrics** (tau-agnostic Top-1, 2048-way, random baseline=0.049%):
+
+| Step  | Top-1 Grid | Top-1 Global |
+|-------|------------|--------------|
+| 5510  | 0.361      | 0.264        |
+| 5700  | 0.367      | 0.283        |
+
+Grid ~730× above random — genuine alignment confirmed, not tau-cheating.
+
+**Key engineering lessons**:
+- Cache save OOM: `dict(self._cache)` snapshot doubled 20GB RAM → fixed with `list(items())` + `join()`
+- `embed_texts()`: must `del out, last_layer, enc` after each batch to free Qwen hidden states
+- `OrderedDict.move_to_end()` on cache hit breaks Linux CoW → +335MB/min RAM growth → fixed by removing it (FIFO eviction)
+- DataLoader workers with `persistent_workers=True`: each forked worker inherits full RSS (~29GB) → fixed with `num_workers=0`
+
+**Status**: Active — step ~5700/20000, loss=8.04, top1_grid=0.367, top1_global=0.283
+
+---
+
 ### CLIP-style chess encoder alignment (planned — next iteration)
 
 **Why LLaVA works and our approach fails:**
