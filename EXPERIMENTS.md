@@ -7,10 +7,10 @@ Documents completed and abandoned training experiments.
 ## Active Training Pipeline
 
 ```
-encoder-pretrain (v2, 656M positions)
+encoder-pretrain (v2, 656M positions) ✅ complete → checkpoint-310000
         ↓
-[CLIP-style alignment]   ← NEW: retrain CNN with contrastive loss against LLM text embeddings
-        ↓                         (replaces failed MLP projector phase0 — see architecture notes)
+encoder-clip (CLIP alignment, InfoNCE)  ← ACTIVE (step ~5710/20000)
+        ↓
 qwen3.5-4b-encoder-pretrain-textbook  (textbook causal LM, encoder frozen, LoRA on LLM)
         ↓
 qwen3.5-4b-encoder-phase1-sft         (board-reading Q&A + joint task)
@@ -133,7 +133,7 @@ Our CNN encoder was pretrained on SF15 regression terms + piece classification (
 - **Base model**: phase1-sft checkpoint-890
 - **Data**: `grpo_joint_prompts_sf15.jsonl` (14,950 Lichess positions with SF15 term annotations)
 - **Rewards**: R0 format, R1 legality, R3b SF15 annotation, RC_tone, RC_educ
-- **Status**: Blocked on phase0 alignment + revised phase1-sft completing
+- **Status**: Blocked — waiting for encoder-clip training to complete, then retrain phase1-sft with aligned encoder weights
 
 ---
 
@@ -263,7 +263,7 @@ Grid ~730× above random — genuine alignment confirmed, not tau-cheating.
 
 ---
 
-### CLIP-style chess encoder alignment (planned — next iteration)
+### CLIP-style chess encoder alignment (implemented — see encoder-clip section above)
 
 **Why LLaVA works and our approach fails:**
 
