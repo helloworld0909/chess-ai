@@ -1,5 +1,15 @@
 # Chess-CLIP Encoder Alignment — Experiment Log
 
+> **Keep this file up to date.** Record every significant change: label updates, hyperparameter changes, new probe results, architecture decisions, and bugs found/fixed. This is the single source of truth for what was tried and why.
+>
+> **Probe command** (CPU-only, GPU left for training):
+> ```bash
+> CUDA_VISIBLE_DEVICES="" uv run python recipes-train/encoder-clip/probe_checkpoint.py \
+>   --checkpoint checkpoints/encoder-clip/checkpoint-NNNN/checkpoint.pt \
+>   --data data/processed/encoder_pretrain_sf15_eval.jsonl \
+>   --n-positions 2000
+> ```
+
 ## Architecture
 
 - **Encoder**: ResNet CNN (26M params) — 19-channel board tensor → (65, 2560) tokens

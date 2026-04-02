@@ -103,25 +103,6 @@ STOCKFISH_PATH=/home/zheng/.local/bin/stockfish ENCODER_SERVER_URL=http://localh
 ./scripts/start-review.sh MiracleRoguee
 ```
 
-## Encoder-CLIP Training
-
-Active recipe: `recipes-train/encoder-clip/`
-
-- **Experiment log**: `recipes-train/encoder-clip/experiments.md` — update this file when making significant changes to labels, hyperparameters, architecture, or when recording new probe results.
-- **Probe script**: `recipes-train/encoder-clip/probe_checkpoint.py` — runs 4 probes (linear piece-identity, spatial geometry, confusion matrix, retrieval metrics)
-- **Log**: `/tmp/encoder-clip.log`
-
-```bash
-# Resume training
-./recipes-train/encoder-clip/start.sh --resume checkpoints/encoder-clip/checkpoint-NNNN/checkpoint.pt
-
-# Probe a checkpoint (CPU-only, GPU left for training)
-CUDA_VISIBLE_DEVICES="" uv run python recipes-train/encoder-clip/probe_checkpoint.py \
-  --checkpoint checkpoints/encoder-clip/checkpoint-NNNN/checkpoint.pt \
-  --data data/processed/encoder_pretrain_sf15_eval.jsonl \
-  --n-positions 2000
-```
-
 ## Training Scripts
 
 ```bash
