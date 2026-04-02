@@ -30,7 +30,6 @@ Usage (single GPU):
 from __future__ import annotations
 
 import argparse
-import gc
 import itertools
 import json
 import logging
@@ -295,8 +294,12 @@ def build_global_description(sf15_terms: list[float], eval_score: float, board: 
     parts = [f"{header}.", material + ".", castling + ".", eval_part]
     if ep:
         parts.insert(2, ep + ".")
-    if board.is_check():
+    if board.is_checkmate():
+        parts.insert(1, "Checkmate!")
+    elif board.is_check():
         parts.insert(1, "King is in check!")
+    elif board.is_stalemate():
+        parts.insert(1, "Stalemate!")
     return " ".join(parts)
 
 
@@ -589,20 +592,18 @@ class EmbeddingCache:
         self._save_thread: threading.Thread | None = None
 
     def get(self, key: str) -> torch.Tensor | None:
-        if key in self._cache:
-            self._cache.move_to_end(key)
+        val = self._cache.get(key)
+        if val is not None:
             self.hits += 1
-            return self._cache[key]
+            return val
         self.misses += 1
         return None
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        else:
+        if key not in self._cache:
             if len(self._cache) >= self._maxsize:
                 self._cache.popitem(last=False)
-        self._cache[key] = value.to(dtype=self._dtype, device="cpu")
+            self._cache[key] = value.to(dtype=self._dtype, device="cpu")
 
     @property
     def hit_rate(self) -> float:
@@ -1217,7 +1218,6 @@ def main() -> None:
                 )
             running = {"loss": 0.0, "grid": 0.0, "global": 0.0, "n": 0}
             emb_cache.reset_stats()  # keep counters small
-            gc.collect()  # return pymalloc arenas to OS; helps with steady RSS growth
             t0 = time.time()
 
         if global_step % eval_steps_cfg == 0:
