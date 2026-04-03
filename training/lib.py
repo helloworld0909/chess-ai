@@ -95,6 +95,7 @@ def make_training_args(config: dict):
         gradient_checkpointing_kwargs={"use_reentrant": False},
         seed=train_cfg.get("seed", 42),
         dataloader_num_workers=train_cfg.get("dataloader_num_workers", 4),
+        accelerator_config={"dispatch_batches": train_cfg.get("dispatch_batches", None)},
         report_to="wandb" if wandb_cfg.get("enabled") else "none",
         use_liger_kernel=train_cfg.get("use_liger_kernel", True),
         ddp_find_unused_parameters=train_cfg.get("ddp_find_unused_parameters", False),

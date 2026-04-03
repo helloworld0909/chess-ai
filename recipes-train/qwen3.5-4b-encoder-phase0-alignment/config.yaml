@@ -59,6 +59,7 @@ training:
   bf16: true
   dataloader_num_workers: 8
   ddp_find_unused_parameters: false
+  dispatch_batches: false  # each GPU fetches its own batch from sharded IterableDataset
 
   logging_steps: 10
   eval_strategy: steps

@@ -282,9 +282,47 @@ def main() -> None:
             "line_sans_json": "[]",
         }
 
+    import itertools
     import json
 
     from datasets import Dataset
+
+    class AlignmentJsonlDataset(torch.utils.data.IterableDataset):
+        """Streaming JSONL dataset with manual DDP + DataLoader worker sharding.
+
+        Each DDP rank × DataLoader worker reads its own stride of lines, so no
+        dispatch_batches coordination is needed. _fmt is applied lazily per record.
+        Mirrors the ChessClipJsonlDataset pattern from encoder-clip/train.py.
+        """
+
+        def __init__(self, path: str, limit: int = 0) -> None:
+            self.path = path
+            self.limit = limit
+            self._rank = 0
+            self._world_size = 1
+
+        def __iter__(self):
+            worker_info = torch.utils.data.get_worker_info()
+            worker_id = worker_info.id if worker_info else 0
+            num_workers = worker_info.num_workers if worker_info else 1
+
+            global_stride = num_workers * self._world_size
+            my_slot = self._rank * num_workers + worker_id
+
+            emitted = 0
+            with open(self.path, "rb") as f:
+                for raw in itertools.islice(f, my_slot, None, global_stride):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        example = json.loads(raw)
+                        yield _fmt(example)
+                        emitted += 1
+                        if self.limit and emitted * global_stride >= self.limit:
+                            break
+                    except Exception:
+                        continue
 
     def _load_jsonl(path: str, limit: int | None = None) -> list[dict]:
         records = []
@@ -301,20 +339,49 @@ def main() -> None:
         _logger.info("Loaded %d records from %s", len(records), path)
         return records
 
-    raw_train = _load_jsonl(train_cfg["train_file"], limit=100 if args.dry_run else None)
-    raw_eval = _load_jsonl(train_cfg["eval_file"], limit=20 if args.dry_run else 2000)
-
     num_workers = train_cfg.get("dataloader_num_workers", 4)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if args.dry_run:
+        remove_cols = ["messages", "metadata"]
+        raw_train = _load_jsonl(train_cfg["train_file"], limit=100)
+        train_dataset = Dataset.from_list(raw_train).map(
+            _fmt, num_proc=1, remove_columns=remove_cols
+        )
+    else:
+        train_dataset = AlignmentJsonlDataset(
+            train_cfg["train_file"],
+            limit=100 if args.dry_run else 0,
+        )
+        train_dataset._rank = local_rank
+        train_dataset._world_size = world_size
+
+        # Trainer requires max_steps for IterableDataset (no __len__).
+        train_size = sum(1 for line in open(train_cfg["train_file"]) if line.strip())
+        effective_batch = (
+            train_cfg.get("per_device_train_batch_size", 8)
+            * world_size
+            * train_cfg.get("gradient_accumulation_steps", 8)
+        )
+        epochs = train_cfg.get("num_train_epochs", 1)
+        _logger.info(
+            "Streaming dataset: %d examples, effective_batch=%d → max_steps=%d",
+            train_size,
+            effective_batch,
+            train_size * epochs // effective_batch,
+        )
+
+    raw_eval = _load_jsonl(train_cfg["eval_file"], limit=20 if args.dry_run else 2000)
     remove_cols = ["messages", "metadata"]
-    train_dataset = Dataset.from_list(raw_train).map(
-        _fmt, num_proc=num_workers, remove_columns=remove_cols
-    )
     eval_dataset = Dataset.from_list(raw_eval).map(
-        _fmt, num_proc=num_workers, remove_columns=remove_cols
+        _fmt, num_proc=min(num_workers, 4), remove_columns=remove_cols
     )
 
     training_args = make_training_args(config)
     training_args.remove_unused_columns = False
+    if not args.dry_run:
+        training_args.max_steps = train_size * epochs // effective_batch
 
     # EncoderDataCollator already builds board_tensors_flat from the fen field correctly.
     # A subclass that calls super() then re-reads feat["fen"] is wrong — super() pops
