@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing
 import random
 import sys
 from pathlib import Path
@@ -644,6 +645,14 @@ def _collect_rare_fens(
     return fens
 
 
+def _worker(args: tuple) -> list[dict]:
+    """Top-level function for multiprocessing (must be picklable)."""
+    fen, seed, tasks_per_fen, sf15_terms, eval_score = args
+    return generate_for_fen(
+        fen, random.Random(seed), tasks_per_fen, sf15_terms=sf15_terms, eval_score=eval_score
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -669,6 +678,12 @@ def main() -> None:
         help="Max unique FENs to sample (default 1M → ~1M records at 1 task/FEN)",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=multiprocessing.cpu_count(),
+        help="Parallel workers for FEN processing (default: all CPUs)",
+    )
     parser.add_argument(
         "--from-end",
         action="store_true",
@@ -739,19 +754,23 @@ def main() -> None:
         task_counts: dict[str, int] = {name: 0 for name, _ in _TASKS}
         records_by_task: dict[str, list[dict]] = {name: [] for name, _ in _TASKS}
 
-        # Main pass: all tasks from the regular FEN pool
-        for fen in fen_list:
-            sf15 = sf15_by_fen.get(fen, {})
-            for rec in generate_for_fen(
+        # Main pass: parallel FEN processing
+        worker_args = [
+            (
                 fen,
-                rng,
+                rng.randint(0, 2**32),
                 args.tasks_per_fen,
-                sf15_terms=sf15.get("sf15_terms"),
-                eval_score=sf15.get("eval_score"),
-            ):
-                t = rec["metadata"]["task"]
-                records_by_task[t].append(rec)
-                task_counts[t] += 1
+                sf15_by_fen.get(fen, {}).get("sf15_terms"),
+                sf15_by_fen.get(fen, {}).get("eval_score"),
+            )
+            for fen in fen_list
+        ]
+        with multiprocessing.Pool(processes=args.workers) as pool:
+            for records in pool.imap_unordered(_worker, worker_args, chunksize=2000):
+                for rec in records:
+                    t = rec["metadata"]["task"]
+                    records_by_task[t].append(rec)
+                    task_counts[t] += 1
 
         # Rare task pass: generate from dedicated rare FEN pools (positives guaranteed)
         # Then trim "none" answers so they are at most MAX_NONE_RATIO of total.
