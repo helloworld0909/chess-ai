@@ -1,9 +1,10 @@
 """Generate board-description alignment data from FENs.
 
 LLaVA-style alignment: simple, direct board reading tasks with no reasoning.
-Each sample: user = <64 sentinels> + short question, assistant = short factual answer.
+Each sample: user = <65 sentinels> + short question, assistant = short factual answer.
 
 Task types (diverse descriptions of the same board):
+  Grid token tasks (probe per-square CNN tokens):
   1.  piece_abbr_at        — "What piece abbreviation is on e4?" → "P" / "empty"
   2.  piece_name_at        — "What piece is on e4?" → "white pawn" / "empty"
   3.  side_to_move         — "Which side is to move?" → "white" / "black"
@@ -18,6 +19,13 @@ Task types (diverse descriptions of the same board):
   12. count_total_material — "How many pieces does Black have in total?" → "14"
   13. find_piece_type      — "List all squares occupied by white knights." → "b1, g1" / "none"
   14. is_square_occupied   — "Is there a piece on e4?" → "yes" / "no"  (strict 50/50)
+
+  Global token tasks (probe the 65th summary CNN token, aligned with CLIP anchor text):
+  15. is_check             — "Is the king in check?" → "yes" / "no"
+  16. material_balance     — "What is the material balance?" → "+3" / "0" / "-5" (white minus black)
+  17. who_is_better        — "Which side has the material advantage?" → "white" / "black" / "equal"
+  18. eval_tier            — "How would you assess this position?" → "White has a clear advantage" (requires SF15)
+  19. sf15_dominant        — "Which factor most favours one side?" → "Mobility favours white" (requires SF15)
 
 Output JSONL fields:
   {"messages": [...], "metadata": {"fen": ..., "task": ...}}
@@ -66,7 +74,7 @@ def _sq(sq: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _task_piece_abbr_at(board: chess.Board, rng: random.Random) -> tuple[str, str] | None:
+def _task_piece_abbr_at(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
     occupied = [s for s in chess.SQUARES if board.piece_at(s) is not None]
     empty = [s for s in chess.SQUARES if board.piece_at(s) is None]
     if occupied and rng.random() < 0.7:
@@ -87,7 +95,7 @@ def _task_piece_abbr_at(board: chess.Board, rng: random.Random) -> tuple[str, st
     return rng.choice(q_variants), abbr
 
 
-def _task_piece_name_at(board: chess.Board, rng: random.Random) -> tuple[str, str] | None:
+def _task_piece_name_at(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
     occupied = [s for s in chess.SQUARES if board.piece_at(s) is not None]
     empty = [s for s in chess.SQUARES if board.piece_at(s) is None]
     if occupied and rng.random() < 0.7:
@@ -110,7 +118,7 @@ def _task_piece_name_at(board: chess.Board, rng: random.Random) -> tuple[str, st
     return rng.choice(q_variants), answer
 
 
-def _task_side_to_move(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_side_to_move(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     answer = "white" if board.turn == chess.WHITE else "black"
     q_variants = [
         "Which side is to move?",
@@ -121,7 +129,7 @@ def _task_side_to_move(board: chess.Board, rng: random.Random) -> tuple[str, str
     return rng.choice(q_variants), answer
 
 
-def _task_piece_list_abbr(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_piece_list_abbr(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     parts = []
     for sq in chess.SQUARES:  # rank 1→8, matching CNN output order
         piece = board.piece_at(sq)
@@ -139,7 +147,7 @@ def _task_piece_list_abbr(board: chess.Board, rng: random.Random) -> tuple[str, 
     return rng.choice(q_variants), answer
 
 
-def _task_piece_list_full(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_piece_list_full(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     white_parts, black_parts = [], []
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
@@ -164,7 +172,7 @@ def _task_piece_list_full(board: chess.Board, rng: random.Random) -> tuple[str, 
     return rng.choice(q_variants), answer
 
 
-def _task_rank_contents(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_rank_contents(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     rank = rng.randint(0, 7)
     rank_name = str(rank + 1)
     parts = []
@@ -185,7 +193,7 @@ def _task_rank_contents(board: chess.Board, rng: random.Random) -> tuple[str, st
     return rng.choice(q_variants), answer
 
 
-def _task_file_contents(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_file_contents(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     file = rng.randint(0, 7)
     file_name = chess.FILE_NAMES[file]
     parts = []
@@ -206,7 +214,7 @@ def _task_file_contents(board: chess.Board, rng: random.Random) -> tuple[str, st
     return rng.choice(q_variants), answer
 
 
-def _task_castling_rights(board: chess.Board, rng: random.Random) -> tuple[str, str] | None:
+def _task_castling_rights(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
     parts = []
     if board.has_kingside_castling_rights(chess.WHITE):
         parts.append("White O-O")
@@ -228,7 +236,7 @@ def _task_castling_rights(board: chess.Board, rng: random.Random) -> tuple[str, 
     return rng.choice(q_variants), answer
 
 
-def _task_en_passant(board: chess.Board, rng: random.Random) -> tuple[str, str] | None:
+def _task_en_passant(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
     # En passant is available <1% of random positions — skip 50% of "none" cases
     # so the model sees roughly equal yes/no examples and can't cheat by always
     # outputting "none".
@@ -244,7 +252,7 @@ def _task_en_passant(board: chess.Board, rng: random.Random) -> tuple[str, str] 
     return rng.choice(q_variants), answer
 
 
-def _task_move_number(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_move_number(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     answer = str(board.fullmove_number)
     q_variants = [
         "What is the current full move number?",
@@ -254,7 +262,7 @@ def _task_move_number(board: chess.Board, rng: random.Random) -> tuple[str, str]
     return rng.choice(q_variants), answer
 
 
-def _task_count_piece_type(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_count_piece_type(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     color = rng.choice([chess.WHITE, chess.BLACK])
     piece_type = rng.choice([chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN])
     count = len(board.pieces(piece_type, color))
@@ -267,7 +275,7 @@ def _task_count_piece_type(board: chess.Board, rng: random.Random) -> tuple[str,
     return rng.choice(q_variants), str(count)
 
 
-def _task_count_total_material(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_count_total_material(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     color = rng.choice([chess.WHITE, chess.BLACK])
     count = len(
         board.pieces(chess.PAWN, color)
@@ -287,7 +295,7 @@ def _task_count_total_material(board: chess.Board, rng: random.Random) -> tuple[
     return rng.choice(q_variants), answer
 
 
-def _task_find_piece_type(board: chess.Board, rng: random.Random) -> tuple[str, str]:
+def _task_find_piece_type(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     color = rng.choice([chess.WHITE, chess.BLACK])
     piece_type = rng.choice(
         [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
@@ -303,7 +311,7 @@ def _task_find_piece_type(board: chess.Board, rng: random.Random) -> tuple[str, 
     return rng.choice(q_variants), answer
 
 
-def _task_is_square_occupied(board: chess.Board, rng: random.Random) -> tuple[str, str] | None:
+def _task_is_square_occupied(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
     occupied_squares = list(board.piece_map().keys())
     empty_squares = [sq for sq in chess.SQUARES if sq not in occupied_squares]
     # Strict 50/50 to prevent model from learning to always guess yes/no
@@ -318,6 +326,161 @@ def _task_is_square_occupied(board: chess.Board, rng: random.Random) -> tuple[st
     q_variants = [
         f"Is square {_sq(sq)} occupied by any piece?",
         f"Is there a piece on {_sq(sq)}?",
+    ]
+    return rng.choice(q_variants), answer
+
+
+# ---------------------------------------------------------------------------
+# Global token tasks — probe the 65th summary CNN token
+#
+# The global token is CLIP-trained against text encoding:
+#   - Eval tier (7 levels from SF15 eval_score)
+#   - Top-3 SF15 term imbalances (Material, Pawns, Mobility, King safety, etc.)
+#   - Board state: side to move, check, castling, en passant, material summary
+#
+# Tasks here ask about exactly that information.
+# SF15-dependent tasks (eval_tier, sf15_dominant) take optional sf15_terms/eval_score;
+# they are skipped (return None) when not available.
+# ---------------------------------------------------------------------------
+
+_PIECE_VALUES = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+    chess.KING: 0,
+}
+
+_SF15_TERMS = [
+    "Material",
+    "Imbalance",
+    "Pawns",
+    "Knights",
+    "Bishops",
+    "Rooks",
+    "Queens",
+    "Mobility",
+    "King safety",
+    "Threats",
+    "Passed",
+    "Space",
+    "Winnable",
+]
+
+_EVAL_TIERS = [
+    (-1e9, -2.5, "Black is winning decisively"),
+    (-2.5, -1.0, "Black has a clear advantage"),
+    (-1.0, -0.3, "Black has a slight advantage"),
+    (-0.3, +0.3, "approximately equal"),
+    (+0.3, +1.0, "White has a slight advantage"),
+    (+1.0, +2.5, "White has a clear advantage"),
+    (+2.5, +1e9, "White is winning decisively"),
+]
+
+
+def _eval_tier(eval_score: float) -> str:
+    for lo, hi, label in _EVAL_TIERS:
+        if lo <= eval_score < hi:
+            return label
+    return _EVAL_TIERS[-1][2]
+
+
+def _task_is_check(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
+    in_check = board.is_check()
+    # Checks are rare (~5% of positions) — skip 50% of non-check cases
+    if not in_check and rng.random() < 0.5:
+        return None
+    answer = "yes" if in_check else "no"
+    q_variants = [
+        "Is the king in check?",
+        "Is the side to move currently in check?",
+        "Is there a check on the board?",
+    ]
+    return rng.choice(q_variants), answer
+
+
+def _task_material_balance(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
+    white_mat = sum(
+        _PIECE_VALUES[pt] * len(board.pieces(pt, chess.WHITE))
+        for pt in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+    )
+    black_mat = sum(
+        _PIECE_VALUES[pt] * len(board.pieces(pt, chess.BLACK))
+        for pt in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+    )
+    balance = white_mat - black_mat
+    answer = f"+{balance}" if balance > 0 else str(balance)
+    q_variants = [
+        "What is the material balance? Give the score as white minus black (e.g. +3, 0, -5). Pawns=1, knights/bishops=3, rooks=5, queens=9.",
+        "Calculate the material balance (white minus black). Pawns=1, minor pieces=3, rooks=5, queens=9.",
+        "What is the material difference? Positive means white is ahead. Pawns=1, knights/bishops=3, rooks=5, queens=9.",
+    ]
+    return rng.choice(q_variants), answer
+
+
+def _task_who_is_better(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
+    """Which side has the material advantage? → "white" / "black" / "equal".
+
+    Balanced ~1/3 each: equal positions are ~40% of random games, so skip
+    some to prevent the model from learning to guess "equal" by default.
+    """
+    white_mat = sum(
+        _PIECE_VALUES[pt] * len(board.pieces(pt, chess.WHITE))
+        for pt in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+    )
+    black_mat = sum(
+        _PIECE_VALUES[pt] * len(board.pieces(pt, chess.BLACK))
+        for pt in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+    )
+    diff = white_mat - black_mat
+    if diff > 0:
+        answer = "white"
+    elif diff < 0:
+        answer = "black"
+    else:
+        if rng.random() < 0.5:
+            return None
+        answer = "equal"
+    q_variants = [
+        "Which side has the material advantage?",
+        "Who has more material on the board?",
+        "Which side is ahead in material?",
+    ]
+    return rng.choice(q_variants), answer
+
+
+def _task_eval_tier(
+    board: chess.Board, rng: random.Random, eval_score: float | None = None, **_
+) -> tuple[str, str] | None:
+    """Overall position assessment from SF15 eval_score → 7-tier label."""
+    if eval_score is None:
+        return None
+    answer = _eval_tier(eval_score)
+    q_variants = [
+        "How would you assess this position overall?",
+        "What is the overall evaluation of this position?",
+        "Assess the position: who stands better and by how much?",
+    ]
+    return rng.choice(q_variants), answer
+
+
+def _task_sf15_dominant(
+    board: chess.Board, rng: random.Random, sf15_terms: list[float] | None = None, **_
+) -> tuple[str, str] | None:
+    """Which SF15 factor most favours one side? → e.g. "Mobility favours white"."""
+    if sf15_terms is None:
+        return None
+    ranked = sorted(zip(_SF15_TERMS, sf15_terms), key=lambda x: abs(x[1]), reverse=True)
+    name, val = ranked[0]
+    if abs(val) < 0.1:
+        return None  # no significant imbalance
+    side = "white" if val > 0 else "black"
+    answer = f"{name} favours {side}"
+    q_variants = [
+        "Which positional factor most favours one side?",
+        "What is the dominant positional imbalance in this position?",
+        "Which factor gives one side the biggest advantage?",
     ]
     return rng.choice(q_variants), answer
 
@@ -337,13 +500,26 @@ _TASKS = [
     ("count_total_material", _task_count_total_material),
     ("find_piece_type", _task_find_piece_type),
     ("is_square_occupied", _task_is_square_occupied),
+    # Global token tasks (FEN-only)
+    ("is_check", _task_is_check),
+    ("material_balance", _task_material_balance),
+    ("who_is_better", _task_who_is_better),
+    # Global token tasks (require SF15 data — skipped when not provided)
+    ("eval_tier", _task_eval_tier),
+    ("sf15_dominant", _task_sf15_dominant),
 ]
 
 # Tasks that need a top-up pass because their positive examples are rare in random positions.
-_RARE_TASKS = {"castling_rights", "en_passant"}
+_RARE_TASKS = {"castling_rights", "en_passant", "is_check"}
 
 
-def generate_for_fen(fen: str, rng: random.Random, tasks_per_fen: int = 10) -> list[dict]:
+def generate_for_fen(
+    fen: str,
+    rng: random.Random,
+    tasks_per_fen: int = 10,
+    sf15_terms: list[float] | None = None,
+    eval_score: float | None = None,
+) -> list[dict]:
     try:
         board = chess.Board(fen)
     except Exception:
@@ -354,7 +530,7 @@ def generate_for_fen(fen: str, rng: random.Random, tasks_per_fen: int = 10) -> l
     rng.shuffle(task_pool)
 
     for task_name, task_fn in task_pool[:tasks_per_fen]:
-        result = task_fn(board, rng)
+        result = task_fn(board, rng, sf15_terms=sf15_terms, eval_score=eval_score)
         if result is None:
             continue
         question, answer = result
@@ -370,21 +546,26 @@ def generate_for_fen(fen: str, rng: random.Random, tasks_per_fen: int = 10) -> l
     return records
 
 
-def _collect_fens(source: str, max_fens: int | None = None, from_end: bool = False) -> list[str]:
-    """Extract unique FENs from a JSONL source file.
+def _collect_fens(
+    source: str, max_fens: int | None = None, from_end: bool = False
+) -> tuple[list[str], dict[str, dict]]:
+    """Extract unique FENs (and optional SF15 data) from a JSONL source file.
 
     Supports two formats:
       - grpo/board-reading format: {"metadata": {"fen": ...}, ...}
-      - encoder pretrain format:   {"fen": ..., "move_uci": ..., ...}
+      - encoder pretrain format:   {"fen": ..., "sf15_terms": [...], "eval_score": float}
+
+    Returns:
+        (fens, sf15_by_fen) where sf15_by_fen maps fen → {"sf15_terms": [...], "eval_score": float}
+        sf15_by_fen is empty if the source does not contain SF15 data.
 
     Args:
         from_end: If True, read from the end of the file (tail) rather than
                   the beginning. Useful for sourcing positions the encoder has
                   never seen (encoder pretrain reads from the start).
-                  Reads a 2× oversampling window via seek to avoid loading the
-                  entire file into memory.
     """
     fens: list[str] = []
+    sf15_by_fen: dict[str, dict] = {}
     seen: set[str] = set()
 
     if from_end and max_fens:
@@ -414,6 +595,11 @@ def _collect_fens(source: str, max_fens: int | None = None, from_end: bool = Fal
                 if fen and fen not in seen:
                     seen.add(fen)
                     fens.append(fen)
+                    if "sf15_terms" in rec and "eval_score" in rec:
+                        sf15_by_fen[fen] = {
+                            "sf15_terms": rec["sf15_terms"],
+                            "eval_score": rec["eval_score"],
+                        }
             except Exception:
                 pass
             if max_fens and len(fens) >= max_fens:
@@ -421,7 +607,7 @@ def _collect_fens(source: str, max_fens: int | None = None, from_end: bool = Fal
     finally:
         if not from_end:
             lines_iter.close()  # type: ignore[union-attr]
-    return fens
+    return fens, sf15_by_fen
 
 
 def _collect_rare_fens(
@@ -502,12 +688,13 @@ def main() -> None:
     rng = random.Random(args.seed)
 
     # Collect unique FENs from source (tail = unseen by encoder)
-    fens = _collect_fens(args.source, max_fens=args.max_fens, from_end=args.from_end)
+    fens, sf15_by_fen = _collect_fens(args.source, max_fens=args.max_fens, from_end=args.from_end)
     _logger.info(
-        "Unique FENs collected: %d (max_fens=%s, from_end=%s)",
+        "Unique FENs collected: %d (max_fens=%s, from_end=%s, sf15_coverage=%d)",
         len(fens),
         args.max_fens,
         args.from_end,
+        len(sf15_by_fen),
     )
 
     # Collect extra FENs from full dataset for rare board states.
@@ -530,11 +717,19 @@ def main() -> None:
         max_fens=RARE_TARGET_POSITIVES,
         exclude=fens_set | set(ep_fens),
     )
+    _logger.info("Scanning full dataset for is_check FENs (target=%d)...", RARE_TARGET_POSITIVES)
+    check_fens = _collect_rare_fens(
+        args.source,
+        predicate=lambda b: b.is_check(),
+        max_fens=RARE_TARGET_POSITIVES,
+        exclude=fens_set | set(ep_fens) | set(castling_fens),
+    )
 
     # Rare FENs are kept separate — only used for their respective tasks
     rare_fens_by_task = {
         "en_passant": ep_fens,
         "castling_rights": castling_fens,
+        "is_check": check_fens,
     }
 
     rng.shuffle(fens)
@@ -548,7 +743,14 @@ def main() -> None:
 
         # Main pass: all tasks from the regular FEN pool
         for fen in fen_list:
-            for rec in generate_for_fen(fen, rng, args.tasks_per_fen):
+            sf15 = sf15_by_fen.get(fen, {})
+            for rec in generate_for_fen(
+                fen,
+                rng,
+                args.tasks_per_fen,
+                sf15_terms=sf15.get("sf15_terms"),
+                eval_score=sf15.get("eval_score"),
+            ):
                 t = rec["metadata"]["task"]
                 records_by_task[t].append(rec)
                 task_counts[t] += 1
@@ -566,7 +768,13 @@ def main() -> None:
                     board = chess.Board(fen)
                 except Exception:
                     continue
-                result = fn(board, topup_rng)
+                sf15 = sf15_by_fen.get(fen, {})
+                result = fn(
+                    board,
+                    topup_rng,
+                    sf15_terms=sf15.get("sf15_terms"),
+                    eval_score=sf15.get("eval_score"),
+                )
                 if result is None:
                     continue
                 question, answer = result

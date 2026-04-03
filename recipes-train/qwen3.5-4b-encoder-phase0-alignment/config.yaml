@@ -1,13 +1,13 @@
-# Qwen3.5-4B + ChessEncoder — Phase 0: Alignment (projector + LoRA, run 4)
+# Qwen3.5-4B + ChessEncoder — Phase 0: Alignment (projector + LoRA)
 #
-# Goal:   Align cnn.proj into LLM embedding space with LoRA at 200× lower LR.
-#         Projector (1e-3) moves fast; LoRA (5e-6) too slow to exploit text escape hatch.
-#         LayerNorm at projector output stabilizes training.
+# Goal:   Align cnn.proj + cnn.global_proj into LLM embedding space.
+#         CNN trunk from encoder-clip (CLIP-trained, semantically aligned to Qwen).
+#         Flat 65-token sentinel block — no square-label text anchors.
 #
 # Frozen: CNN trunk + LLM base weights
-# Trained: cnn.proj (~7M) + LoRA r=64 (~85M, but at 5e-6 LR)
+# Trained: cnn.proj + cnn.global_proj (~14M) + LoRA r=64 (~85M, at 5e-6 LR)
 #
-# Prompt: system prompt + board sentinels + question (position randomized 50/50)
+# Prompt: system prompt + 65 sentinel tokens + question (position randomized 50/50)
 # Data:   LLaVA-style board description — 897k FENs × 14 tasks
 # DDP:    2× RTX 5090  |  effective batch = 256 (4 × 2 GPUs × 32 accum)
 
@@ -19,7 +19,7 @@ encoder:
   in_channels: 19
   hidden_size: 256
   num_blocks: 10
-  pretrained_weights: "checkpoints/encoder-pretrain/checkpoint-310000/encoder_weights.pt"
+  pretrained_weights: "checkpoints/encoder-clip/checkpoint-9000/encoder_weights.pt"
 
 lora:
   r: 64
@@ -33,28 +33,29 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
+    - lm_head
   bias: none
 
 training:
   train_file: data/processed/alignment_board_description.jsonl
   eval_file:  data/processed/alignment_board_description_eval.jsonl
-  max_seq_length: 512  # with system prompt: p99=459, max=467 — no truncation
+  max_seq_length: 320  # flat 65 sentinels: p99=287, max=295 (anchored board was p99=459)
 
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 32  # effective batch = 256 (4 × 2 GPUs × 32 accum)
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 8  # effective batch = 128 (8 × 2 GPUs × 8 accum)
 
-  learning_rate: 1.0e-3        # projector LR — aggressive, random init
-  lora_learning_rate: 5.0e-6  # LoRA LR — 200× slower, can't exploit text escape hatch
+  learning_rate: 1.0e-4        # proj/global_proj LR — pretrained from CLIP, fine-tuning rate
+  lora_learning_rate: 5.0e-5  # LoRA LR — includes lm_head, needs strong signal for alignment
   lr_scheduler_type: cosine
-  warmup_steps: 100
+  warmup_steps: 500            # extended warmup for stable ramp with lm_head frozen
   num_train_epochs: 1
 
   optim: adamw_torch  # overridden by create_optimizer (two param groups)
   weight_decay: 0.0
   max_grad_norm: 1.0
 
-  gradient_checkpointing: false  # LLM fully frozen — no grad through LLM, checkpointing wastes time
+  gradient_checkpointing: false
   bf16: true
   dataloader_num_workers: 8
   ddp_find_unused_parameters: false

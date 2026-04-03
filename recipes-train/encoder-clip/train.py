@@ -1058,7 +1058,14 @@ def main() -> None:
             return {}
         raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
         raw_enc.eval()
-        totals = {"loss": 0.0, "grid": 0.0, "global": 0.0, "n": 0.0}
+        totals = {
+            "loss": 0.0,
+            "grid": 0.0,
+            "global": 0.0,
+            "top1_grid": 0.0,
+            "top1_global": 0.0,
+            "n": 0.0,
+        }
         tau = log_temperature.exp().clamp(0.01, 0.5)
         with torch.no_grad():
             for boards, sf15, eval_score, fens in eval_loader:
@@ -1103,6 +1110,20 @@ def main() -> None:
                 totals["grid"] += L_grid.item() * bs
                 totals["global"] += L_global.item() * bs
                 totals["n"] += bs
+                # Top-1 retrieval (tau-agnostic)
+                _lbl = torch.arange(grid_tokens.size(0), device=grid_tokens.device)
+                _gn = F.normalize(grid_tokens, dim=-1)
+                _an = F.normalize(grid_anchors, dim=-1)
+                _t1g = 0.0
+                for _sq in range(grid_tokens.size(1)):
+                    _s = _gn[:, _sq, :] @ _an[:, _sq, :].T
+                    _t1g += (_s.argmax(dim=1) == _lbl).float().mean().item()
+                totals["top1_grid"] += (_t1g / grid_tokens.size(1)) * bs
+                _gn_g = F.normalize(global_token.squeeze(1), dim=-1)
+                _an_g = F.normalize(global_anchor, dim=-1)
+                totals["top1_global"] += (_gn_g @ _an_g.T).argmax(dim=1).eq(
+                    _lbl
+                ).float().mean().item() * bs
         raw_enc.train()
         if dist.is_initialized():
             t = torch.tensor(list(totals.values()), dtype=torch.float64, device=device)
@@ -1110,7 +1131,11 @@ def main() -> None:
             for i, k in enumerate(totals):
                 totals[k] = t[i].item()
         n = totals["n"]
-        return {k: totals[k] / n for k in ("loss", "grid", "global")} if n > 0 else {}
+        return (
+            {k: totals[k] / n for k in ("loss", "grid", "global", "top1_grid", "top1_global")}
+            if n > 0
+            else {}
+        )
 
     # ── Training loop ─────────────────────────────────────────────────────────
     if is_main:
@@ -1266,11 +1291,13 @@ def main() -> None:
             metrics = run_eval()
             if is_main and metrics:
                 logger.info(
-                    "step=%d  eval loss=%.4f grid=%.4f global=%.4f",
+                    "step=%d  eval loss=%.4f grid=%.4f global=%.4f  top1=%.3f/%.3f",
                     global_step,
                     metrics.get("loss", 0),
                     metrics.get("grid", 0),
                     metrics.get("global", 0),
+                    metrics.get("top1_grid", 0),
+                    metrics.get("top1_global", 0),
                 )
                 if wandb_cfg.get("enabled"):
                     import wandb

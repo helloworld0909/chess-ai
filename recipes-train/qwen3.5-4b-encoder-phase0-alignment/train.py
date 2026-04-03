@@ -1,20 +1,22 @@
-"""Phase 0: MLP Projector + LoRA Alignment (run 4)
+"""Phase 0: MLP Projector + LoRA Alignment
 
-Trains cnn.proj (2-layer MLP + LayerNorm) + LoRA on LLM jointly.
+Trains cnn.proj + cnn.global_proj (2-layer MLPs + LayerNorm) + LoRA on LLM jointly.
 CNN trunk is frozen. LLM base weights are frozen; only LoRA adapters train.
 
-Key fix vs run 2: heavily asymmetric LRs — projector at 1e-3, LoRA at 5e-6 (200× slower).
-LoRA can't exploit text coordinate labels fast enough; projector establishes alignment first.
-LayerNorm at projector output stabilizes training.
+Asymmetric LRs: projector at 1e-3, LoRA at 5e-6 (200× slower).
+The projector establishes alignment first; LoRA refines the LLM's reading.
+
+Board is injected as a flat block of 65 sentinel tokens (64 per-square + 1 global).
+No square-label text anchors — the CNN (CLIP-trained) carries full semantic meaning.
 
 Data format: alignment_board_description.jsonl
   {"messages": [{"role": "user", ...}, {"role": "assistant", ...}],
    "metadata": {"fen": ..., "task": ...}}
 
 The user message does NOT contain sentinel tokens.
-This script injects the 64-sentinel block into the user content at data-loading time,
-randomly placing it before or after the question (50/50) so the model learns to attend
-to board tokens at any position. Labels are set so loss is only computed on the assistant answer.
+This script injects the 65-sentinel block into the user content at data-loading time,
+randomly placing it before or after the question (50/50).
+Labels are set so loss is only computed on the assistant answer.
 Think block tokens (<think>\n\n</think>\n\n) are masked from loss.
 """
 
@@ -35,31 +37,14 @@ from training.lib import load_config, make_training_args
 
 _logger = logging.getLogger(__name__)
 
-_SENTINEL_BLOCK = BOARD_TOKEN * BOARD_TOKENS_PER_POSITION
-
-# TODO: This anchored board format MUST be used consistently everywhere the encoder
-# is used — SFT data generation, GRPO prompts, and inference (encoder_inference.py).
-# Any mismatch (flat sentinels vs anchored) will break spatial grounding.
-
-# Prompt-anchored board: each sentinel explicitly labeled with its square name.
-# CNN output is row-major a1=idx0, b1=idx1, ..., h1=idx7, a2=idx8, ..., h8=idx63.
-# Display rank 1→8 to match CNN output order exactly:
-# text token N gets injected with CNN output token N → a1<tok0> b1<tok1> ... h8<tok63>
-_FILES = "abcdefgh"
-_ANCHORED_BOARD_LINES = []
-for _rank in range(0, 8):  # rank 1→8, matching CNN output order (a1=idx0 ... h8=idx63)
-    _cells = []
-    for _file in range(8):
-        _sq = f"{_FILES[_file]}{_rank + 1}"
-        _cells.append(f"{_sq}{BOARD_TOKEN}")
-    _ANCHORED_BOARD_LINES.append(" ".join(_cells))
-_ANCHORED_BOARD = "\n".join(_ANCHORED_BOARD_LINES)
+# Flat block of 65 sentinel tokens representing one board position.
+# 64 per-square tokens (row-major a1..h8) + 1 global summary token.
+# No square-label text anchors — the CLIP-trained CNN encodes full semantics.
+_BOARD_BLOCK = BOARD_TOKEN * BOARD_TOKENS_PER_POSITION
 
 _SYSTEM_PROMPT = (
-    "You are a chess assistant. The board is encoded as a grid of square labels (a1–h8), "
-    "each immediately followed by a vision token that encodes the piece occupying that square. "
-    "To answer questions, attend to the vision token after each square label to identify the piece — "
-    "do not try to parse the square labels as text notation."
+    "You are a chess assistant. The board position is encoded as a sequence of vision tokens. "
+    "Use them to identify pieces and answer questions about the position."
 )
 
 
@@ -120,20 +105,20 @@ def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
         state = torch.load(
             encoder_weights_path, map_location=f"cuda:{local_rank}", weights_only=True
         )
-        trunk_state = {k: v for k, v in state.items() if not k.startswith("proj.")}
-        missing, unexpected = model.cnn.load_state_dict(trunk_state, strict=False)
-        if missing:
-            proj_missing = [k for k in missing if k.startswith("proj.")]
-            other_missing = [k for k in missing if not k.startswith("proj.")]
-            if other_missing:
-                _logger.warning("Missing non-proj keys in encoder weights: %s", other_missing)
-            _logger.info(
-                "Loaded encoder trunk weights; proj keys not loaded (random init): %s",
-                proj_missing,
-            )
+        missing, unexpected = model.cnn.load_state_dict(state, strict=False)
+        proj_missing = [k for k in missing if k.startswith("proj.") or k.startswith("global_proj.")]
+        other_missing = [k for k in missing if k not in proj_missing]
+        if other_missing:
+            _logger.warning("Missing trunk keys in encoder weights: %s", other_missing)
         if unexpected:
             _logger.warning("Unexpected keys in encoder weights: %s", unexpected)
-        _logger.info("Loaded encoder trunk from %s", encoder_weights_path)
+        if proj_missing:
+            _logger.info(
+                "Loaded encoder trunk from %s; proj/global_proj randomly initialized",
+                encoder_weights_path,
+            )
+        else:
+            _logger.info("Loaded full encoder (trunk + proj) from %s", encoder_weights_path)
     else:
         _logger.warning("No encoder.pretrained_weights set — encoder is randomly initialised!")
 
@@ -154,25 +139,33 @@ def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
                 proj_state = {
                     k.removeprefix("cnn."): v
                     for k, v in merged.items()
-                    if k.startswith("cnn.proj.")
+                    if k.startswith("cnn.proj.") or k.startswith("cnn.global_proj.")
                 }
             else:
                 raise FileNotFoundError(f"No checkpoint found in {init_proj_path}")
         else:
             ckpt = torch.load(ckpt_file, map_location=f"cuda:{local_rank}", weights_only=True)
             proj_state = {
-                k.removeprefix("cnn."): v for k, v in ckpt.items() if k.startswith("cnn.proj.")
+                k.removeprefix("cnn."): v
+                for k, v in ckpt.items()
+                if k.startswith("cnn.proj.") or k.startswith("cnn.global_proj.")
             }
         missing, unexpected = model.cnn.load_state_dict(proj_state, strict=False)
-        other_missing = [k for k in missing if k.startswith("proj.")]
+        other_missing = [
+            k for k in missing if not k.startswith("proj.") and not k.startswith("global_proj.")
+        ]
         if other_missing:
             _logger.warning("Missing proj keys from init checkpoint: %s", other_missing)
-        _logger.info("Loaded cnn.proj weights from %s (warm init)", init_proj_path)
+        _logger.info(
+            "Loaded cnn.proj + cnn.global_proj weights from %s (warm init)", init_proj_path
+        )
 
-    # Freeze CNN trunk. LoRA adapters + cnn.proj are trainable.
+    # Freeze CNN trunk. LoRA adapters + cnn.proj + cnn.global_proj are trainable.
     for param in model.cnn.parameters():
         param.requires_grad_(False)
     for param in model.cnn.proj.parameters():
+        param.requires_grad_(True)
+    for param in model.cnn.global_proj.parameters():
         param.requires_grad_(True)
 
     model.print_trainable_parameters()
@@ -217,7 +210,7 @@ def main() -> None:
     def _fmt(example: dict) -> dict:
         """Tokenize a board-reading Q&A example for projector alignment.
 
-        Injects 64 sentinel tokens into the user message. Position is randomized
+        Injects 65 sentinel tokens into the user message. Position is randomized
         (50/50 before or after the question) so the model learns to attend to
         the board tokens regardless of where they appear in context.
         Labels are set so loss is computed only on assistant answer tokens.
@@ -232,20 +225,14 @@ def main() -> None:
             if msg["role"] == "user":
                 q = msg["content"]
                 if board_before:
-                    user_content = _ANCHORED_BOARD + "\n\n" + q
+                    user_content = _BOARD_BLOCK + "\n\n" + q
                 else:
-                    user_content = q + "\n\n" + _ANCHORED_BOARD
+                    user_content = q + "\n\n" + _BOARD_BLOCK
                 patched_messages.append({"role": "user", "content": user_content})
             else:
                 patched_messages.append(msg)
 
-        # Apply chat template: full conversation including assistant turn
-        full_text = tokenizer.apply_chat_template(
-            patched_messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        # Prompt only (no assistant turn) — used to find where answer starts
+        # Build prompt without assistant turn
         prompt_messages = [m for m in patched_messages if m["role"] != "assistant"]
         prompt_text = tokenizer.apply_chat_template(
             prompt_messages,
@@ -253,46 +240,44 @@ def main() -> None:
             add_generation_prompt=True,
         )
 
-        full_ids = tokenizer(
-            full_text,
-            truncation=True,
-            max_length=max_seq_length,
-            return_attention_mask=True,
-        )
-        prompt_ids = tokenizer(
-            prompt_text,
-            truncation=False,
-            return_attention_mask=False,
-        )
+        # Qwen3 with add_generation_prompt=True appends "<think>\n" to the prompt.
+        # Our data has no think blocks, so full_text won't contain <think>\n.
+        # Strip it from prompt_text so prompt_len matches the actual boundary in full_ids.
+        if prompt_text.endswith("<think>\n"):
+            prompt_text = prompt_text[:-8]
 
-        input_ids = full_ids["input_ids"]
-        attention_mask = full_ids["attention_mask"]
-        prompt_len = len(prompt_ids["input_ids"])
+        # Extract assistant answer and manually assemble full sequence.
+        # This keeps prompt boundary exactly aligned between prompt_text and full_text.
+        assistant_content = next(m["content"] for m in patched_messages if m["role"] == "assistant")
+        full_text = prompt_text + assistant_content + "<|im_end|>\n"
+
+        full_ids = tokenizer(full_text, truncation=True, max_length=max_seq_length)["input_ids"]
+        prompt_ids = tokenizer(prompt_text, truncation=False)["input_ids"]
+
+        prompt_len = len(prompt_ids)
+
+        # Verify the prompt prefix is byte-for-byte identical in both tokenizations.
+        # If full_ids[:prompt_len] != prompt_ids, the label boundary is wrong.
+        # This can happen if there's a tokenization boundary effect at the join point.
+        if full_ids[:prompt_len] != prompt_ids:
+            raise ValueError(
+                f"Tokenization boundary mismatch: prompt_ids and full_ids diverge at the join. "
+                f"prompt_ids[-5:]={prompt_ids[-5:]}, full_ids[prompt_len-5:prompt_len+5]="
+                f"{full_ids[max(0, prompt_len - 5) : prompt_len + 5]}"
+            )
 
         # Loss only on assistant answer tokens.
-        # Also mask the empty <think>\n\n</think>\n\n block Qwen3 always emits —
-        # we don't want the model rewarded for predicting boilerplate think tokens.
-        labels = [-100] * prompt_len + input_ids[prompt_len:]
-        if len(labels) < len(input_ids):
-            labels += [-100] * (len(input_ids) - len(labels))
-        labels = labels[: len(input_ids)]
-
-        # Qwen3 chat template with add_generation_prompt=True appends "<think>\n" to the prompt.
-        # So the label region starts with: </think>(248069) \n\n(271) <answer>...
-        # Mask </think> and \n\n so loss is computed only on actual answer tokens.
-        think_end_id = tokenizer.convert_tokens_to_ids("</think>")
-        i = prompt_len
-        if i < len(labels) and input_ids[i] == think_end_id:  # </think>
-            labels[i] = -100
-            i += 1
-        if i < len(labels) and input_ids[i] == 271:  # \n\n
-            labels[i] = -100
+        labels = [-100] * prompt_len + full_ids[prompt_len:]
+        if len(labels) > len(full_ids):
+            labels = labels[: len(full_ids)]
+        elif len(labels) < len(full_ids):
+            labels += [-100] * (len(full_ids) - len(labels))
 
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
+            "input_ids": full_ids,
+            "attention_mask": [1] * len(full_ids),
             "labels": labels,
-            "fen": fen if fen else "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "fen": fen,
             "move_san": "",
             "line_sans_json": "[]",
         }
@@ -331,30 +316,10 @@ def main() -> None:
     training_args = make_training_args(config)
     training_args.remove_unused_columns = False
 
-    # Single-board collator — each example has exactly one board (fen field)
-    class AlignmentCollator(EncoderDataCollator):
-        """Collator that builds a single board_to_tensor per example from the fen field."""
-
-        def __call__(self, features):
-            import chess
-
-            batch = super().__call__(features)
-
-            # Rebuild board_tensors_flat using the fen field (one board per example)
-            tensors = []
-            for feat in features:
-                fen = feat.get("fen", chess.STARTING_FEN)
-                try:
-                    board = chess.Board(fen)
-                except Exception:
-                    board = chess.Board()
-                tensors.append(board_to_tensor(board))
-
-            if tensors:
-                batch["board_tensors_flat"] = torch.stack(tensors).to(torch.bfloat16)
-            return batch
-
-    collator = AlignmentCollator(tokenizer=tokenizer)
+    # EncoderDataCollator already builds board_tensors_flat from the fen field correctly.
+    # A subclass that calls super() then re-reads feat["fen"] is wrong — super() pops
+    # fen from each feature dict, so the second pass gets chess.STARTING_FEN for all.
+    collator = EncoderDataCollator(tokenizer=tokenizer)
 
     from transformers import Trainer
 
@@ -362,8 +327,10 @@ def main() -> None:
 
     class EncoderTrainer(Trainer):
         def create_optimizer(self):
-            """Two param groups: projector at 1e-3, LoRA at 5e-6 (200× slower)."""
-            proj_params = list(self.model.cnn.proj.parameters())
+            """Two param groups: proj+global_proj at learning_rate (1e-4), LoRA at lora_lr (5e-6)."""
+            proj_params = list(self.model.cnn.proj.parameters()) + list(
+                self.model.cnn.global_proj.parameters()
+            )
             proj_ids = {id(p) for p in proj_params}
             lora_params = [
                 p for p in self.model.parameters() if p.requires_grad and id(p) not in proj_ids
@@ -431,7 +398,7 @@ def main() -> None:
                     prompt_text = tokenizer.apply_chat_template(
                         [
                             {"role": "system", "content": _SYSTEM_PROMPT},
-                            {"role": "user", "content": _ANCHORED_BOARD + "\n\n" + q},
+                            {"role": "user", "content": _BOARD_BLOCK + "\n\n" + q},
                         ],
                         tokenize=False,
                         add_generation_prompt=True,
