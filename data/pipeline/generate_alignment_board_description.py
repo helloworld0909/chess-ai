@@ -489,8 +489,6 @@ _TASKS = [
     ("piece_abbr_at", _task_piece_abbr_at),
     ("piece_name_at", _task_piece_name_at),
     ("side_to_move", _task_side_to_move),
-    ("piece_list_abbr", _task_piece_list_abbr),
-    ("piece_list_full", _task_piece_list_full),
     ("rank_contents", _task_rank_contents),
     ("file_contents", _task_file_contents),
     ("castling_rights", _task_castling_rights),
