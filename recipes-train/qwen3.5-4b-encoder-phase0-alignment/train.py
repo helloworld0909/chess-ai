@@ -427,13 +427,14 @@ def main() -> None:
                     deduped[k] = v
             super()._save(output_dir=output_dir, state_dict=deduped)
 
-    # Pick one fixed example per task type for eval logging
+    # Pick 2 fixed examples per task type for eval logging
+    _SAMPLES_PER_TASK = 2
     _log_samples: list[dict] = []
-    seen_tasks: set[str] = set()
+    task_counts: dict[str, int] = {}
     for ex in raw_eval:
         task = ex.get("metadata", {}).get("task", "")
-        if task and task not in seen_tasks:
-            seen_tasks.add(task)
+        if task and task_counts.get(task, 0) < _SAMPLES_PER_TASK:
+            task_counts[task] = task_counts.get(task, 0) + 1
             _log_samples.append(ex)
 
     from transformers import TrainerCallback
@@ -448,7 +449,11 @@ def main() -> None:
 
             model.eval()
             device = model.llm.device
-            _logger.info("=== Sample predictions at step %d ===", state.global_step)
+            sep = "=" * 72
+            _logger.info("%s", sep)
+            _logger.info("  EVAL SAMPLES  step=%d", state.global_step)
+            _logger.info("%s", sep)
+            prev_task = None
             for ex in _log_samples:
                 fen = ex.get("metadata", {}).get("fen", _chess.STARTING_FEN)
                 task = ex.get("metadata", {}).get("task", "")
@@ -460,39 +465,42 @@ def main() -> None:
                     board = _chess.Board()
                 board_tensor = board_to_tensor(board).unsqueeze(0).to(torch.bfloat16).to(device)
 
-                results = {}
-                for think in (False, True):
-                    prompt_text = tokenizer.apply_chat_template(
-                        [
-                            {"role": "system", "content": _SYSTEM_PROMPT},
-                            {"role": "user", "content": _BOARD_BLOCK + "\n\n" + q},
-                        ],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        enable_thinking=think,
-                    )
-                    input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].to(device)
-                    with torch.no_grad():
-                        cnn_tokens = model.cnn(board_tensor)
-                        text_embeds = model.embed_tokens(input_ids)
-                        sentinel_mask = (input_ids == model.move_token_id)[0]
-                        text_embeds[0, sentinel_mask] = cnn_tokens[0, : sentinel_mask.sum()]
-                        out = model.llm.generate(
-                            inputs_embeds=text_embeds,
-                            max_new_tokens=64,
-                            do_sample=False,
-                            pad_token_id=tokenizer.eos_token_id,
-                        )
-                    results[think] = tokenizer.decode(out[0], skip_special_tokens=False).strip()
+                if task != prev_task:
+                    _logger.info("--- %s", task)
+                    prev_task = task
 
-                _logger.info(
-                    "  [%-20s] Q: %-45s | expected: %-12r | no-think: %-15r | think: %r",
-                    task,
-                    q[:45],
-                    expected,
-                    results[False],
-                    results[True],
+                pred = None
+                prompt_text = tokenizer.apply_chat_template(
+                    [
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user", "content": _BOARD_BLOCK + "\n\n" + q},
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
                 )
+                input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].to(device)
+                with torch.no_grad():
+                    cnn_tokens = model.cnn(board_tensor)
+                    text_embeds = model.embed_tokens(input_ids)
+                    sentinel_mask = (input_ids == model.move_token_id)[0]
+                    text_embeds[0, sentinel_mask] = cnn_tokens[0, : sentinel_mask.sum()]
+                    out = model.llm.generate(
+                        inputs_embeds=text_embeds,
+                        max_new_tokens=32,
+                        do_sample=False,
+                        pad_token_id=tokenizer.eos_token_id,
+                    )
+                pred = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+                ok = "✓" if pred.strip() == expected.strip() else "✗"
+                _logger.info(
+                    "  %s  Q: %-40s  expect=%-10s  got=%s",
+                    ok,
+                    q[:40],
+                    repr(expected),
+                    repr(pred),
+                )
+            _logger.info("%s", sep)
             model.train()
 
     trainer = EncoderTrainer(
