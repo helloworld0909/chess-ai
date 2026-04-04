@@ -33,7 +33,6 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
-    - lm_head
   bias: none
 
 training:
@@ -43,16 +42,16 @@ training:
 
   per_device_train_batch_size: 8
   per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 8  # effective batch = 128 (8 × 2 GPUs × 8 accum)
+  gradient_accumulation_steps: 8  # effective batch = 128 (16 × 2 GPUs × 4 accum)
 
-  learning_rate: 1.0e-4        # proj/global_proj LR — pretrained from CLIP, fine-tuning rate
-  lora_learning_rate: 5.0e-5  # LoRA LR — includes lm_head, needs strong signal for alignment
+  learning_rate: 5.0e-5        # proj/global_proj LR — pretrained from CLIP, fine-tuning rate
+  lora_learning_rate: 5.0e-5  # LoRA LR — needs strong signal for alignment
   lr_scheduler_type: cosine
   warmup_steps: 500            # extended warmup for stable ramp with lm_head frozen
   num_train_epochs: 1
 
   optim: adamw_torch  # overridden by create_optimizer (two param groups)
-  weight_decay: 0.0
+  weight_decay: 0.05
   max_grad_norm: 1.0
 
   gradient_checkpointing: false
@@ -70,10 +69,10 @@ training:
 
   seed: 42
 
-output_dir: checkpoints/qwen3.5-4b-encoder-phase0-alignment
+output_dir: checkpoints/qwen3.5-4b-encoder-phase1-alignment
 
 wandb:
   enabled: false
   project: "chess-tutor"
-  name: "qwen3.5-4b-encoder-phase0-alignment"
+  name: "qwen3.5-4b-encoder-phase1-alignment"
   tags: ["encoder", "alignment", "projector"]

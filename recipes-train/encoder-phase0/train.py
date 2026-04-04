@@ -21,10 +21,10 @@ Dataset: binary .bin (map-style, O(1) access) or streaming .jsonl.
       fen: 90 bytes | sf15_terms: 13×f32 | eval_score: f32 | piece_labels: 64×u8
 
 Usage (2-GPU DDP):
-    torchrun --nproc_per_node=2 recipes-train/encoder-clip/train.py
+    torchrun --nproc_per_node=2 recipes-train/encoder-phase0/train.py
 
 Usage (single GPU):
-    uv run python recipes-train/encoder-clip/train.py
+    uv run python recipes-train/encoder-phase0/train.py
 """
 
 from __future__ import annotations
@@ -840,7 +840,7 @@ def cleanup_ddp() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", "-c", default="recipes-train/encoder-clip/config.yaml")
+    parser.add_argument("--config", "-c", default="recipes-train/encoder-phase0/config.yaml")
     parser.add_argument("--resume", default=None, help="Path to checkpoint.pt")
     parser.add_argument(
         "--reset-scheduler",
@@ -867,8 +867,8 @@ def main() -> None:
 
             wandb.init(
                 project=wandb_cfg.get("project", "chess-tutor"),
-                name=wandb_cfg.get("name", "encoder-clip"),
-                tags=wandb_cfg.get("tags", ["encoder-clip"]),
+                name=wandb_cfg.get("name", "encoder-phase0"),
+                tags=wandb_cfg.get("tags", ["encoder-phase0"]),
                 config=config,
             )
 

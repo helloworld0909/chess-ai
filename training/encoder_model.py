@@ -57,16 +57,23 @@ class ChessLMWithEncoder(nn.Module):
         )
 
         if hasattr(self.llm, "get_input_embeddings"):
-            self.embed_tokens = self.llm.get_input_embeddings()
+            embed_layer = self.llm.get_input_embeddings()
         elif hasattr(self.llm.model, "embed_tokens"):
-            self.embed_tokens = self.llm.model.embed_tokens
+            embed_layer = self.llm.model.embed_tokens
         else:
             raise ValueError("Could not find input embeddings layer in the LLM.")
+        
+        # Don't register as a module attribute to avoid duplicate in state_dict
+        object.__setattr__(self, "embed_tokens", embed_layer)
 
         # Expose HF model attributes that SFTTrainer / Trainer expect
         self.config = self.llm.config
         self.name_or_path = getattr(self.llm, "name_or_path", "")
         self._keys_to_ignore_on_save = getattr(self.llm, "_keys_to_ignore_on_save", None)
+
+    def get_input_embeddings(self):
+        """Return the input embedding layer (used by trainer/collator)."""
+        return self.embed_tokens
 
     def freeze_for_alignment(self) -> None:
         """Freeze everything except the CNN projector for phase0 alignment.

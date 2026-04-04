@@ -12,8 +12,8 @@
 #   Qwen3.5-4B frozen (bf16): ~8GB | encoder + grads: ~0.2GB | cache: ~0.5GB
 #   Total: ~11GB — comfortable
 #
-# DDP: torchrun --nproc_per_node=2 recipes-train/encoder-clip/train.py
-# Single GPU: uv run python recipes-train/encoder-clip/train.py
+# DDP: torchrun --nproc_per_node=2 recipes-train/encoder-phase0/train.py
+# Single GPU: uv run python recipes-train/encoder-phase0/train.py
 
 encoder:
   in_channels: 19       # 19-channel single-board tensor
@@ -55,8 +55,8 @@ output_dir: checkpoints/encoder-clip
 wandb:
   enabled: false
   project: chess-tutor
-  name: encoder-clip
+  name: encoder-phase0
   tags:
-    - encoder-clip
+    - encoder-phase0
     - contrastive
     - chess-clip

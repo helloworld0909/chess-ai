@@ -1,8 +1,8 @@
 """Quick per-task eval: run one example per task type and print model output.
 
 Usage:
-    PYTHONPATH=src:. python recipes-train/qwen3.5-4b-encoder-phase0-alignment/eval_samples.py \
-        --checkpoint checkpoints/qwen3.5-4b-encoder-phase0-alignment/checkpoint-1000
+    PYTHONPATH=src:. python recipes-train/qwen3.5-4b-encoder-phase1-alignment/eval_samples.py \
+        --checkpoint checkpoints/qwen3.5-4b-encoder-phase1-alignment/checkpoint-1000
 """
 
 import argparse
@@ -36,11 +36,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint",
-        default="checkpoints/qwen3.5-4b-encoder-phase0-alignment/checkpoint-1000",
+        default="checkpoints/qwen3.5-4b-encoder-phase1-alignment/checkpoint-1000",
     )
     parser.add_argument(
         "--config",
-        default="recipes-train/qwen3.5-4b-encoder-phase0-alignment/config.yaml",
+        default="recipes-train/qwen3.5-4b-encoder-phase1-alignment/config.yaml",
     )
     parser.add_argument(
         "--eval-file",

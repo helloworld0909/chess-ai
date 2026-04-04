@@ -3,8 +3,8 @@
 Trains cnn.proj + cnn.global_proj (2-layer MLPs + LayerNorm) + LoRA on LLM jointly.
 CNN trunk is frozen. LLM base weights are frozen; only LoRA adapters train.
 
-Asymmetric LRs: projector at 1e-3, LoRA at 5e-6 (200× slower).
-The projector establishes alignment first; LoRA refines the LLM's reading.
+Asymmetric LRs: projector at 5e-5, LoRA at 5e-5 (same rate, different param groups).
+The projector establishes alignment; LoRA adapts the LLM's reading jointly.
 
 Board is injected as a flat block of 65 sentinel tokens (64 per-square + 1 global).
 No square-label text anchors — the CNN (CLIP-trained) carries full semantic meaning.
@@ -48,7 +48,7 @@ _SYSTEM_PROMPT = (
 )
 
 
-def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
+def setup_model(config_path: str) -> tuple:
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -122,44 +122,6 @@ def setup_model(config_path: str, init_proj_path: str | None = None) -> tuple:
     else:
         _logger.warning("No encoder.pretrained_weights set — encoder is randomly initialised!")
 
-    # Optionally warm-init projector from a prior phase0 checkpoint
-    if init_proj_path:
-        import glob as _glob
-        import os as _os
-
-        ckpt_file = _os.path.join(init_proj_path, "pytorch_model.bin")
-        if not _os.path.exists(ckpt_file):
-            shards = sorted(_glob.glob(_os.path.join(init_proj_path, "model*.safetensors")))
-            if shards:
-                from safetensors.torch import load_file as _load_safetensors
-
-                merged = {}
-                for s in shards:
-                    merged.update(_load_safetensors(s, device=f"cuda:{local_rank}"))
-                proj_state = {
-                    k.removeprefix("cnn."): v
-                    for k, v in merged.items()
-                    if k.startswith("cnn.proj.") or k.startswith("cnn.global_proj.")
-                }
-            else:
-                raise FileNotFoundError(f"No checkpoint found in {init_proj_path}")
-        else:
-            ckpt = torch.load(ckpt_file, map_location=f"cuda:{local_rank}", weights_only=True)
-            proj_state = {
-                k.removeprefix("cnn."): v
-                for k, v in ckpt.items()
-                if k.startswith("cnn.proj.") or k.startswith("cnn.global_proj.")
-            }
-        missing, unexpected = model.cnn.load_state_dict(proj_state, strict=False)
-        other_missing = [
-            k for k in missing if not k.startswith("proj.") and not k.startswith("global_proj.")
-        ]
-        if other_missing:
-            _logger.warning("Missing proj keys from init checkpoint: %s", other_missing)
-        _logger.info(
-            "Loaded cnn.proj + cnn.global_proj weights from %s (warm init)", init_proj_path
-        )
-
     # Freeze CNN trunk. LoRA adapters + cnn.proj + cnn.global_proj are trainable.
     for param in model.cnn.parameters():
         param.requires_grad_(False)
@@ -178,16 +140,9 @@ def main() -> None:
     parser.add_argument(
         "--config",
         "-c",
-        default="recipes-train/qwen3.5-4b-encoder-phase0-alignment/config.yaml",
+        default="recipes-train/qwen3.5-4b-encoder-phase1-alignment/config.yaml",
     )
     parser.add_argument("--resume", nargs="?", const=True, default=None)
-    parser.add_argument(
-        "--init-proj",
-        default=None,
-        metavar="CHECKPOINT_DIR",
-        help="Load cnn.proj weights from a prior phase0 checkpoint to continue training on new data. "
-        "Unlike --resume, this starts a fresh optimizer/scheduler (new dataset, new run).",
-    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -200,11 +155,11 @@ def main() -> None:
 
         wandb.init(
             project=wandb_cfg.get("project", "chess-tutor"),
-            name=wandb_cfg.get("name", "qwen3.5-4b-encoder-phase0-alignment"),
+            name=wandb_cfg.get("name", "qwen3.5-4b-encoder-phase1-alignment"),
             tags=wandb_cfg.get("tags", ["alignment"]),
         )
 
-    model, tokenizer = setup_model(args.config, init_proj_path=args.init_proj)
+    model, tokenizer = setup_model(args.config)
     max_seq_length: int = train_cfg.get("max_seq_length", 512)
 
     def _fmt(example: dict) -> dict:
@@ -300,6 +255,7 @@ def main() -> None:
             self.limit = limit
             self._rank = 0
             self._world_size = 1
+            self._resume_examples = 0  # total examples seen before checkpoint
 
         def __iter__(self):
             worker_info = torch.utils.data.get_worker_info()
@@ -309,9 +265,19 @@ def main() -> None:
             global_stride = num_workers * self._world_size
             my_slot = self._rank * num_workers + worker_id
 
+            # Skip past already-seen examples (mirrors ChessClipJsonlDataset).
+            # Each worker owns lines: my_slot, my_slot+stride, my_slot+2*stride, ...
+            # Find the first line index >= _resume_examples that belongs to this worker.
+            start_example = self._resume_examples
+            if my_slot >= start_example:
+                start_idx = my_slot
+            else:
+                steps = (start_example - my_slot + global_stride - 1) // global_stride
+                start_idx = my_slot + steps * global_stride
+
             emitted = 0
             with open(self.path, "rb") as f:
-                for raw in itertools.islice(f, my_slot, None, global_stride):
+                for raw in itertools.islice(f, start_idx, None, global_stride):
                     raw = raw.strip()
                     if not raw:
                         continue
@@ -357,6 +323,32 @@ def main() -> None:
         train_dataset._rank = local_rank
         train_dataset._world_size = world_size
 
+        # Resume: seek past already-seen examples so we don't retrain on old data.
+        if args.resume and isinstance(args.resume, str):
+            state_file = os.path.join(args.resume, "trainer_state.json")
+            if os.path.exists(state_file):
+                with open(state_file) as _f:
+                    _state = json.load(_f)
+                _resumed_step = _state.get("global_step", 0)
+                # train_batch_size in trainer_state = per_device × world_size (no grad_accum).
+                # Multiply by grad_accum to get examples consumed per optimizer step.
+                _ckpt_batch = _state.get("train_batch_size", 0)
+                if _ckpt_batch:
+                    _grad_accum = train_cfg.get("gradient_accumulation_steps", 8)
+                    _effective = _ckpt_batch * _grad_accum
+                else:
+                    _effective = (
+                        train_cfg.get("per_device_train_batch_size", 8)
+                        * world_size
+                        * train_cfg.get("gradient_accumulation_steps", 8)
+                    )
+                train_dataset._resume_examples = _resumed_step * _effective
+                _logger.info(
+                    "Resuming from step %d — skipping %d examples per dataset",
+                    _resumed_step,
+                    train_dataset._resume_examples,
+                )
+
         # Trainer requires max_steps for IterableDataset (no __len__).
         train_size = sum(1 for line in open(train_cfg["train_file"]) if line.strip())
         effective_batch = (
@@ -394,7 +386,7 @@ def main() -> None:
 
     class EncoderTrainer(Trainer):
         def create_optimizer(self):
-            """Two param groups: proj+global_proj at learning_rate (1e-4), LoRA at lora_lr (5e-6)."""
+            """Two param groups: proj+global_proj at learning_rate (5e-5), LoRA at lora_lr (5e-5)."""
             proj_params = list(self.model.cnn.proj.parameters()) + list(
                 self.model.cnn.global_proj.parameters()
             )
@@ -413,19 +405,44 @@ def main() -> None:
             )
             return self.optimizer
 
-        def _save(self, output_dir=None, state_dict=None):
-            if state_dict is None:
-                state_dict = self.model.state_dict()
-            seen: dict[int, torch.Tensor] = {}
-            deduped: dict[str, torch.Tensor] = {}
-            for k, v in state_dict.items():
-                ptr = v.data_ptr()
-                if ptr in seen:
-                    deduped[k] = v.detach().clone()
-                else:
-                    seen[ptr] = v
-                    deduped[k] = v
-            super()._save(output_dir=output_dir, state_dict=deduped)
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            # Use super() so DDP + liger kernel machinery runs correctly.
+            # We request return_outputs=True to read logits for accuracy without
+            # a second forward pass.
+            loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+
+            labels = inputs.get("labels")
+            is_log_step = (
+                self.state.global_step % self.args.logging_steps == 0
+                and getattr(self, "_acc_logged_at_step", -1) != self.state.global_step
+            )
+            if labels is not None and is_log_step and outputs.logits is not None:
+                self._acc_logged_at_step = self.state.global_step
+                shift_logits = outputs.logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                preds = shift_logits.argmax(dim=-1)
+                mask = shift_labels != -100
+                acc = ((preds == shift_labels) & mask).sum().float() / mask.sum().clamp(min=1)
+                self._pending_token_acc = acc.item()
+
+            return (loss, outputs) if return_outputs else loss
+
+        def log(self, logs, *args, **kwargs):
+            if "loss" in logs and hasattr(self, "_pending_token_acc"):
+                logs = {**logs, "train/token_acc": round(self._pending_token_acc, 4)}
+                del self._pending_token_acc
+            super().log(logs, *args, **kwargs)
+
+        def save_model(self, output_dir=None, _internal_call=False):
+            # Qwen ties embed_tokens.weight and lm_head.weight. safetensors refuses to
+            # serialize shared tensors. Untie before save and retie after.
+            llm = self.model.llm
+            tied = getattr(llm.config, "tie_word_embeddings", False)
+            if tied:
+                llm.lm_head.weight = torch.nn.Parameter(llm.lm_head.weight.detach().clone())
+            super().save_model(output_dir, _internal_call)
+            if tied:
+                llm.tie_weights()
 
     # Pick 2 fixed examples per task type for eval logging
     _SAMPLES_PER_TASK = 2
@@ -449,11 +466,17 @@ def main() -> None:
 
             model.eval()
             device = model.llm.device
+            GREEN = "\033[32m"
+            RED = "\033[31m"
+            RESET = "\033[0m"
             sep = "=" * 72
             _logger.info("%s", sep)
             _logger.info("  EVAL SAMPLES  step=%d", state.global_step)
             _logger.info("%s", sep)
+
             prev_task = None
+            n_correct = 0
+            n_total = 0
             for ex in _log_samples:
                 fen = ex.get("metadata", {}).get("fen", _chess.STARTING_FEN)
                 task = ex.get("metadata", {}).get("task", "")
@@ -469,7 +492,6 @@ def main() -> None:
                     _logger.info("--- %s", task)
                     prev_task = task
 
-                pred = None
                 prompt_text = tokenizer.apply_chat_template(
                     [
                         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -492,14 +514,29 @@ def main() -> None:
                         pad_token_id=tokenizer.eos_token_id,
                     )
                 pred = tokenizer.decode(out[0], skip_special_tokens=True).strip()
-                ok = "✓" if pred.strip() == expected.strip() else "✗"
+                correct = pred.strip() == expected.strip()
+                n_correct += int(correct)
+                n_total += 1
+                symbol = f"{GREEN}✓{RESET}" if correct else f"{RED}✗{RESET}"
                 _logger.info(
                     "  %s  Q: %-40s  expect=%-10s  got=%s",
-                    ok,
+                    symbol,
                     q[:40],
                     repr(expected),
                     repr(pred),
                 )
+
+            acc = n_correct / n_total if n_total else 0.0
+            acc_color = GREEN if acc >= 0.7 else (RED if acc < 0.4 else "\033[33m")
+            _logger.info("%s", sep)
+            _logger.info(
+                "  TOTAL ACCURACY: %s%d/%d (%.1f%%)%s",
+                acc_color,
+                n_correct,
+                n_total,
+                100 * acc,
+                RESET,
+            )
             _logger.info("%s", sep)
             model.train()
 

@@ -3,29 +3,37 @@
 LLaVA-style alignment: simple, direct board reading tasks with no reasoning.
 Each sample: user = <65 sentinels> + short question, assistant = short factual answer.
 
+Two data sources:
+  --source     (default: encoder_pretrain_1b.jsonl)  — main FENs for all tasks
+  --sf15-source (default: encoder_pretrain_sf15.jsonl) — SF15-annotated FENs for
+                eval_tier and sf15_dominant tasks ONLY (read from tail = unseen)
+
 Task types (diverse descriptions of the same board):
-  Grid token tasks (probe per-square CNN tokens):
+  Per-square tasks (probe per-square CNN tokens):
   1.  piece_abbr_at        — "What piece abbreviation is on e4?" → "P" / "empty"
   2.  piece_name_at        — "What piece is on e4?" → "white pawn" / "empty"
-  3.  side_to_move         — "Which side is to move?" → "white" / "black"
-  4.  piece_list_abbr      — "List all pieces using abbreviations." → "Ra1 Nb1 ..."
-  5.  piece_list_full      — "List all pieces by name." → "white rook on a1, ..."
-  6.  rank_contents        — "What pieces are on rank 1?" → "Ra1 Nb1 ..."
-  7.  file_contents        — "What pieces are on the e file?" → "Pe2 pe7"
-  8.  castling_rights      — "What are the castling rights?" → "White: K Q  Black: k q" / none
-  9.  en_passant           — "Is there an en passant square?" → "e6" / "none"
-  10. move_number          — "What is the current move number?" → "5"
-  11. count_piece_type     — "How many white pawns are on the board?" → "5"
-  12. count_total_material — "How many pieces does Black have in total?" → "14"
-  13. find_piece_type      — "List all squares occupied by white knights." → "b1, g1" / "none"
-  14. is_square_occupied   — "Is there a piece on e4?" → "yes" / "no"  (strict 50/50)
+  3.  rank_contents        — "What pieces are on rank 1?" → "Ra1 Nb1 ..."
+  4.  file_contents        — "What pieces are on the e file?" → "Pe2 pe7"
+  5.  count_piece_type     — "How many white pawns are on the board?" → "5"
+  6.  count_total_material — "How many pieces does Black have in total?" → "14"
+  7.  find_piece_type      — "List all squares occupied by white knights." → "b1, g1" / "none"
+  8.  is_square_occupied   — "Is there a piece on e4?" → "yes" / "no"  (strict 50/50)
+  9.  attackers_at         — "Which white pieces attack e5?" → "Ne4 Re1" / "none"
+  10. is_pinned            — "Is the piece on f3 pinned?" → "yes" / "no"
+  11. mobility_at          — "How many squares does the piece on d5 attack?" → "8"
 
-  Global token tasks (probe the 65th summary CNN token, aligned with CLIP anchor text):
-  15. is_check             — "Is the king in check?" → "yes" / "no"
-  16. material_balance     — "What is the material balance?" → "+3" / "0" / "-5" (white minus black)
-  17. who_is_better        — "Which side has the material advantage?" → "white" / "black" / "equal"
-  18. eval_tier            — "How would you assess this position?" → "White has a clear advantage" (requires SF15)
-  19. sf15_dominant        — "Which factor most favours one side?" → "Mobility favours white" (requires SF15)
+  Global token tasks (probe the 65th summary CNN token):
+  12. side_to_move         — "Which side is to move?" → "white" / "black"
+  13. castling_rights      — "What are the castling rights?" → "White O-O, Black O-O-O" / "none"
+  14. en_passant           — "Is there an en passant square?" → "e6" / "none"
+  15. move_number          — "What is the current move number?" → "5"
+  16. is_check             — "Is the king in check?" → "yes" / "no"
+  17. material_balance     — "What is the material balance?" → "+3" / "0" / "-5" (white minus black)
+  18. who_is_better        — "Which side has the material advantage?" → "white" / "black" / "equal"
+
+  SF15-dependent global token tasks (require --sf15-source with eval_score/sf15_terms):
+  19. eval_tier            — "Assess the position" → "White has a slight advantage"
+  20. sf15_dominant        — "Which factor most favours one side?" → "Mobility favours white"
 
 Output JSONL fields:
   {"messages": [...], "metadata": {"fen": ..., "task": ...}}
@@ -130,49 +138,6 @@ def _task_side_to_move(board: chess.Board, rng: random.Random, **_) -> tuple[str
     return rng.choice(q_variants), answer
 
 
-def _task_piece_list_abbr(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
-    parts = []
-    for sq in chess.SQUARES:  # rank 1→8, matching CNN output order
-        piece = board.piece_at(sq)
-        if piece:
-            abbr = _PIECE_ABBR[piece.piece_type]
-            if piece.color == chess.BLACK:
-                abbr = abbr.lower()
-            parts.append(f"{abbr}{_sq(sq)}")
-    answer = " ".join(parts) if parts else "none"
-    q_variants = [
-        "List all pieces on the board using abbreviations (e.g. Ra1, nb8). One per space.",
-        "List every piece using standard abbreviation and square. Uppercase = white, lowercase = black.",
-        "Give all pieces and their squares using abbreviations.",
-    ]
-    return rng.choice(q_variants), answer
-
-
-def _task_piece_list_full(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
-    white_parts, black_parts = [], []
-    for sq in chess.SQUARES:
-        piece = board.piece_at(sq)
-        if piece:
-            name = _PIECE_NAMES[piece.piece_type]
-            entry = f"{name} on {_sq(sq)}"
-            if piece.color == chess.WHITE:
-                white_parts.append(entry)
-            else:
-                black_parts.append(entry)
-    lines = []
-    if white_parts:
-        lines.append("White: " + ", ".join(white_parts))
-    if black_parts:
-        lines.append("Black: " + ", ".join(black_parts))
-    answer = "\n".join(lines) if lines else "none"
-    q_variants = [
-        "List all pieces by full name and square.",
-        "Describe all pieces on the board with their full names and squares.",
-        "Name every piece on the board and its square.",
-    ]
-    return rng.choice(q_variants), answer
-
-
 def _task_rank_contents(board: chess.Board, rng: random.Random, **_) -> tuple[str, str]:
     rank = rng.randint(0, 7)
     rank_name = str(rank + 1)
@@ -244,7 +209,7 @@ def _task_en_passant(board: chess.Board, rng: random.Random, **_) -> tuple[str, 
     has_ep = board.ep_square is not None
     if not has_ep and rng.random() < 0.5:
         return None  # skip — will be replaced by another task
-    answer = _sq(board.ep_square) if has_ep else "none"
+    answer = _sq(board.ep_square) if has_ep else "none"  # type: ignore[arg-type]
     q_variants = [
         "What is the en passant square, if any?",
         "Is there an en passant target square? If so, which?",
@@ -451,8 +416,89 @@ def _task_who_is_better(board: chess.Board, rng: random.Random, **_) -> tuple[st
     return rng.choice(q_variants), answer
 
 
+def _task_attackers_at(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
+    """Which pieces of one color attack a given square?
+
+    Directly mirrors the attacker info encoded in describe_square() CLIP anchors.
+    Ask about white or black attackers with equal probability.
+    """
+    sq = rng.choice(chess.SQUARES)
+    sq_name = _sq(sq)
+    color = rng.choice([chess.WHITE, chess.BLACK])
+    color_str = "white" if color == chess.WHITE else "black"
+    attackers = sorted(board.attackers(color, sq))
+
+    if not attackers and rng.random() < 0.5:
+        return None  # skip uninteresting empty-attacker cases half the time
+
+    if attackers:
+        parts = []
+        for asq in attackers[:4]:  # cap at 4 for brevity
+            piece = board.piece_at(asq)
+            if piece:
+                abbr = _PIECE_ABBR[piece.piece_type]
+                if piece.color == chess.BLACK:
+                    abbr = abbr.lower()
+                parts.append(f"{abbr}{_sq(asq)}")
+        answer = " ".join(parts)
+    else:
+        answer = "none"
+
+    q_variants = [
+        f"Which {color_str} pieces attack {sq_name}?",
+        f"List all {color_str} pieces that attack square {sq_name}.",
+        f"What {color_str} attackers target {sq_name}? Use abbreviations.",
+    ]
+    return rng.choice(q_variants), answer
+
+
+def _task_is_pinned(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
+    """Is the piece on a given square absolutely pinned to its king?
+
+    Pins are rare — skip 70% of non-pinned cases to keep a balanced yes/no ratio.
+    """
+    occupied = [sq for sq in chess.SQUARES if board.piece_at(sq) is not None]
+    if not occupied:
+        return None
+    sq = rng.choice(occupied)
+    piece = board.piece_at(sq)
+    assert piece is not None
+    pinned = board.is_pinned(piece.color, sq)
+    if not pinned and rng.random() < 0.7:
+        return None
+    answer = "yes" if pinned else "no"
+    q_variants = [
+        f"Is the piece on {_sq(sq)} absolutely pinned to its king?",
+        f"Is the piece on {_sq(sq)} pinned?",
+        f"Can the piece on {_sq(sq)} move freely, or is it pinned to the king?",
+    ]
+    return rng.choice(q_variants), answer
+
+
+def _task_mobility_at(board: chess.Board, rng: random.Random, **_) -> tuple[str, str] | None:
+    """How many squares does a piece control/attack from its square?
+
+    Directly mirrors the 'controls N squares' info in describe_square() CLIP anchors.
+    """
+    occupied = [sq for sq in chess.SQUARES if board.piece_at(sq) is not None]
+    if not occupied:
+        return None
+    sq = rng.choice(occupied)
+    mobility = len(board.attacks(sq))
+    answer = str(mobility)
+    q_variants = [
+        f"How many squares does the piece on {_sq(sq)} attack or control?",
+        f"What is the mobility of the piece on {_sq(sq)}? Count the squares it attacks.",
+        f"How many squares can the piece on {_sq(sq)} attack from its current position?",
+    ]
+    return rng.choice(q_variants), answer
+
+
 def _task_eval_tier(
-    board: chess.Board, rng: random.Random, eval_score: float | None = None, **_
+    board: chess.Board,  # noqa: ARG001
+    rng: random.Random,
+    eval_score: float | None = None,
+    **_,
 ) -> tuple[str, str] | None:
     """Overall position assessment from SF15 eval_score → 7-tier label."""
     if eval_score is None:
@@ -499,6 +545,10 @@ _TASKS = [
     ("count_total_material", _task_count_total_material),
     ("find_piece_type", _task_find_piece_type),
     ("is_square_occupied", _task_is_square_occupied),
+    # Per-square tasks — probe structural info encoded in CLIP per-square anchors
+    ("attackers_at", _task_attackers_at),
+    ("is_pinned", _task_is_pinned),
+    ("mobility_at", _task_mobility_at),
     # Global token tasks (FEN-only)
     ("is_check", _task_is_check),
     ("material_balance", _task_material_balance),
@@ -509,7 +559,15 @@ _TASKS = [
 ]
 
 # Tasks that need a top-up pass because their positive examples are rare in random positions.
-_RARE_TASKS = {"castling_rights", "en_passant", "is_check"}
+# eval_tier and sf15_dominant are also rare — they require SF15-annotated FENs from --sf15-source.
+_RARE_TASKS = {
+    "castling_rights",
+    "en_passant",
+    "is_check",
+    "is_pinned",
+    "eval_tier",
+    "sf15_dominant",
+}
 
 
 def generate_for_fen(
@@ -696,6 +754,18 @@ def main() -> None:
         action="store_false",
         help="Read FENs from the start of the source file instead.",
     )
+    parser.add_argument(
+        "--sf15-source",
+        default="data/processed/encoder_pretrain_sf15.jsonl",
+        help="Source JSONL with SF15 annotations (eval_score, sf15_terms). Used ONLY for "
+        "eval_tier and sf15_dominant tasks. Read from tail (unseen positions).",
+    )
+    parser.add_argument(
+        "--sf15-fens",
+        type=int,
+        default=200000,
+        help="Max SF15-annotated FENs to collect for eval_tier/sf15_dominant tasks.",
+    )
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -737,22 +807,57 @@ def main() -> None:
         max_fens=RARE_TARGET_POSITIVES,
         exclude=fens_set | set(ep_fens) | set(castling_fens),
     )
+    _logger.info("Scanning full dataset for is_pinned FENs (target=%d)...", RARE_TARGET_POSITIVES)
+    pinned_fens = _collect_rare_fens(
+        args.source,
+        predicate=lambda b: any(b.is_pinned(b.piece_at(sq).color, sq) for sq in b.piece_map()),
+        max_fens=RARE_TARGET_POSITIVES,
+        exclude=fens_set | set(ep_fens) | set(castling_fens) | set(check_fens),
+    )
+
+    # Collect SF15-annotated FENs for eval_tier and sf15_dominant.
+    # These come ONLY from --sf15-source (not the 1b source), read from the tail
+    # so the encoder hasn't seen them during pretraining.
+    _logger.info(
+        "Collecting SF15 FENs from %s (max=%d, from_end=True)...",
+        args.sf15_source,
+        args.sf15_fens,
+    )
+    sf15_fens, sf15_extra = _collect_fens(args.sf15_source, max_fens=args.sf15_fens, from_end=True)
+    # Merge SF15 metadata so generate_for_fen can access eval_score/sf15_terms
+    sf15_by_fen.update(sf15_extra)
+    _logger.info(
+        "SF15 FENs collected: %d (with SF15 data: %d)",
+        len(sf15_fens),
+        len(sf15_extra),
+    )
 
     # Rare FENs are kept separate — only used for their respective tasks
     rare_fens_by_task = {
         "en_passant": ep_fens,
         "castling_rights": castling_fens,
         "is_check": check_fens,
+        "is_pinned": pinned_fens,
+        # SF15 tasks: use only SF15-source FENs (have eval_score + sf15_terms)
+        "eval_tier": [f for f in sf15_fens if f in sf15_extra],
+        "sf15_dominant": [f for f in sf15_fens if f in sf15_extra],
     }
 
     rng.shuffle(fens)
 
-    eval_fens = set(fens[: args.eval_fens])
-    train_fens = fens[args.eval_fens :]
-
-    def _write(path: str, fen_list: list[str], rare_pool: dict[str, list[str]]) -> int:
-        task_counts: dict[str, int] = {name: 0 for name, _ in _TASKS}
-        records_by_task: dict[str, list[dict]] = {name: [] for name, _ in _TASKS}
+    def _write_split(train_path: str, eval_path: str, fen_list: list[str], rare_pool: dict[str, list[str]], target_eval_records: int) -> tuple[int, int]:
+        """Generate data and split into train/eval to match target eval size using RNG."""
+        # Estimate eval_ratio needed to get target eval records
+        # With N FENs * 1 task/fen ≈ N records, we want eval_ratio = target_eval_records / N
+        estimated_records = len(fen_list)
+        eval_ratio = min(0.5, max(0.001, target_eval_records / (estimated_records + target_eval_records)))
+        
+        task_counts_train: dict[str, int] = {name: 0 for name, _ in _TASKS}
+        task_counts_eval: dict[str, int] = {name: 0 for name, _ in _TASKS}
+        records_train: list[dict] = []
+        records_eval: list[dict] = []
+        
+        split_rng = random.Random(rng.randint(0, 2**32))
 
         # Main pass: parallel FEN processing
         worker_args = [
@@ -769,11 +874,15 @@ def main() -> None:
             for records in pool.imap_unordered(_worker, worker_args, chunksize=2000):
                 for rec in records:
                     t = rec["metadata"]["task"]
-                    records_by_task[t].append(rec)
-                    task_counts[t] += 1
+                    # Use RNG to decide train vs eval
+                    if split_rng.random() < eval_ratio:
+                        records_eval.append(rec)
+                        task_counts_eval[t] += 1
+                    else:
+                        records_train.append(rec)
+                        task_counts_train[t] += 1
 
         # Rare task pass: generate from dedicated rare FEN pools (positives guaranteed)
-        # Then trim "none" answers so they are at most MAX_NONE_RATIO of total.
         MAX_NONE_RATIO = 0.30
         topup_rng = random.Random(rng.randint(0, 2**32))
         rare_fns = {name: fn for name, fn in _TASKS if name in _RARE_TASKS}
@@ -795,56 +904,74 @@ def main() -> None:
                 if result is None:
                     continue
                 question, answer = result
-                records_by_task[name].append(
-                    {
-                        "messages": [
-                            {"role": "user", "content": question},
-                            {"role": "assistant", "content": answer},
-                        ],
-                        "metadata": {"fen": fen, "task": name},
-                    }
-                )
-                task_counts[name] += 1
+                rec = {
+                    "messages": [
+                        {"role": "user", "content": question},
+                        {"role": "assistant", "content": answer},
+                    ],
+                    "metadata": {"fen": fen, "task": name},
+                }
+                # Split rare records 90/10
+                if split_rng.random() < eval_ratio:
+                    records_eval.append(rec)
+                    task_counts_eval[name] += 1
+                else:
+                    records_train.append(rec)
+                    task_counts_train[name] += 1
 
-            # Trim nones to MAX_NONE_RATIO
-            positives = [r for r in records_by_task[name] if r["messages"][1]["content"] != "none"]
-            nones = [r for r in records_by_task[name] if r["messages"][1]["content"] == "none"]
-            max_none = int(len(positives) * MAX_NONE_RATIO / (1.0 - MAX_NONE_RATIO))
-            topup_rng.shuffle(nones)
-            kept_nones = nones[:max_none]
-            records_by_task[name] = positives + kept_nones
-            task_counts[name] = len(records_by_task[name])
+            # Trim nones to MAX_NONE_RATIO in each set
+            train_positives = [r for r in records_train if r["metadata"]["task"] == name and r["messages"][1]["content"] != "none"]
+            train_nones = [r for r in records_train if r["metadata"]["task"] == name and r["messages"][1]["content"] == "none"]
+            eval_positives = [r for r in records_eval if r["metadata"]["task"] == name and r["messages"][1]["content"] != "none"]
+            eval_nones = [r for r in records_eval if r["metadata"]["task"] == name and r["messages"][1]["content"] == "none"]
+            
+            max_train_none = int(len(train_positives) * MAX_NONE_RATIO / (1.0 - MAX_NONE_RATIO))
+            max_eval_none = int(len(eval_positives) * MAX_NONE_RATIO / (1.0 - MAX_NONE_RATIO))
+            topup_rng.shuffle(train_nones)
+            topup_rng.shuffle(eval_nones)
+            
+            # Rebuild records lists without this task, then add trimmed version
+            records_train = [r for r in records_train if r["metadata"]["task"] != name]
+            records_eval = [r for r in records_eval if r["metadata"]["task"] != name]
+            
+            records_train.extend(train_positives + train_nones[:max_train_none])
+            records_eval.extend(eval_positives + eval_nones[:max_eval_none])
+            
+            task_counts_train[name] = len([r for r in records_train if r["metadata"]["task"] == name])
+            task_counts_eval[name] = len([r for r in records_eval if r["metadata"]["task"] == name])
+            
             _logger.info(
-                "  rare task %-20s pos=%d none=%d (%.0f%%) total=%d",
+                "  rare task %-20s train: pos=%d total=%d | eval: pos=%d total=%d",
                 name,
-                len(positives),
-                len(kept_nones),
-                100 * len(kept_nones) / max(task_counts[name], 1),
-                task_counts[name],
+                len(train_positives),
+                task_counts_train[name],
+                len(eval_positives),
+                task_counts_eval[name],
             )
 
-        for name, cnt in sorted(task_counts.items()):
+        _logger.info("Train task counts:")
+        for name, cnt in sorted(task_counts_train.items()):
             _logger.info("  task %-25s %d", name, cnt)
 
-        # Write all records fully shuffled
-        all_records = [r for recs in records_by_task.values() for r in recs]
-        topup_rng.shuffle(all_records)
-        with open(path, "w") as f:
-            for rec in all_records:
+        _logger.info("Eval task counts:")
+        for name, cnt in sorted(task_counts_eval.items()):
+            _logger.info("  task %-25s %d", name, cnt)
+
+        # Write both files
+        split_rng.shuffle(records_train)
+        split_rng.shuffle(records_eval)
+        
+        with open(train_path, "w") as f:
+            for rec in records_train:
                 f.write(json.dumps(rec) + "\n")
-        return len(all_records)
+        
+        with open(eval_path, "w") as f:
+            for rec in records_eval:
+                f.write(json.dumps(rec) + "\n")
+        
+        return len(records_train), len(records_eval)
 
-    # Split rare FENs 90/10 train/eval
-    rare_train: dict[str, list[str]] = {}
-    rare_eval: dict[str, list[str]] = {}
-    for task_name, pool in rare_fens_by_task.items():
-        rng.shuffle(pool)
-        split = max(1, int(len(pool) * 0.9))
-        rare_train[task_name] = pool[:split]
-        rare_eval[task_name] = pool[split:]
-
-    n_train = _write(args.output, train_fens, rare_train)
-    n_eval = _write(args.eval_output, list(eval_fens), rare_eval)
+    n_train, n_eval = _write_split(args.output, args.eval_output, fens, rare_fens_by_task, target_eval_records=args.eval_fens * args.tasks_per_fen)
     _logger.info("Train: %d records → %s", n_train, args.output)
     _logger.info("Eval:  %d records → %s", n_eval, args.eval_output)
 

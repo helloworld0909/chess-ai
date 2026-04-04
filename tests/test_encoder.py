@@ -546,7 +546,7 @@ import importlib.util as _ilu
 def _load_clip_train():
     spec = _ilu.spec_from_file_location(
         "encoder_clip_train",
-        str(Path(__file__).parent.parent / "recipes-train/encoder-clip/train.py"),
+        str(Path(__file__).parent.parent / "recipes-train/encoder-phase0/train.py"),
     )
     mod = _ilu.module_from_spec(spec)
     spec.loader.exec_module(mod)

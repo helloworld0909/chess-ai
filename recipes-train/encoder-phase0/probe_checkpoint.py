@@ -61,7 +61,7 @@ _CLASS_NAMES = ["empty", "wP", "wN", "wB", "wR", "wQ", "wK", "bP", "bN", "bB", "
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="recipes-train/encoder-clip/config.yaml")
+    parser.add_argument("--config", default="recipes-train/encoder-phase0/config.yaml")
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint.pt")
     parser.add_argument("--data", default="data/processed/encoder_pretrain_sf15_eval.jsonl")
     parser.add_argument("--n-positions", type=int, default=2000)

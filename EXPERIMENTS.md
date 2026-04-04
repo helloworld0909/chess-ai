@@ -7,15 +7,13 @@ Documents completed and abandoned training experiments.
 ## Active Training Pipeline
 
 ```
-encoder-pretrain (v2, 656M positions) ✅ complete → checkpoint-310000 (abandoned as upstream; encoder-clip retrains from scratch)
+encoder-phase0 (CLIP alignment, InfoNCE) ✅ complete → checkpoint-9000
         ↓
-encoder-clip (CLIP alignment, InfoNCE)  ← ACTIVE (step ~5710/20000)
+qwen3.5-4b-encoder-phase1-alignment (proj+LoRA alignment, 20 tasks) ← ACTIVE (step ~9100/32079)
         ↓
-qwen3.5-4b-encoder-pretrain-textbook  (textbook causal LM, encoder frozen, LoRA on LLM)
+qwen3.5-4b-encoder-phase2-sft         (board-reading Q&A + joint task)
         ↓
-qwen3.5-4b-encoder-phase1-sft         (board-reading Q&A + joint task)
-        ↓
-qwen3.5-4b-encoder-phase2-grpo        (RL on coaching quality)
+qwen3.5-4b-encoder-phase3-grpo        (RL on coaching quality)
 ```
 
 ### qwen3.5-4b-encoder-phase0-alignment (abandoned — architecture mismatch)
@@ -192,6 +190,8 @@ Our CNN encoder was pretrained on SF15 regression terms + piece classification (
 | `grpo_phase1c_board_reading_eval.jsonl` | same script | grpo-phase1 eval (disabled) | **active** |
 | `textbook_pretrain.jsonl` | `generate_textbook_pretrain.py` | encoder-pretrain-textbook train | **active** (3,093 chunks, ~2.7M tokens) |
 | `textbook_pretrain_eval.jsonl` | same script | encoder-pretrain-textbook eval | **active** |
+| `alignment_board_description.jsonl` | `generate_alignment_board_description.py` | phase1-alignment train | **active** (4.58M records, 20 tasks, dual-source) |
+| `alignment_board_description_eval.jsonl` | same script | phase1-alignment eval | **active** (103k records) |
 
 ---
 
@@ -207,7 +207,7 @@ From 4 runs of `qwen3.5-4b-encoder-phase0-alignment`, all plateauing at 0.53–0
 - **Grad norm is a lagging indicator.** Grad norm 0.015–0.022 looked "healthy" but projector was receiving near-zero useful gradient. Loss plateau + tiny grad norm = bootstrap deadlock, not convergence.
 - **The LLaVA method requires a CLIP-pretrained encoder.** See "CLIP-style encoder alignment" section below for the architectural fix.
 
-### encoder-clip (active — step ~5700)
+### encoder-phase0 (active — step ~5700)
 
 **Goal**: CLIP-style contrastive alignment of the ResNet CNN encoder against frozen Qwen3.5-4B text embeddings. Replaces the failed MLP projector phase0.
 
@@ -260,11 +260,67 @@ Grid ~730× above random — genuine alignment confirmed, not tau-cheating.
 - `OrderedDict.move_to_end()` on cache hit breaks Linux CoW → +335MB/min RAM growth → fixed by removing it (FIFO eviction)
 - DataLoader workers with `persistent_workers=True`: each forked worker inherits full RSS (~29GB) → fixed with `num_workers=0`
 
-**Status**: Active — step ~5700/20000, loss=8.04, top1_grid=0.367, top1_global=0.283
+**Status**: ✅ Complete — checkpoint-9000 used as encoder in phase1-alignment
 
 ---
 
-### CLIP-style chess encoder alignment (implemented — see encoder-clip section above)
+### qwen3.5-4b-encoder-phase1-alignment (ACTIVE — step ~9100/32079)
+
+**Goal**: LLaVA-style alignment — map CLIP-trained CNN embeddings into Qwen3.5-4B's embedding space. Trains `cnn.proj` + `cnn.global_proj` (14M params) + LoRA r=64 (85M params) jointly. CNN trunk frozen; LLM base weights frozen.
+
+**Why this works (vs. the failed phase0-alignment runs)**: The CNN encoder was now CLIP-trained (encoder-phase0) — its features lie on the LLM's language manifold. The projector just needs to rotate/scale into the exact LLM embedding dim. Previously the CNN had no language supervision and the projector had no useful gradient signal.
+
+**Architecture**:
+- Flat 65-token sentinel block: 64 per-square `<|vision_pad|>` + 1 global summary token
+- No square-label text anchors in the prompt — CNN carries all semantic meaning
+- Sentinel block placed before or after the question (50/50 random)
+- Labels masked: system prompt, user turn, think block all `-100`; only assistant answer trains
+
+**Hyperparameters**:
+- LR=5e-5 (both proj and LoRA), cosine schedule, warmup=500 steps
+- Batch: 8 per device × 2 GPU × 8 grad_accum = 128 effective
+- max_seq_length=320 (p99=287 for flat 65-token board + question)
+
+**Data**: `alignment_board_description.jsonl` — 4.58M train examples, 103k eval
+- **Dual-source**: main tasks from `encoder_pretrain_1b.jsonl` (tail, unseen by encoder); `eval_tier` + `sf15_dominant` from `encoder_pretrain_sf15.jsonl` (tail, unseen)
+- **20 tasks**: piece_abbr_at, piece_name_at, rank_contents, file_contents, count_piece_type, count_total_material, find_piece_type, is_square_occupied, attackers_at, is_pinned, mobility_at, side_to_move, castling_rights, en_passant, move_number, is_check, material_balance, who_is_better, eval_tier, sf15_dominant
+- **Rare task top-up**: castling_rights, en_passant, is_check, is_pinned pool-boosted to 3500 positives; eval_tier/sf15_dominant from 500k SF15 FENs; all trimmed to ≤30% "none" answers
+
+**Training runs**:
+
+| Steps | Notes |
+|-------|-------|
+| 0→6500 | Initial run from checkpoint. Loss 2.33→0.07 over first ~2k steps, then stable 0.07–0.12 |
+| 6500→7000 | Checkpoint-7000 corrupted (crashed mid-save during safetensors shared-tensor bug) |
+| 6500→ | Resumed from checkpoint-6500 after fixing save bug; batch lowered 16→8 per device (game using GPU 0) |
+
+**Key bugs fixed this session**:
+1. **Token accuracy = 0**: `logit[i]` was compared to `label[i]` without causal shift. Fix: shift both by 1, deduplicate per step with `_acc_logged_at_step`.
+2. **Loss jump 0.07→0.4 on resume**: `compute_loss` override called `model(**inputs)` directly, bypassing DDP+liger kernel. Fix: use `super().compute_loss(return_outputs=True)`.
+3. **safetensors crash on checkpoint save**: Qwen ties `embed_tokens.weight` and `lm_head.weight`; safetensors refuses shared tensors. Fix: clone `lm_head.weight` before save, call `tie_weights()` after.
+4. **`--init-proj` loss spike to 5.0**: Removed. Loading proj+LoRA from a checkpoint without restoring optimizer state caused instability. Use `--resume` instead.
+5. **start.sh resume path dropped**: `$2` (checkpoint path) was not captured. Fixed.
+
+**Eval accuracy** (fixed 40 samples, 2 per task):
+
+| Step  | Accuracy | Notes |
+|-------|----------|-------|
+| 6500  | 90%      | 36/40 |
+| ~7000 | 85-87.5% | 34-35/40 (game on GPU slowing training) |
+| ~9100 | ~85-90%  | Stable |
+
+**Failing tasks analysis** (not data quality — all labels verified correct):
+- `attackers_at`: model outputs `none` for non-trivial cases — hardest spatial reasoning task, still learning
+- `en_passant` (specific square): off by a file (`e3` vs `c3`) — very rare signal (0.1% of data), model gets direction but not exact file
+- `move_number`: off by 1-3 — continuous value hard to encode precisely in CNN global token
+- `mobility_at`: off by ~2 — pseudo-legal vs legal move count edge cases
+- `sf15_dominant`: wrong term when top-2 SF15 terms are close in magnitude — ambiguous ground truth
+
+**Status**: Active — step ~9100/32079, loss ~0.09, token_acc ~1.0 (easy tasks), ~85-90% eval accuracy
+
+---
+
+### CLIP-style chess encoder alignment (implemented — see encoder-phase0 section above)
 
 **Why LLaVA works and our approach fails:**
 

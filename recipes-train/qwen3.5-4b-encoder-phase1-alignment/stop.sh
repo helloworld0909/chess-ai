@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-PID_FILE="/tmp/phase0-alignment.pid"
+PID_FILE="/tmp/phase1-alignment.pid"
 
 if [[ ! -f "$PID_FILE" ]]; then
   echo "No PID file found ($PID_FILE). Is training running?"

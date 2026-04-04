@@ -3,11 +3,11 @@
 # DDP: 2× RTX 5090  |  Output: checkpoints/encoder-clip/
 #
 # Usage:
-#   ./recipes-train/encoder-clip/start.sh
-#   ./recipes-train/encoder-clip/start.sh --resume checkpoints/encoder-clip/checkpoint-2000/checkpoint.pt
+#   ./recipes-train/encoder-phase0/start.sh
+#   ./recipes-train/encoder-phase0/start.sh --resume checkpoints/encoder-clip/checkpoint-2000/checkpoint.pt
 #
-# Logs: /tmp/encoder-clip.log
-# Stop: ./recipes-train/encoder-clip/stop.sh
+# Logs: /tmp/encoder-phase0.log
+# Stop: ./recipes-train/encoder-phase0/stop.sh
 
 set -euo pipefail
 
@@ -15,8 +15,8 @@ RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$(dirname "$RECIPE_DIR")")"
 cd "$REPO_ROOT"
 
-LOG_FILE="/tmp/encoder-clip.log"
-PID_FILE="/tmp/encoder-clip.pid"
+LOG_FILE="/tmp/encoder-phase0.log"
+PID_FILE="/tmp/encoder-phase0.pid"
 CONFIG="$RECIPE_DIR/config.yaml"
 NPROC=2
 EXTRA_ARGS=()
@@ -43,7 +43,7 @@ echo "Devices: $NPROC GPUs (DDP)"
 echo "Log    : $LOG_FILE"
 echo ""
 
-TRAIN_CMD="torchrun --nproc_per_node=$NPROC recipes-train/encoder-clip/train.py --config $CONFIG ${EXTRA_ARGS[*]:-}"
+TRAIN_CMD="torchrun --nproc_per_node=$NPROC recipes-train/encoder-phase0/train.py --config $CONFIG ${EXTRA_ARGS[*]:-}"
 
 # shellcheck disable=SC2086
 nohup bash -c "source $REPO_ROOT/.venv/bin/activate \
