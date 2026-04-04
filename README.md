@@ -1,42 +1,59 @@
 # Chess AI Tutor
 
-A chess analysis system combining Stockfish evaluations with a fine-tuned encoder+LLM model for move coaching. The model uses a CNN board encoder to inject positional embeddings into the LLM, then learns to annotate engine key lines and produce coaching comments via SFT + GRPO.
+A chess coaching system built on a multimodal encoder+LLM architecture. A ResNet CNN board encoder is CLIP-aligned to Qwen3.5-4B's embedding space, then fine-tuned jointly to annotate engine key lines and produce coaching comments.
 
-## Features
+## Current Training Pipeline
 
-- **Move Analysis**: Classify moves via Stockfish (Best/Inaccuracy/Mistake/Blunder)
-- **Encoder-augmented LLM**: ResNet CNN encodes board states → embeddings injected at `<|vision_pad|>` tokens in the prompt
-- **SF15 Term Annotations**: Each engine key line move annotated with classical eval term diffs (mobility, king safety, threats, etc.)
-- **Natural Language Coaching**: Model produces structured line analysis + coaching comment grounded in SF15 terms
-- **Web UI**: Browser-based game review with chess.com integration
-- **MCP Integration**: Stockfish tools via Model Context Protocol
+```
+encoder-phase0 (CLIP alignment, InfoNCE) ✅ checkpoint-9000
+        ↓
+phase1-alignment (proj+LoRA, 20 board-reading tasks) ← ACTIVE (step ~9100/32079)
+        ↓
+phase2-sft  (joint task: annotated lines + coaching comment)
+        ↓
+phase3-grpo (RL on SF15 annotation accuracy + comment quality)
+```
+
+### Architecture
+
+The model injects a flat block of 65 `<|vision_pad|>` sentinel tokens (64 per-square + 1 global) into the LLM prompt. The CNN encoder maps the board tensor to `(65, 2560)` embeddings which replace the sentinel token embeddings before the LLM forward pass.
+
+```
+Board (FEN) ──→ ChessEncoder (ResNet, 10 blocks, 256 filters)
+                    ├─ 64 per-square tokens ──→ proj MLP (256→2560) ──→ grid embeddings
+                    └─ 1 global token ─────→ cross-attn + MLP ────→ global embedding
+                                                        ↓
+[system] [65 × <|vision_pad|>] [question]  ←── injected into LLM prompt
+                                                        ↓
+                                              Qwen3.5-4B + LoRA r=64
+```
+
+**Why CLIP first**: The CNN was initially pretrained on SF15 regression (no language supervision), leaving its features in an arbitrary space unrelated to the LLM's embedding manifold. Direct projector alignment failed — the LLM ignores CNN tokens and solves tasks from text instead (bootstrap deadlock). encoder-phase0 fixes this by contrastively aligning CNN features to Qwen3.5-4B text embeddings via InfoNCE before any projector training.
+
+---
 
 ## Installation
 
 ```bash
-uv sync
+uv sync --extra training
+export STOCKFISH_PATH="$HOME/.local/bin/stockfish"
+export SF15_PATH="$HOME/.local/bin/stockfish-15"
 ./scripts/test.sh -v
 ```
 
-Set Stockfish path:
-```bash
-export STOCKFISH_PATH="$HOME/.local/bin/stockfish"
-export SF15_PATH="$HOME/.local/bin/stockfish-15"
-```
-
-## Quick Start
+## Training
 
 ```bash
-# Game review (fetches chess.com games, opens browser UI)
-uv run chess-review <username>
+# Phase 1 alignment (active)
+./recipes-train/qwen3.5-4b-encoder-phase1-alignment/start.sh
+./recipes-train/qwen3.5-4b-encoder-phase1-alignment/start.sh --resume   # resume last checkpoint
+./recipes-train/qwen3.5-4b-encoder-phase1-alignment/start.sh --resume checkpoints/.../checkpoint-N
 
-# Launch encoder inference server (phase1-sft checkpoint, port 8200)
-./recipes-train/qwen3.5-4b-encoder-phase1-sft/serve.sh
+# Monitor
+tail -f /tmp/phase1-alignment.log
 
-# Launch web UI (port 8080)
-STOCKFISH_PATH=/home/zheng/.local/bin/stockfish \
-ENCODER_SERVER_URL=http://localhost:8200 \
-PYTHONPATH=src uv run uvicorn tutor.web:app --host 0.0.0.0 --port 8080
+# encoder-phase0 CLIP training (complete)
+./recipes-train/encoder-phase0/start.sh
 ```
 
 ---
@@ -45,89 +62,62 @@ PYTHONPATH=src uv run uvicorn tutor.web:app --host 0.0.0.0 --port 8080
 
 ### `src/`
 
-- `chess_mcp/` — MCP server + async Stockfish wrapper (6 tools: get_best_move, get_eval, compare_moves, ...)
+- `encoder/` — Board tensor builder, `BOARD_TOKEN` / `BOARD_TOKEN_ID` constants
 - `verification/` — Move legality validation + GRPO reward functions (`rewards.py`)
+- `chess_mcp/` — MCP server + async Stockfish wrapper
 - `tutor/` — FastAPI web server, chess.com client, prompt templates
-- `encoder/` — Board tensor builder (`MOVE_TOKEN`, `MOVE_TOKEN_ID` constants)
 
 ### `training/`
 
-- `encoder_model.py` — `ChessLMWithEncoder`: Qwen3.5-4B + ResNet CNN (72M params), PEFT LoRA wrapper
-- `encoder_collator.py` — Builds board tensors from FEN + SAN sequences; injects at `<|vision_pad|>` positions
-- `lib.py` — Shared SFT utilities: `load_jsonl_lines`, `strip_think_from_target`, `make_training_args`
+- `encoder_model.py` — `ChessLMWithEncoder`: wraps Qwen3.5-4B + ChessEncoder CNN; handles sentinel injection
+- `encoder_collator.py` — Builds board tensors from FEN; injects at `<|vision_pad|>` positions
+- `lib.py` — Shared training utilities
 
 ### `recipes-train/`
 
 | Recipe | Purpose | Status |
 |--------|---------|--------|
-| `encoder-pretrain/` | CNN encoder: 13 SF15 terms + piece classification (656M positions) | 🔄 Training v2 |
-| `qwen3.5-4b-encoder-phase1-sft/` | SFT: joint task with engine key lines + coaching comment | ✅ Done (`checkpoint-890`) |
-| `qwen3.5-4b-grpo-phase1/` | GRPO: board reading pretraining (piece location, count, etc.) | 🔄 Active (phase1d) |
-| `qwen3.5-4b-encoder-phase2-grpo/` | GRPO: SF15 annotation accuracy + comment quality rewards | ⏸ Paused |
+| `encoder-phase0/` | CLIP-style InfoNCE alignment of CNN to Qwen3.5-4B | ✅ checkpoint-9000 |
+| `qwen3.5-4b-encoder-phase1-alignment/` | proj+LoRA alignment, 20 board-reading tasks | 🔄 step ~9100/32079 |
+| `qwen3.5-4b-encoder-phase2-sft/` | SFT: annotated key lines + coaching comment | ⏳ pending |
+| `qwen3.5-4b-encoder-phase3-grpo/` | GRPO: SF15 annotation + comment quality rewards | ⏳ pending |
 
 ### `data/pipeline/`
 
-- `generate_encoder_pretrain_sf15.py` — 656M board positions with SF15 term labels → `encoder_pretrain_sf15.jsonl`
+- `generate_alignment_board_description.py` — 5M board positions × 20 tasks → `alignment_board_description.jsonl`
+- `generate_encoder_pretrain_sf15.py` — 656M positions with SF15 term labels → `encoder_pretrain_sf15.jsonl`
 - `generate_phase2_data.py` — Textbook positions + Stockfish depth-18 → `lines_joint_sft.jsonl`
-- `generate_grpo_joint_prompts.py` — Lichess `lines_30k.jsonl` + SF15 annotations → `grpo_joint_prompts_sf15.jsonl`
-- `parse_pgn_study.py` — Lichess annotated studies → clean prose text with `[Position: FEN]` tokens
-- `parse_textbook_pgn.py` — Gutenberg ASCII board books (Lasker notation) → clean prose with FEN tokens
-- `sf15_eval.py` — Stockfish 15 classical eval term wrapper (`get_sf15_eval(fen)`)
+- `generate_grpo_joint_prompts.py` — Lichess positions + SF15 annotations → `grpo_joint_prompts_sf15.jsonl`
+- `sf15_eval.py` — Stockfish 15 classical eval term wrapper
 
-### `data/processed/` (active datasets)
+### `data/processed/` (active)
 
 | File | Records | Used by |
 |------|---------|---------|
-| `encoder_pretrain_sf15.jsonl` | 656M | encoder-pretrain v2 |
-| `encoder_pretrain_sf15_eval.jsonl` | 6.6M | encoder-pretrain v2 eval |
-| `lines_joint_sft.jsonl` | 28k | phase1-sft |
-| `sft_phase1_board_reading.jsonl` | 100k | grpo-phase1 |
-| `grpo_joint_prompts_sf15.jsonl` | 14,950 | phase2-grpo |
-| `lines_30k.jsonl` | 30k | source for grpo prompts |
-| `textbooks/*.txt` | 8 books, ~1,058 positions | future SFT |
+| `alignment_board_description.jsonl` | 4.58M | phase1-alignment train |
+| `alignment_board_description_eval.jsonl` | 103k | phase1-alignment eval |
+| `encoder_pretrain_sf15.jsonl` | 656M | encoder-phase0 CLIP training, phase1-alignment SF15 tasks |
+| `encoder_pretrain_1b.jsonl` | ~1B | phase1-alignment main tasks (source) |
 
 ---
 
-## Training Pipeline
+## Phase 1 Alignment — 20 Tasks
 
-### Architecture
+The alignment dataset trains the model to answer direct board-reading questions using only the 65 CNN sentinel tokens — no text anchors. Tasks are split by what information they probe:
 
-```
-User prompt:
-  ## Engine Key Lines
-  PLAYED LINE: <|vision_pad|>Ne5 [mobility +0.32; threats +0.18] → <|vision_pad|>d4 [...] | eval: equal
-  Line 1: <|vision_pad|>Nd5 [king safety +0.21] → ...
+**Per-square** (probe grid tokens): `piece_abbr_at`, `piece_name_at`, `rank_contents`, `file_contents`, `count_piece_type`, `count_total_material`, `find_piece_type`, `is_square_occupied`, `attackers_at`, `is_pinned`, `mobility_at`
 
-  ↑ CNN injects board embeddings at each <|vision_pad|> token
+**Global** (probe summary token): `side_to_move`, `castling_rights`, `en_passant`, `move_number`, `is_check`, `material_balance`, `who_is_better`
 
-Assistant output:
-  <think>
-  PLAYED: Ne5 → d4 | eval: equal
-    Ne5: mobility +0.32, threats +0.18 → centralises knight, creates tactical pressure
-    ...
-  </think>
-  <line>LINE 1: Ne5 (centralise knight) → d4 (gain space) | eval: equal</line>
-  [coaching comment]
-```
+**SF15-dependent** (from `encoder_pretrain_sf15.jsonl`): `eval_tier`, `sf15_dominant`
 
-### Phase 1 — SFT (`qwen3.5-4b-encoder-phase1-sft`)
+Current eval accuracy: ~85–90% at step 9100/32079.
 
-Cold-starts the joint task: given board + student move + engine key lines with SF15 annotations, output annotated lines + coaching comment.
+---
 
-```bash
-./recipes-train/qwen3.5-4b-encoder-phase1-sft/start.sh
-```
+## Phase 3 GRPO Rewards
 
-### Phase 2 — GRPO (`qwen3.5-4b-encoder-phase2-grpo`)
-
-Reinforcement learning from verifiable rewards. Starts from phase1 checkpoint-890.
-
-```bash
-./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh
-./recipes-train/qwen3.5-4b-encoder-phase2-grpo/start.sh --resume   # resume last checkpoint
-```
-
-**Rewards** (6 total, all free — no LLM judge):
+Reinforcement learning from verifiable rewards — no LLM judge needed:
 
 | Reward | Weight | Signal |
 |--------|--------|--------|
@@ -138,36 +128,16 @@ Reinforcement learning from verifiable rewards. Starts from phase1 checkpoint-89
 | RC_tone | 0.20 | Chess concept vocabulary in coaching comment |
 | RC_educ | 0.20 | Grounded moves + causal reasoning in comment |
 
-Key config: `beta=0.0` (no reference model, pure REINFORCE), 2-GPU DDP, 50-sample eval set.
-
----
-
-## GRPO Reward Details
-
-`R3b sf15_annotation` is the primary learning signal. For each move in the prompt's Engine Key Lines that has notable SF15 term diffs (|delta| ≥ 0.10), it checks whether the model's `<think>` block interprets the top term in the correct direction using a vocabulary mapping (`_SF15_TERM_VOCAB` in `rewards.py`).
-
-Example: prompt shows `Ne5 [mobility +0.32]` → model says "improves piece activity" → +1.0. Model says "restricts pieces" → −1.0. Model ignores the term → 0.0.
-
 ---
 
 ## Tests
 
 ```bash
-./scripts/test.sh -v   # 288 tests
+./scripts/test.sh -v
 ```
-
-| File | Coverage |
-|------|---------|
-| `test_stockfish.py` | Stockfish wrapper |
-| `test_mcp_tools.py` | MCP tools |
-| `test_verification.py` | Move legality |
-| `test_representations.py` | Board display |
-| `test_rewards.py` | All 6 GRPO reward functions |
-| `test_encoder.py` | Board tensors, CNN forward pass |
-| `test_chesscom.py` | chess.com API client |
 
 ---
 
 ## Experiments Log
 
-See [EXPERIMENTS.md](EXPERIMENTS.md) for a history of tried approaches and why each was abandoned or superseded.
+See [EXPERIMENTS.md](EXPERIMENTS.md) for a full history of tried approaches, what failed, and why.
