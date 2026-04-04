@@ -19,8 +19,8 @@ from encoder.cnn import ChessEncoder, ResidualBlock
 
 _REPO = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _REPO)
-from training.encoder_collator import EncoderDataCollator
-from training.encoder_model import ChessLMWithEncoder
+from src.model.encoder_collator import EncoderDataCollator
+from src.model.encoder_model import ChessLMWithEncoder
 
 
 def _load_module(path: str, name: str):

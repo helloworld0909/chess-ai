@@ -17,9 +17,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.encoder import BOARD_TOKEN, BOARD_TOKEN_ID, BOARD_TOKENS_PER_POSITION
-from training.encoder_collator import EncoderDataCollator
-from training.encoder_model import ChessLMWithEncoder
-from training.lib import (
+from src.model.encoder_collator import EncoderDataCollator
+from src.model.encoder_model import ChessLMWithEncoder
+from src.model.lib import (
     load_config,
     load_jsonl_lines,
     make_training_args,

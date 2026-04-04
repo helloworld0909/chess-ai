@@ -18,7 +18,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.encoder import MOVE_TOKEN, MOVE_TOKEN_ID
 from src.encoder.board_tensor import board_to_tensor
-from training.lib import load_config
+from src.model.lib import load_config
 
 _logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ def load_encoder_model(checkpoint_dir: str, config_path: str) -> tuple:
     from safetensors.torch import load_file
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    from training.encoder_model import ChessLMWithEncoder
+    from src.model.encoder_model import ChessLMWithEncoder
 
     config = load_config(config_path)
     model_cfg = config.get("model", {})

@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.encoder import MOVE_TOKEN, MOVE_TOKEN_ID
 from src.encoder.board_tensor import board_to_tensor
-from training.encoder_model import ChessLMWithEncoder
+from src.model.encoder_model import ChessLMWithEncoder
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

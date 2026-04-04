@@ -108,7 +108,7 @@ def _load_model(checkpoint_dir: str, config_path: str, device: str):
     from safetensors.torch import load_file
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from training.encoder_model import ChessLMWithEncoder
+    from src.model.encoder_model import ChessLMWithEncoder
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)

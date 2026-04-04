@@ -36,7 +36,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.encoder.board_tensor import board_to_tensor
 from src.encoder.cnn import ChessEncoder
-from training.lib import load_config
+from src.model.lib import load_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
