@@ -21,6 +21,8 @@ Think block tokens (<think>\n\n</think>\n\n) are masked from loss.
 """
 
 import argparse
+import glob
+import json as _json_mod
 import logging
 import os
 import random
@@ -34,6 +36,24 @@ from src.encoder.board_tensor import board_to_tensor
 from src.model.encoder_collator import EncoderDataCollator
 from src.model.encoder_model import ChessLMWithEncoder
 from src.model.lib import load_config, make_training_args
+
+
+def _resolve_checkpoint(resume_arg: str | bool | None, output_dir: str) -> str | None:
+    """Return the absolute checkpoint directory, or None if not resuming.
+
+    `--resume` (no value) → latest checkpoint-* in output_dir.
+    `--resume <path>`    → use that path directly.
+    """
+    if resume_arg is None:
+        return None
+    if resume_arg is True:
+        candidates = sorted(glob.glob(os.path.join(output_dir, "checkpoint-*")))
+        if not candidates:
+            return None
+        return candidates[-1]
+    path = str(resume_arg)
+    return path if os.path.isdir(path) else None
+
 
 _logger = logging.getLogger(__name__)
 
@@ -143,6 +163,13 @@ def main() -> None:
         default="recipes-train/qwen3.5-4b-encoder-phase1-alignment/config.yaml",
     )
     parser.add_argument("--resume", nargs="?", const=True, default=None)
+    parser.add_argument(
+        "--init-from",
+        default=None,
+        help="Load model weights from a checkpoint dir (model.safetensors) without "
+        "restoring optimizer/scheduler/dataloader state. Use this to continue "
+        "training on a new dataset from a previous checkpoint.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -324,14 +351,13 @@ def main() -> None:
         train_dataset._world_size = world_size
 
         # Resume: seek past already-seen examples so we don't retrain on old data.
-        if args.resume and isinstance(args.resume, str):
-            state_file = os.path.join(args.resume, "trainer_state.json")
+        checkpoint_dir = _resolve_checkpoint(args.resume, config.get("output_dir", ""))
+        if checkpoint_dir:
+            state_file = os.path.join(checkpoint_dir, "trainer_state.json")
             if os.path.exists(state_file):
                 with open(state_file) as _f:
-                    _state = json.load(_f)
+                    _state = _json_mod.load(_f)
                 _resumed_step = _state.get("global_step", 0)
-                # train_batch_size in trainer_state = per_device × world_size (no grad_accum).
-                # Multiply by grad_accum to get examples consumed per optimizer step.
                 _ckpt_batch = _state.get("train_batch_size", 0)
                 if _ckpt_batch:
                     _grad_accum = train_cfg.get("gradient_accumulation_steps", 8)
@@ -344,9 +370,10 @@ def main() -> None:
                     )
                 train_dataset._resume_examples = _resumed_step * _effective
                 _logger.info(
-                    "Resuming from step %d — skipping %d examples per dataset",
+                    "Resuming from step %d — skipping %d examples (checkpoint: %s)",
                     _resumed_step,
                     train_dataset._resume_examples,
+                    os.path.basename(checkpoint_dir),
                 )
 
         # Trainer requires max_steps for IterableDataset (no __len__).
@@ -357,11 +384,12 @@ def main() -> None:
             * train_cfg.get("gradient_accumulation_steps", 8)
         )
         epochs = train_cfg.get("num_train_epochs", 1)
+        computed_max_steps = train_size * epochs // effective_batch
         _logger.info(
             "Streaming dataset: %d examples, effective_batch=%d → max_steps=%d",
             train_size,
             effective_batch,
-            train_size * epochs // effective_batch,
+            computed_max_steps,
         )
 
     raw_eval = _load_jsonl(train_cfg["eval_file"], limit=20 if args.dry_run else 2000)
@@ -372,8 +400,13 @@ def main() -> None:
 
     training_args = make_training_args(config)
     training_args.remove_unused_columns = False
+    # Our IterableDataset handles data skipping via _resume_examples.
+    # Trainer's built-in skip would conflict (consume+discard a full epoch).
+    training_args.ignore_data_skip = True
     if not args.dry_run:
-        training_args.max_steps = train_size * epochs // effective_batch
+        # Use explicit max_steps from config if set; otherwise compute from epochs
+        config_max_steps = train_cfg.get("max_steps", None)
+        training_args.max_steps = config_max_steps if config_max_steps else computed_max_steps
 
     # EncoderDataCollator already builds board_tensors_flat from the fen field correctly.
     # A subclass that calls super() then re-reads feat["fen"] is wrong — super() pops
@@ -431,6 +464,11 @@ def main() -> None:
             if "loss" in logs and hasattr(self, "_pending_token_acc"):
                 logs = {**logs, "train/token_acc": round(self._pending_token_acc, 4)}
                 del self._pending_token_acc
+            # For IterableDataset, Trainer computes epoch from iterator
+            # exhaustion count.  Override state.epoch so super().log()
+            # picks up step/max_steps as actual training progress.
+            if self.args.max_steps > 0:
+                self.state.epoch = self.state.global_step / self.args.max_steps
             super().log(logs, *args, **kwargs)
 
         def save_model(self, output_dir=None, _internal_call=False):
@@ -444,8 +482,20 @@ def main() -> None:
             if tied:
                 llm.tie_weights()
 
-    # Pick 2 fixed examples per task type for eval logging
-    _SAMPLES_PER_TASK = 2
+    # Pick 10 fixed examples per task type for eval logging
+    _SAMPLES_PER_TASK = 10
+    _MEDIUM_TASKS = {
+        "hanging_pieces",
+        "capture_on_square",
+        "give_check",
+        "threaten_piece_with",
+        "fork_move",
+        "doubled_pawns",
+        "isolated_pawn_at",
+        "passed_pawn",
+        "checkmate_in_one",
+        "board_inventory",
+    }
     _log_samples: list[dict] = []
     task_counts: dict[str, int] = {}
     for ex in raw_eval:
@@ -509,7 +559,7 @@ def main() -> None:
                     text_embeds[0, sentinel_mask] = cnn_tokens[0, : sentinel_mask.sum()]
                     out = model.llm.generate(
                         inputs_embeds=text_embeds,
-                        max_new_tokens=32,
+                        max_new_tokens=120,
                         do_sample=False,
                         pad_token_id=tokenizer.eos_token_id,
                     )
@@ -549,10 +599,44 @@ def main() -> None:
         callbacks=[SampleLogCallback()],
     )
 
+    if args.init_from:
+        # Load model weights only — no optimizer/scheduler/dataloader state.
+        # Used to continue training on a new dataset from a previous checkpoint.
+        # Only load trainable keys (LoRA adapters + cnn.proj + cnn.global_proj) to avoid
+        # loading the full frozen base LLM weights and inflating VRAM.
+        safetensors_path = os.path.join(args.init_from, "model.safetensors")
+        _logger.info("Loading trainable weights from %s (init-from)", safetensors_path)
+        from safetensors.torch import load_file as _load_safetensors
+
+        # Load to CPU first, filter to trainable keys, then move to GPU.
+        # Loading directly to CUDA would map the full ~9GB file onto GPU before filtering.
+        full_state = _load_safetensors(safetensors_path, device="cpu")
+        trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
+        filtered = {
+            k: v.to(f"cuda:{local_rank}") for k, v in full_state.items() if k in trainable_keys
+        }
+        del full_state
+        missing, unexpected = model.load_state_dict(filtered, strict=False)
+        non_trainable_missing = [k for k in missing if k in trainable_keys]
+        if non_trainable_missing:
+            _logger.warning("init-from missing trainable keys: %s", non_trainable_missing[:10])
+        _logger.info(
+            "Loaded %d/%d trainable keys from %s",
+            len(filtered),
+            len(trainable_keys),
+            args.init_from,
+        )
+
     if args.dry_run:
         _logger.info("Dry run complete — exiting before training.")
         return
 
+    if args.resume:
+        _logger.info(
+            "Resuming from %s — Trainer will restore full model/optimizer/scheduler state "
+            "(encoder CLIP weights above are overwritten by checkpoint).",
+            args.resume,
+        )
     trainer.train(resume_from_checkpoint=args.resume)
     trainer.save_model()
     tokenizer.save_pretrained(training_args.output_dir)

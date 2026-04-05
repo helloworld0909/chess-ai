@@ -28,19 +28,25 @@ _logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def load_encoder_model(checkpoint_dir: str, config_path: str) -> tuple:
+def load_encoder_model(
+    checkpoint_dir: str,
+    config_path: str,
+    device: str | int = 0,
+) -> tuple:
     """Load ChessLMWithEncoder from a Trainer.save_model() checkpoint.
 
     Args:
         checkpoint_dir: Path to directory containing model.safetensors
         config_path: Path to the training config YAML (for architecture params)
+        device: CUDA device index or string (e.g. 0, 1, "cuda:0"). The full
+                model is placed on this single device for data-parallel inference.
 
     Returns:
-        (model, tokenizer) — model in eval mode on CUDA
+        (model, tokenizer) — model in eval mode on the specified device
     """
     from peft import LoraConfig, get_peft_model
     from safetensors.torch import load_file
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from src.model.encoder_model import ChessLMWithEncoder
 
@@ -50,20 +56,20 @@ def load_encoder_model(checkpoint_dir: str, config_path: str) -> tuple:
     encoder_cfg = config.get("encoder", {})
     model_name = model_cfg["model_name"]
 
+    device_str = f"cuda:{device}" if isinstance(device, int) else device
+
     _logger.info("Loading tokenizer: %s", model_name)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # for generation
 
-    _logger.info("Loading base LLM (8-bit)...")
-    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    _logger.info("Loading base LLM (bf16) onto %s...", device_str)
     base_llm = AutoModelForCausalLM.from_pretrained(
         model_name,
-        quantization_config=bnb_config,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        device_map={"": 0},
+        device_map={"": device_str},
         attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
     )
 
@@ -97,10 +103,9 @@ def load_encoder_model(checkpoint_dir: str, config_path: str) -> tuple:
     if unexpected:
         _logger.warning("Unexpected keys: %s", unexpected[:5])
 
-    # Move CNN to the same device as the LLM
-    model.cnn.to(device=torch.device("cuda:0"), dtype=torch.bfloat16)
+    model.cnn.to(device=torch.device(device_str), dtype=torch.bfloat16)
     model.eval()
-    _logger.info("Model ready.")
+    _logger.info("Model ready on %s.", device_str)
     return model, tokenizer
 
 

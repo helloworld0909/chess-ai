@@ -39,6 +39,7 @@ train.venv/
 htmlcov/
 .tox/
 .nox/
+results/
 
 # Data (large files)
 data/raw/

@@ -23,6 +23,7 @@ PID_FILE="/tmp/phase1-alignment.pid"
 CONFIG="recipes-train/qwen3.5-4b-encoder-phase1-alignment/config.yaml"
 
 RESUME_ARG=""
+INIT_FROM_ARG=""
 if [ "${1:-}" = "--resume" ]; then
     # Pass the checkpoint path if provided, else let Trainer auto-find last checkpoint.
     if [ -n "${2:-}" ]; then
@@ -30,6 +31,9 @@ if [ "${1:-}" = "--resume" ]; then
     else
         RESUME_ARG="--resume"
     fi
+elif [ "${1:-}" = "--init-from" ]; then
+    # Load weights only — no optimizer/dataloader state restore. For new-dataset continuation.
+    INIT_FROM_ARG="--init-from ${2}"
 fi
 
 TRAIN_CMD="torchrun \
@@ -37,7 +41,8 @@ TRAIN_CMD="torchrun \
     --master_port=29500 \
     recipes-train/qwen3.5-4b-encoder-phase1-alignment/train.py \
     --config $CONFIG \
-    $RESUME_ARG"
+    $RESUME_ARG \
+    $INIT_FROM_ARG"
 
 echo "Starting phase0 alignment training (log: $LOG_FILE)"
 

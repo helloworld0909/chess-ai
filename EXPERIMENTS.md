@@ -9,9 +9,9 @@ Documents training experiments, architecture decisions, and lessons learned.
 ```
 encoder-phase0 (CLIP alignment, InfoNCE) ✅ complete → checkpoint-9000
         ↓
-qwen3.5-4b-encoder-phase1-alignment (proj+LoRA alignment, 20 tasks) ← ACTIVE (step ~9100/32079)
+qwen3.5-4b-encoder-phase1-alignment (proj+LoRA alignment, 30 tasks) ✅ complete → checkpoint-7500
         ↓
-qwen3.5-4b-encoder-phase2-sft         (board-reading Q&A + joint task)
+qwen3.5-4b-encoder-phase2-sft         (board-reading Q&A + joint task)  ← NEXT
         ↓
 qwen3.5-4b-encoder-phase3-grpo        (RL on coaching quality)
 ```
@@ -88,7 +88,7 @@ Grid ~730× above random — genuine alignment confirmed, not tau-cheating.
 
 ---
 
-### qwen3.5-4b-encoder-phase1-alignment (ACTIVE — step ~9100/32079)
+### qwen3.5-4b-encoder-phase1-alignment (✅ complete — checkpoint-7500)
 
 **Goal**: LLaVA-style alignment — map CLIP-trained CNN embeddings into Qwen3.5-4B's embedding space. Trains `cnn.proj` + `cnn.global_proj` (14M params) + LoRA r=64 (85M params) jointly. CNN trunk frozen; LLM base weights frozen.
 
@@ -101,46 +101,70 @@ Grid ~730× above random — genuine alignment confirmed, not tau-cheating.
 - Sentinel block placed before or after the question (50/50 random)
 - Labels masked: system prompt, user turn, think block all `-100`; only assistant answer trains
 
-**Hyperparameters**:
+**Two runs** (easy dataset first, then medium dataset for harder tasks):
+
+**Run 1 — easy dataset** (`alignment_board_description.jsonl`, 20 tasks, 4.58M examples):
 - LR=5e-5 (both proj and LoRA), cosine schedule, warmup=500 steps
-- Batch: 8 per device × 2 GPU × 8 grad_accum = 128 effective
-- max_seq_length=320 (p99=287 for flat 65-token board + question)
+- Batch: 8 per device × 2 GPU × 8 grad_accum = 128 effective; max_seq_length=320
+- Loss: 2.33→0.07 over first ~2k steps, stable 0.07–0.12 thereafter
+- Crashed at step 6500 (safetensors shared-tensor bug); resumed; stopped at ~9100 steps
 
-**Data**: `alignment_board_description.jsonl` — 4.58M train, 103k eval
-- **Dual-source**: main tasks from `encoder_pretrain_1b.jsonl` (tail, unseen by encoder); `eval_tier` + `sf15_dominant` from `encoder_pretrain_sf15.jsonl` (tail, unseen)
-- **20 tasks**: piece_abbr_at, piece_name_at, rank_contents, file_contents, count_piece_type, count_total_material, find_piece_type, is_square_occupied, attackers_at, is_pinned, mobility_at, side_to_move, castling_rights, en_passant, move_number, is_check, material_balance, who_is_better, eval_tier, sf15_dominant
-- **Rare task top-up**: castling_rights, en_passant, is_check, is_pinned pool-boosted to 3500 positives; eval_tier/sf15_dominant from 500k SF15 FENs; all trimmed to ≤30% "none" answers
-
-**Training runs**:
-
-| Steps | Notes |
-|-------|-------|
-| 0→6500 | Initial run. Loss 2.33→0.07 over first ~2k steps, then stable 0.07–0.12 |
-| 6500→7000 | Checkpoint-7000 corrupted (crashed mid-save — safetensors shared-tensor bug) |
-| 6500→ | Resumed from checkpoint-6500 after fixing save bug; batch 16→8 per device |
+**Run 2 — medium dataset** (`alignment_board_description_medium.jsonl`, 30 tasks, 1.16M examples):
+- Same hyperparameters; max_seq_length=300 (shorter sequences)
+- Adds 10 medium tasks: hanging_pieces, capture_on_square, give_check, threaten_piece_with, fork_move, doubled_pawns, isolated_pawn_at, passed_pawn, checkmate_in_one, board_inventory
+- 73% of examples are medium-tier; answers designed to avoid SAN ambiguity (no `Ke1`-style)
+- Crashed at step 7535 (labels micro-batch size mismatch bug); resumed from checkpoint-7500
 
 **Key bugs fixed**:
-1. **Token accuracy = 0**: `logit[i]` compared to `label[i]` without causal shift. Fix: shift both by 1, deduplicate with `_acc_logged_at_step`.
+1. **Token accuracy = 0**: `logit[i]` compared to `label[i]` without causal shift. Fix: shift both by 1.
 2. **Loss jump 0.07→0.4 on resume**: `compute_loss` override called `model(**inputs)` directly, bypassing DDP+liger kernel. Fix: use `super().compute_loss(return_outputs=True)`.
-3. **safetensors crash on save**: Qwen ties `embed_tokens.weight` and `lm_head.weight`; safetensors refuses shared tensors. Fix: clone `lm_head.weight` before save, call `tie_weights()` after.
-4. **`--init-proj` loss spike to 5.0**: Removed. Loading proj+LoRA without restoring optimizer state caused instability.
-5. **start.sh resume path dropped**: `$2` (checkpoint path) was not captured. Fixed.
+3. **safetensors crash on save**: Qwen ties `embed_tokens.weight` and `lm_head.weight`. Fix: clone `lm_head.weight` before save, call `tie_weights()` after.
+4. **`IndexError` in encoder_model.py**: `labels[move_mask]` failed when last micro-batch was smaller than per_device_batch_size. Fix: recompute mask as `input_ids[:labels.shape[0]] == move_token_id`.
+5. **VRAM bloat on `--init-from`**: loading full 9GB safetensors to CUDA before filtering. Fix: load to CPU, filter to trainable keys only, move filtered keys to CUDA.
+6. **IterableDataset epoch restart on resume**: Trainer starts epoch from scratch. Fix: `_resume_examples` skip via `itertools.islice` + `max_steps` override in config + `ignore_data_skip=True`.
 
-**Eval accuracy** (fixed 40 samples, 2 per task):
+**Alignment eval results** (checkpoint-7500, 5903 examples, `eval_alignment.py`):
 
-| Step  | Accuracy |
-|-------|----------|
-| 6500  | 90% (36/40) |
-| ~9100 | 85–90% (stable) |
+| Tier | Accuracy |
+|------|----------|
+| Overall | 73.6% (4345/5903) |
+| Medium | 70.3% (3022/4299) |
+| Easy | 82.5% (1323/1604) |
 
-**Failing tasks analysis** (data labels verified correct — all failures are learning difficulty):
-- `attackers_at`: outputs `none` for non-trivial cases — hardest spatial reasoning task, still learning
-- `en_passant` (specific square): off by a file (`e3` vs `c3`) — very rare signal (0.1% of data)
-- `move_number`: off by 1–3 — continuous value, hard to encode precisely in CNN global token
-- `mobility_at`: off by ~2 — pseudo-legal vs legal move count edge cases
-- `sf15_dominant`: wrong term when top-2 SF15 values are close in magnitude
+Medium task breakdown:
 
-**Status**: Active — step ~9100/32079, loss ~0.09, token_acc ~1.0, eval acc ~85–90%
+| Task | Acc |
+|------|-----|
+| doubled_pawns | 99.7% |
+| hanging_pieces | 99.0% |
+| isolated_pawn_at | 96.5% |
+| passed_pawn | 92.3% |
+| capture_on_square | 81.8% |
+| board_inventory | 70.2% |
+| threaten_piece_with | 62.5% |
+| give_check | 47.4% |
+| fork_move | 27.4% |
+| checkmate_in_one | 28.6% |
+
+**ChessQA benchmark** (checkpoint-7500, strip-fen=OFF):
+
+| Category | Accuracy |
+|----------|----------|
+| Overall | 11.9% (415/3500) |
+| structural | 12.6% |
+| semantic | 39.8% |
+| short_tactics | 9.7% |
+| position_judgement | 4.8% |
+| motifs | 1.0% |
+
+**Observations**:
+- Structural tasks (doubled_pawns, hanging_pieces, isolated_pawn, passed_pawn) essentially solved ≥92%
+- fork_move and checkmate_in_one weak (~27%) — require multi-step tactical reasoning
+- move_number weak (20%) — continuous integer hard to encode in 1 global CNN token
+- ChessQA: semantic (39.8%) is the strongest — board reading feeds directly into piece listing tasks
+- Checkpoint-4000 vs 7500: nearly identical overall (73.2% vs 73.6%); model converged early; harder tasks (give_check, checkmate_in_one) still improving at 7500
+
+**Status**: ✅ Complete — checkpoint-7500
 
 ---
 
@@ -262,8 +286,10 @@ Projector LR=1e-3, LoRA LR=5e-6. Added "attend to vision token" system prompt. L
 |---------|-----------|---------|--------|
 | `encoder_pretrain_sf15.jsonl` | `generate_encoder_pretrain_sf15.py` | encoder-phase0 (CLIP training), phase1-alignment (SF15 tasks) | **active** (656M records, 114GB) |
 | `encoder_pretrain_1b.jsonl` | `generate_encoder_data.py` | phase1-alignment (main tasks) | **active** (source) |
-| `alignment_board_description.jsonl` | `generate_alignment_board_description.py` | phase1-alignment train | **active** (4.58M records, 20 tasks) |
-| `alignment_board_description_eval.jsonl` | same script | phase1-alignment eval | **active** (103k records) |
+| `alignment_board_description.jsonl` | `generate_alignment_board_description.py` | phase1-alignment easy run | **active** (4.58M records, 20 tasks) |
+| `alignment_board_description_eval.jsonl` | same script | phase1-alignment easy eval | **active** (103k records) |
+| `alignment_board_description_medium.jsonl` | same script (`--from-end --sf15-fens 50000`) | phase1-alignment medium run | **active** (1.16M records, 30 tasks, 73% medium) |
+| `alignment_board_description_medium_eval.jsonl` | same script | phase1-alignment medium eval | **active** (5903 records) |
 | `encoder_pretrain_sf15_eval.jsonl` | same script (1% split) | encoder-pretrain v2 eval | superseded |
 | `lines_joint_sft.jsonl` | `generate_phase2_data.py` | encoder-phase1-sft | superseded |
 | `grpo_joint_prompts_sf15.jsonl` | `generate_grpo_joint_prompts.py` | encoder-phase2-grpo | superseded |

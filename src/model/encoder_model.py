@@ -62,7 +62,7 @@ class ChessLMWithEncoder(nn.Module):
             embed_layer = self.llm.model.embed_tokens
         else:
             raise ValueError("Could not find input embeddings layer in the LLM.")
-        
+
         # Don't register as a module attribute to avoid duplicate in state_dict
         object.__setattr__(self, "embed_tokens", embed_layer)
 
@@ -204,16 +204,80 @@ class ChessLMWithEncoder(nn.Module):
             l_idx = move_positions[:, 1]
             inputs_embeds = inputs_embeds.index_put((b_idx, l_idx), cnn_embs, accumulate=False)
 
-        # 5. Mask sentinel positions in labels — never predict them
+        # 5. Mask sentinel positions in labels — never predict them.
+        # labels may have a different batch size than input_ids (e.g. last micro-batch),
+        # so recompute the mask from labels[:, 1:] aligned to input_ids[:labels.shape[0]].
         if labels is not None and n_sentinels > 0:
             labels = labels.clone()
-            labels[move_mask] = -100
+            label_move_mask = input_ids[: labels.shape[0]] == self.move_token_id
+            labels[label_move_mask] = -100
 
         # 6. Forward through LLM — sequence length unchanged
         return self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
+            **kwargs,
+        )
+
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        board_tensors_flat: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """Generate tokens with CNN embeddings injected at sentinel positions.
+
+        Builds inputs_embeds with CNN injection, then calls llm.generate with
+        inputs_embeds only (no input_ids). Transformers derives cache_position
+        from the embedding sequence length. Output contains only new tokens.
+        """
+        device = input_ids.device
+        dtype = self.embed_tokens.weight.dtype
+
+        # Build inputs_embeds with CNN injection (same logic as forward)
+        inputs_embeds = self.embed_tokens(input_ids)
+        move_mask = input_ids == self.move_token_id
+        n_sentinels = int(move_mask.sum().item())
+
+        if n_sentinels > 0:
+            H = inputs_embeds.shape[-1]
+            n_boards = n_sentinels // BOARD_TOKENS_PER_POSITION
+
+            if board_tensors_flat is not None and board_tensors_flat.shape[0] > 0:
+                cnn_param = next(iter(self.cnn.parameters()), None)
+                cnn_dtype = cnn_param.dtype if cnn_param is not None else dtype
+                cnn_out = self.cnn(board_tensors_flat.to(device=device, dtype=cnn_dtype))
+                cnn_out = cnn_out.to(dtype=dtype)
+                if cnn_out.shape[0] < n_boards:
+                    pad = torch.zeros(
+                        n_boards - cnn_out.shape[0],
+                        BOARD_TOKENS_PER_POSITION,
+                        H,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    cnn_out = torch.cat([cnn_out, pad], dim=0)
+                cnn_embs = cnn_out[:n_boards].reshape(n_boards * BOARD_TOKENS_PER_POSITION, H)
+                cnn_embs = cnn_embs[:n_sentinels]
+            else:
+                cnn_embs = torch.zeros(n_sentinels, H, dtype=dtype, device=device)
+
+            move_positions = move_mask.nonzero(as_tuple=False)[:n_sentinels]
+            b_idx = move_positions[:, 0]
+            l_idx = move_positions[:, 1]
+            inputs_embeds = inputs_embeds.index_put((b_idx, l_idx), cnn_embs, accumulate=False)
+
+        # Pass only inputs_embeds — do NOT pass input_ids alongside it.
+        # When both are passed, transformers 5.x internally slices input_ids via
+        # _cache_dependant_input_preparation and may produce an empty cache_position
+        # in Qwen3.5's hybrid linear-attention path (_update_linear_attn_mask).
+        # With inputs_embeds only, _get_initial_cache_position derives cache_position
+        # cleanly from the embedding sequence length.
+        return self.llm.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
             **kwargs,
         )
 

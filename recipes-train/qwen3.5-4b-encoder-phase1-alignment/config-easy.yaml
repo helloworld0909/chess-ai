@@ -1,0 +1,78 @@
+# Qwen3.5-4B + ChessEncoder — Phase 1: Alignment (easy dataset)
+#
+# Goal:   Align cnn.proj + cnn.global_proj into LLM embedding space.
+#         CNN trunk from encoder-clip (CLIP-trained, semantically aligned to Qwen).
+#         Flat 65-token sentinel block — no square-label text anchors.
+#
+# Frozen: CNN trunk + LLM base weights
+# Trained: cnn.proj + cnn.global_proj (~14M) + LoRA r=64 (~85M, at 5e-5 LR)
+#
+# Data:   Easy dataset — 20 tasks, 4.58M train examples
+# DDP:    2× RTX 5090  |  effective batch = 128 (8 × 2 GPUs × 8 accum)
+
+model:
+  model_name: "Qwen/Qwen3.5-4B"
+  attn_implementation: "sdpa"
+
+encoder:
+  in_channels: 19
+  hidden_size: 256
+  num_blocks: 10
+  pretrained_weights: "checkpoints/encoder-clip/checkpoint-9000/encoder_weights.pt"
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none
+
+training:
+  train_file: data/processed/alignment_board_description.jsonl
+  eval_file:  data/processed/alignment_board_description_eval.jsonl
+  max_seq_length: 320  # easy dataset (full sequence): p99=287, max=298
+
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 8  # effective batch = 128 (8 × 2 GPUs × 8 accum)
+
+  learning_rate: 5.0e-5        # proj/global_proj LR
+  lora_learning_rate: 5.0e-5  # LoRA LR
+  lr_scheduler_type: cosine
+  warmup_steps: 500
+  num_train_epochs: 1
+  max_steps: 32079  # 4.58M / (128 effective batch) ≈ 35782 → ~32k with 10% warmup buffer
+
+  optim: adamw_torch
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+
+  gradient_checkpointing: false
+  bf16: true
+  dataloader_num_workers: 8
+  ddp_find_unused_parameters: false
+  dispatch_batches: false
+
+  logging_steps: 10
+  eval_strategy: steps
+  eval_steps: 200
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 20
+
+  seed: 42
+
+output_dir: checkpoints/qwen3.5-4b-encoder-phase1-alignment-easy
+
+wandb:
+  enabled: false
+  project: "chess-tutor"
+  name: "qwen3.5-4b-encoder-phase1-alignment-easy"
+  tags: ["encoder", "alignment", "projector", "easy"]

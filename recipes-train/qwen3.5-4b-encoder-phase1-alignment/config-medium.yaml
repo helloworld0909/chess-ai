@@ -1,15 +1,15 @@
-# Qwen3.5-4B + ChessEncoder — Phase 0: Alignment (projector + LoRA)
+# Qwen3.5-4B + ChessEncoder — Phase 1: Alignment (medium dataset)
 #
 # Goal:   Align cnn.proj + cnn.global_proj into LLM embedding space.
 #         CNN trunk from encoder-clip (CLIP-trained, semantically aligned to Qwen).
 #         Flat 65-token sentinel block — no square-label text anchors.
 #
 # Frozen: CNN trunk + LLM base weights
-# Trained: cnn.proj + cnn.global_proj (~14M) + LoRA r=64 (~85M, at 5e-6 LR)
+# Trained: cnn.proj + cnn.global_proj (~14M) + LoRA r=64 (~85M, at 5e-5 LR)
 #
 # Prompt: system prompt + 65 sentinel tokens + question (position randomized 50/50)
-# Data:   LLaVA-style board description — 897k FENs × 14 tasks
-# DDP:    2× RTX 5090  |  effective batch = 256 (4 × 2 GPUs × 32 accum)
+# Data:   Medium dataset — 30 tasks (20 easy + 10 medium), 1.16M train examples
+# DDP:    2× RTX 5090  |  effective batch = 128 (8 × 2 GPUs × 8 accum)
 
 model:
   model_name: "Qwen/Qwen3.5-4B"
@@ -75,5 +75,5 @@ output_dir: checkpoints/qwen3.5-4b-encoder-phase1-alignment-medium
 wandb:
   enabled: false
   project: "chess-tutor"
-  name: "qwen3.5-4b-encoder-phase1-alignment"
-  tags: ["encoder", "alignment", "projector"]
+  name: "qwen3.5-4b-encoder-phase1-alignment-medium"
+  tags: ["encoder", "alignment", "projector", "medium"]
