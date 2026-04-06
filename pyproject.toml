@@ -23,6 +23,7 @@ dependencies = [
     "datasets>=2.18",
     "jmespath>=1.0",
     "flash-linear-attention[training]>=0.4.2",
+    "sglang[all]",
 ]
 
 [project.optional-dependencies]

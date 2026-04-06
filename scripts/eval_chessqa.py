@@ -233,14 +233,17 @@ def infer_batch(
     results = []
     for i, ids in enumerate(out):
         if not valid[i]:
-            results.append("")
+            results.append(("", ""))
             continue
-        decoded = tokenizer.decode(ids, skip_special_tokens=True).strip()
+        full = tokenizer.decode(ids, skip_special_tokens=True).strip()
         if thinking:
-            idx = decoded.rfind("</think>")
-            if idx != -1:
-                decoded = decoded[idx + len("</think>") :].strip()
-        results.append(decoded)
+            idx = full.rfind("</think>")
+            answer = full[idx + len("</think>") :].strip() if idx != -1 else full
+        else:
+            answer = full
+        # full: complete output including think block (saved to JSON)
+        # answer: text after </think> used for matching
+        results.append((full, answer))
     return results
 
 
@@ -337,7 +340,12 @@ def main() -> None:
         default=None,
         help="Save full results to this JSON file (e.g. results/chessqa_phase1.json)",
     )
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size per GPU")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size per GPU (default: 1 with thinking, 32 without)",
+    )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
@@ -349,8 +357,8 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Enable Qwen3 thinking mode (<think> block before answer). "
-        "The think block is stripped before answer matching. "
-        "Automatically raises max-new-tokens to 512 if not explicitly set.",
+        "Full output (including think block) saved to JSON; think block stripped for answer matching. "
+        "Defaults: max-new-tokens=32768, batch-size=1.",
     )
     parser.add_argument(
         "--strip-fen",
@@ -367,9 +375,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Default token budget depends on thinking mode
+    # Defaults depend on thinking mode
     if args.max_new_tokens is None:
-        args.max_new_tokens = 2048 if args.thinking else 512
+        args.max_new_tokens = 32768 if args.thinking else 512
+    if args.batch_size is None:
+        args.batch_size = 4 if args.thinking else 32
 
     # DDP: init process group BEFORE any CUDA ops so NCCL can enumerate GPUs correctly
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -399,6 +409,10 @@ def main() -> None:
         for split_data in ds.values():  # type: ignore[union-attr]
             for row in split_data:
                 examples.append(dict(row))
+
+    import random
+
+    random.shuffle(examples)
 
     if args.max_examples:
         examples = examples[: args.max_examples]
@@ -465,7 +479,7 @@ def main() -> None:
             thinking=args.thinking,
             strip_fen=args.strip_fen,
         )
-        for ex, pred in zip(batch, preds):
+        for ex, (full_output, answer) in zip(batch, preds):
             results.append(
                 {
                     "task_id": ex.get("task_id", ""),
@@ -475,10 +489,10 @@ def main() -> None:
                     "question": ex["question"],
                     "correct_answer": ex["correct_answer"],
                     "answer_type": ex.get("answer_type", "single"),
-                    "predicted": pred,
-                    "predicted_answer": _extract_final_answer(pred),
+                    "predicted": full_output,
+                    "predicted_answer": _extract_final_answer(answer),
                     "exact": match_exact(
-                        pred, ex["correct_answer"], ex.get("answer_type", "single")
+                        answer, ex["correct_answer"], ex.get("answer_type", "single")
                     ),
                 }
             )

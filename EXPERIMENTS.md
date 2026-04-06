@@ -9,11 +9,11 @@ Documents training experiments, architecture decisions, and lessons learned.
 ```
 encoder-phase0 (CLIP alignment, InfoNCE) ✅ complete → checkpoint-9000
         ↓
-qwen3.5-4b-encoder-phase1-alignment (proj+LoRA alignment, 30 tasks) ✅ complete → checkpoint-7500
+qwen3.5-4b-encoder-phase1-alignment (proj+LoRA, 30 tasks) ← ACTIVE (step 7500→9070)
         ↓
-qwen3.5-4b-encoder-phase2-sft         (board-reading Q&A + joint task)  ← NEXT
+qwen3.5-4b-encoder-phase2-grpo (puzzle RL — checkmate-in-one first) ← NEXT
         ↓
-qwen3.5-4b-encoder-phase3-grpo        (RL on coaching quality)
+qwen3.5-4b-encoder-phase3-grpo (coaching quality RL)
 ```
 
 ---
@@ -164,7 +164,168 @@ Medium task breakdown:
 - ChessQA: semantic (39.8%) is the strongest — board reading feeds directly into piece listing tasks
 - Checkpoint-4000 vs 7500: nearly identical overall (73.2% vs 73.6%); model converged early; harder tasks (give_check, checkmate_in_one) still improving at 7500
 
-**Status**: ✅ Complete — checkpoint-7500
+**Status**: ✅ Complete — checkpoint-7500 (resuming to 9070)
+
+---
+
+### Experiment: Zero-Gated Skip-Layer Residuals (❌ abandoned)
+
+**Hypothesis**: Board tokens injected only at layer 0 may suffer "modality washout" in deep
+`<think>` blocks. Re-inject frozen CNN embeddings residually at every transformer layer
+via zero-initialized scalar gates (`tanh(alpha)`, alpha=0 init) to refresh spatial signal.
+
+**Implementation**:
+- `register_forward_hook` on all 32 Qwen3.5-4B decoder layers
+- Per-layer scalar gate: `h[board_pos] += tanh(alpha) * cnn_embs.detach()`
+- Zero-init → model identical to Phase 1 checkpoint at step 0
+- Gates trained jointly with LoRA + proj at same LR (5e-5)
+- Initialized from `phase1-alignment/checkpoint-23000`
+
+**Gate behavior** (observed on medium alignment dataset):
+
+| Step | Mean \|gate\| | Early layers (0–14) | Mid layers (19–26) | Late layers (27–31) |
+|------|--------------|---------------------|--------------------|---------------------|
+| 1000 | 0.0045       | −0.007 to −0.010    | +0.002 to +0.005   | ≈ 0                 |
+| 3000 | 0.0085       | −0.010 to −0.017    | +0.002 to +0.005   | −0.004 to −0.007    |
+
+Pattern: early layers learned to *suppress* board re-injection (negative gates); mid layers
+(19–26) welcome a small positive refresh; layer 31 stayed at exactly zero throughout.
+
+**Why abandoned**:
+- Gates are growing (~0.005–0.017 at step 3000) but remain well below the ~0.01–0.1 range
+  where cross-modal injection literature (LLaMA-Adapter, CogVLM) shows meaningful effect
+- The suppression in early layers suggests the model actively doesn't want board features
+  re-injected there — the original injection at layer 0 via `inputs_embeds` is sufficient
+- Training crashed twice due to disk pressure (each checkpoint 9.7GB × save_total_limit=20)
+- No evidence of loss improvement over plain Phase 1 baseline at equivalent steps
+
+**Conclusion**: Skip-layer residuals add complexity without measurable benefit on the
+alignment task. The modality washout hypothesis may not apply at this scale/task difficulty,
+or the alignment dataset is too easy to reveal the weakness. Revisit if deeper reasoning
+tasks (multi-move tactics CoT) show spatial degradation in `<think>` blocks.
+
+---
+
+### qwen3.5-4b-encoder-phase2-grpo (PLANNED — puzzle RL)
+
+**Goal**: Teach the model to solve chess puzzles using RL. Start with checkmate-in-one
+as the simplest verifiable task — binary reward, unambiguous ground truth.
+
+**Why RL (not SFT) for puzzles**:
+- Puzzles have a single correct answer verifiable by the rules engine (python-chess)
+- SFT would require labelled (position, solution) pairs and risks overfitting to move
+  format; RL just needs the position and a legality + correctness checker
+- Checkmate-in-one is the hardest alignment task (28.6%) and the most tactically pure —
+  it requires actually reading the board, not pattern matching on text
+
+**Why start with checkmate-in-one**:
+- Binary reward: either it's checkmate or it isn't — no ambiguous scoring
+- Short horizon: 1 move, no search required; model just needs to identify the mating move
+- Directly tests board reading: the CNN encoder must have encoded enough to distinguish
+  mating squares from non-mating ones
+- Natural curriculum: checkmate-in-one → checkmate-in-two → fork → pin → skewer
+
+**Base model**: `checkpoints/qwen3.5-4b-encoder-phase1-alignment-medium/checkpoint-9070`
+(phase1 alignment complete — CNN proj + LoRA trained)
+
+**Data**:
+- Source: Lichess puzzle database (`lichess_db_puzzle.csv`) — 3M+ puzzles with themes
+- Filter: `Mate in 1` theme → ~120k positions
+- Format: FEN + 65 sentinel board tokens; model outputs a single UCI move (e.g. `e2e4`)
+
+**Reward design**:
+- R_format (0.1): output matches UCI move pattern `[a-h][1-8][a-h][1-8][qrbn]?`
+- R_legal (0.4): move is legal in the position
+- R_mate (0.5): move results in checkmate (verified by python-chess)
+- No partial credit for "almost checkmate" — binary R_mate keeps reward signal clean
+
+**Generation setup**:
+- Thinking enabled: `<think>` block encouraged — model reasons about candidates then outputs move
+- G=8 completions per prompt (GRPO group size)
+- `max_new_tokens=512` — sufficient for think block + 1 move
+- `beta=0.05` — KL penalty to prevent mode collapse (lesson from grpo-phase1)
+
+**Curriculum plan** (each stage trains until reward plateaus):
+1. Checkmate-in-one (~120k positions) — binary R_mate
+2. Checkmate-in-two — extend to 2-move sequences, R_mate on final position
+3. Tactical puzzles (fork, pin, skewer) — R_material gain after N moves
+4. Full coaching quality (phase3) — R_annotation + R_tone + R_educ
+
+**Infrastructure**:
+- Currently: plain Transformers GRPO via TRL (slow but works)
+- Target: SGLang custom model for fast rollout generation (see `sglang-serve/PLAN.md`)
+- SGLang needed before scaling to longer puzzles (checkmate-in-two requires more tokens)
+
+**Agentic board tool (key design idea)**:
+
+Instead of forcing the model to simulate board state purely in its `<think>` block,
+expose a tool `get_board(move)` that returns fresh CNN board tokens for the position
+*after* a candidate move is played. The model can call this tool multiple times to
+look ahead before committing to a final answer.
+
+```
+<think>
+Let me check if Qd7 gives checkmate...
+<tool_call>{"name": "get_board", "arguments": {"move": "d1d7"}}</tool_call>
+</think>
+<tool_response>
+[65 × <|vision_pad|> tokens for position after d1d7]
+</tool_response>
+<think>
+The king is on e8, all escape squares covered... yes this is checkmate.
+</think>
+e2e4   ← final answer (or whatever)
+```
+
+**Why this is powerful**:
+- The CNN encoder already knows how to read a board — it's trained on 100M+ positions
+- Rather than asking the LLM to mentally simulate piece movements (hard, error-prone),
+  the model can *look* at the resulting position with the same visual perception
+- This is analogous to AlphaZero's tree search, but the "evaluation function" is the
+  CNN encoder, and the "search" is driven by the LLM's language reasoning
+- Multi-turn tool use naturally extends to deeper search:
+  checkmate-in-one (1 tool call) → checkmate-in-two (2 calls) → deeper tactics
+
+**Tool interface**:
+```python
+def get_board(fen: str, move: str) -> str:
+    """Apply move to position, return 65 sentinel tokens as board context.
+    move: UCI format (e.g. 'd1d7', 'e7e8q')
+    Returns: the 65-token sentinel block for the new position, or error if illegal.
+    """
+    board = chess.Board(fen)
+    board.push_uci(move)
+    return BOARD_TOKEN * 65  # SGLang/model replaces these with CNN embeddings
+```
+
+**Training implications**:
+- Requires multi-turn rollout: model generates tool call → env executes → model sees
+  result → model generates next token. Standard GRPO with single-turn rollout won't work.
+- Need agentic GRPO: rollout loop intercepts `<tool_call>` tokens, executes tool,
+  injects `<tool_response>` with new board tokens, continues generation.
+- Reward is still assigned at the end of the full trajectory (final move correctness).
+- This is the main reason SGLang is needed — the rollout loop needs fast multi-turn
+  generation with dynamic injection of new board embeddings mid-sequence.
+
+**Curriculum with tool use**:
+1. Phase 2a — no tool use, checkmate-in-one: model must read initial board only
+2. Phase 2b — tool use enabled, checkmate-in-one: model can verify candidate moves
+3. Phase 2c — tool use, checkmate-in-two: model must look 2 moves ahead
+4. Phase 3 — tool use, full coaching: best move analysis with line exploration
+
+**Key open questions**:
+1. Does the CNN encoder have enough board understanding to guide mate-in-one reasoning,
+   or does the model fall back to text-only reasoning from the FEN?
+   → Diagnostic: run eval_alignment on give_check (47.4%) and checkmate_in_one (28.6%)
+   after phase2 to see if RL improved those tasks.
+2. Should we merge LoRA before GRPO, or keep it as adapter?
+   → Keep as adapter for now; merge only when switching to SGLang serving.
+3. What group size G is optimal given 2× RTX 5090 and ~512 token rollouts?
+   → Estimate: G=8, batch=2 per device → 16 rollouts per step, ~4GB KV cache, fits.
+4. How many tool calls per rollout? Cap at N=3 to bound sequence length and prevent
+   the model from exhaustively searching rather than reasoning.
+
+**Status**: PLANNED — starts after phase1 alignment reaches checkpoint-9070
 
 ---
 
