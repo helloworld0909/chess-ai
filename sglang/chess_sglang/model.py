@@ -43,9 +43,12 @@ from encoder.cnn import ChessEncoder  # noqa: E402
 # ---------------------------------------------------------------------------
 # SGLang imports (resolved at runtime inside sglang-serve venv)
 # ---------------------------------------------------------------------------
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+# Qwen3_5ForCausalLM is the backbone (transformer layers only, returns hidden states).
+# We add our own lm_head + LogitsProcessor, following Qwen3VLForConditionalGeneration.
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import add_prefix
 
@@ -74,19 +77,27 @@ class ChessQwen3ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
 
-        # ---- LLM ----
+        # ---- LLM backbone ----
+        # Qwen3_5ForCausalLM: transformer layers only, returns hidden states.
+        # Qwen3_5Config wraps text_config — extract it (Qwen3_5ForCausalLM expects
+        # Qwen3_5TextConfig which has layers_block_type property).
+        llm_config = getattr(config, "text_config", config)
         self.model = Qwen3_5ForCausalLM(
-            config=config,
+            config=llm_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
 
+        # ---- lm_head + LogitsProcessor ----
+        # Qwen3.5-4B has tie_word_embeddings=True: lm_head = embed_tokens (same object).
+        # This is set after model init — embed_tokens is populated during load_weights.
+        # For now, create a placeholder; we set it properly in load_weights.
+        self.lm_head = None  # set in load_weights after backbone is loaded
+        self.logits_processor = LogitsProcessor(llm_config)
+
         # ---- CNN encoder ----
-        # Qwen3.5 nests hidden_size inside text_config at the top level
-        _hidden_size = getattr(config, "hidden_size", None)
-        if _hidden_size is None:
-            _tc = getattr(config, "text_config", {})
-            _hidden_size = (_tc.get("hidden_size") if isinstance(_tc, dict) else getattr(_tc, "hidden_size", None)) or 2560
+        # hidden_size lives in text_config for Qwen3.5
+        _hidden_size = getattr(llm_config, "hidden_size", None) or 2560
 
         self.cnn = ChessEncoder(
             in_channels=getattr(config, "encoder_in_channels", 19),
@@ -151,8 +162,11 @@ class ChessQwen3ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
-        return general_mm_embed_routine(
+    ):
+        # general_mm_embed_routine splices CNN embeddings at sentinel positions,
+        # then calls self.model(input_ids=None, input_embeds=...) → hidden states.
+        # Qwen3_5ForCausalLM.forward accepts input_embeds (no 's') — compatible.
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.model,
@@ -161,6 +175,8 @@ class ChessQwen3ForCausalLM(nn.Module):
             positions=positions,
             **kwargs,
         )
+        # Apply lm_head + logits processor (following Qwen3VLForConditionalGeneration)
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -170,18 +186,27 @@ class ChessQwen3ForCausalLM(nn.Module):
         """Load LLM weights via Qwen3_5ForCausalLM, then load CNN from
         encoder_weights.pt in the same model directory."""
 
-        # Separate CNN keys from LLM keys
+        # Separate CNN keys from LLM keys.
+        # Our merged safetensors have keys like model.layers.N.* and model.embed_tokens.*
+        # Qwen3_5ForCausalLM.load_weights expects keys WITHOUT the leading "model." prefix
+        # (its params_dict has embed_tokens.*, layers.*, norm.*).
+        # SGLang's own Qwen3VLForConditionalGeneration strips model.language_model. → model.
+        # We strip model. entirely since our backbone is registered at prefix "model".
         llm_weights = []
-        model_path_hint: Optional[str] = None
 
         for name, param in weights:
             if name.startswith("cnn."):
-                # CNN weights in safetensors — skip, loaded from .pt below
                 continue
+            # Strip leading "model." so backbone load_weights finds keys correctly
+            if name.startswith("model."):
+                name = name[len("model."):]
             llm_weights.append((name, param))
 
-        # Load LLM weights
+        # Load backbone weights (embed_tokens, transformer layers, norm)
         loaded = self.model.load_weights(iter(llm_weights))
+
+        # Qwen3.5-4B: tie_word_embeddings=True → lm_head IS embed_tokens (same object)
+        self.lm_head = self.model.embed_tokens
 
         # Load CNN weights from encoder_weights.pt
         self._load_cnn_weights()
@@ -190,10 +215,7 @@ class ChessQwen3ForCausalLM(nn.Module):
 
     def _load_cnn_weights(self):
         """Load CNN weights from encoder_weights.pt next to model.safetensors."""
-        from sglang.srt.utils import get_model_path_from_args
-
-        # Try to find encoder_weights.pt via server_args model path
-        # SGLang sets the model path in the environment during loading
+        # Try to find encoder_weights.pt via SGLANG_MODEL_PATH env var set in serve.sh
         model_dir = os.environ.get("SGLANG_MODEL_PATH", "")
         if not model_dir:
             # Fallback: try to infer from module location (won't work in all cases)

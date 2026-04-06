@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHESS_AI_DIR="$(dirname "$SCRIPT_DIR")"
 
 MODEL_PATH="${1:-/tmp/chess-merged}"
+shift 2>/dev/null || true  # consume $1 so $@ only has extra flags
 
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "ERROR: Model directory not found: $MODEL_PATH"
@@ -55,5 +56,6 @@ SGLANG_MODEL_PATH="$MODEL_PATH" \
     --tp 1 \
     --mem-fraction-static 0.55 \
     --tool-call-parser qwen25 \
+    --attention-backend triton \
     --trust-remote-code \
     "$@"
