@@ -146,7 +146,7 @@ Medium task breakdown:
 | fork_move | 27.4% |
 | checkmate_in_one | 28.6% |
 
-**ChessQA benchmark — SGLang eval experiments** (checkpoint-890, Apr 2026):
+**ChessQA benchmark — SGLang eval experiments** (checkpoint-9070, Apr 2026):
 
 See `scripts/eval_chessqa_sglang.py` for full implementation. Server: SGLang DP=2 (2× RTX 5090), port 8300. Official CSSLab eval logic matched (full piece names in context, UCI legal moves, last `FINAL ANSWER:` extraction, simple lower/strip comparison).
 
@@ -194,16 +194,18 @@ See `scripts/eval_chessqa_sglang.py` for full implementation. Server: SGLang DP=
 - `match_exact()`: simple `.lower().strip()` for single, set comparison for multi — matches official
 - Removed `_normalize_lists()` custom logic that was too strict on structural answers
 
-**ChessQA benchmark** (checkpoint-7500, strip-fen=OFF):
+**ChessQA benchmark** (checkpoint-7500, strip-fen=OFF, max_new_tokens=512, thinking=False):
+
+Results saved in `results/chessqa_checkpoint7500_medium.json`.
 
 | Category | Accuracy |
 |----------|----------|
 | Overall | 11.9% (415/3500) |
-| structural | 12.6% |
-| semantic | 39.8% |
-| short_tactics | 9.7% |
-| position_judgement | 4.8% |
-| motifs | 1.0% |
+| structural | 12.6% (139/1100) |
+| semantic | 39.8% (159/400) |
+| short_tactics | 9.7% (87/900) |
+| position_judgement | 4.8% (24/500) |
+| motifs | 1.0% (6/600) |
 
 **Observations**:
 - Structural tasks (doubled_pawns, hanging_pieces, isolated_pawn, passed_pawn) essentially solved ≥92%
