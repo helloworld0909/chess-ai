@@ -15,17 +15,17 @@ Request format (via openai client extra_body):
         {"format": "board_tensor", "fen": "rnbq..."},   # board 1 (after tool call)
     ]}
 
-The prompt text must already contain the correct number of <|vision_pad|> ×65
-sentinel blocks — one block per entry in image_data.
+The prompt text must contain one <|vision_pad|> placeholder per board entry in
+image_data. The scheduler later expands each placeholder into the 65 internal
+slots needed for the CNN output.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import List, Union
 
-import numpy as np
 import torch
 
 # Resolve chess-ai/src
@@ -42,7 +42,6 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     MultimodalInputFormat,
 )
 from sglang.srt.multimodal.processors.base_processor import (  # noqa: E402
-    BaseMultiModalProcessorOutput,
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
@@ -63,15 +62,18 @@ class ChessBoardProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        tokenizer = getattr(_processor, "tokenizer", _processor)
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=BOARD_TOKEN_STR,
             image_token_id=BOARD_TOKEN_ID,
-        ).build(_processor)
+        ).build(tokenizer)
 
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes, dict]],
+        audio_data,
         input_text: str,
+        request_obj,
         *args,
         **kwargs,
     ) -> dict:
@@ -83,9 +85,10 @@ class ChessBoardProcessor(BaseMultimodalProcessor):
         Returns a dict with keys "input_ids" and "mm_items" as expected by
         SGLang's tokenizer manager.
         """
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
         if not image_data:
             # No boards — text-only fallback
-            input_ids = self._processor.tokenizer(
+            input_ids = tokenizer(
                 input_text, return_tensors="pt", add_special_tokens=True
             ).input_ids.flatten()
             return {"input_ids": input_ids.tolist(), "mm_items": []}
@@ -94,17 +97,15 @@ class ChessBoardProcessor(BaseMultimodalProcessor):
 
         for board_dict in image_data:
             if not isinstance(board_dict, dict):
-                raise ValueError(
-                    f"ChessBoardProcessor expects dicts with 'fen' key, got {type(board_dict)}"
-                )
+                continue
 
             fmt = board_dict.get("format", "board_tensor")
             if fmt not in ("board_tensor", "precomputed_embedding"):
-                raise ValueError(f"Unknown board format: {fmt!r}")
+                continue
 
             fen = board_dict.get("fen")
             if fen is None:
-                raise ValueError("Board dict must contain 'fen' key")
+                continue
 
             try:
                 board = chess.Board(fen)
@@ -122,12 +123,41 @@ class ChessBoardProcessor(BaseMultimodalProcessor):
             item.set_pad_value()
             mm_items.append(item)
 
-        # Tokenize the prompt — it already has the right number of sentinel blocks
-        input_ids = self._processor.tokenizer(
+        if not mm_items:
+            input_ids = tokenizer(
+                input_text, return_tensors="pt", add_special_tokens=True
+            ).input_ids.flatten()
+            return {"input_ids": input_ids.tolist(), "mm_items": []}
+
+        # Tokenize the prompt. Each board should correspond to one placeholder
+        # token; the scheduler later expands that single token to 65 pad slots.
+        input_ids = tokenizer(
             input_text, return_tensors="pt", add_special_tokens=True
         ).input_ids.flatten()
+
+        offsets = self.get_mm_items_offset(input_ids, BOARD_TOKEN_ID)
+        if len(offsets) != len(mm_items):
+            raise ValueError(
+                "Board placeholder count does not match image_data count: "
+                f"{len(offsets)} placeholders vs {len(mm_items)} boards"
+            )
+
+        for item, (start, end) in zip(mm_items, offsets):
+            if end - start + 1 != 1:
+                raise ValueError(
+                    "Each board must occupy exactly one "
+                    f"{BOARD_TOKEN_STR} placeholder token; "
+                    f"got span length {end - start + 1}"
+                )
+            item.offsets = [(start, end + 1)]
+
+        expanded_input_len = len(input_ids) + len(mm_items) * (BOARD_TOKENS_PER_POSITION - 1)
+        mrope_positions = torch.arange(expanded_input_len, dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+        mrope_position_delta = torch.zeros((1, 1), dtype=torch.int64)
 
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": mrope_position_delta,
         }

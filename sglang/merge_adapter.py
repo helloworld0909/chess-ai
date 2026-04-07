@@ -66,7 +66,7 @@ def build_config_json(base_model: str, checkpoint_dir: Path) -> dict:
     # Do NOT remove text_config or flatten it.
     # Chess-specific
     d["board_token_id"] = 248055        # BOARD_TOKEN_ID = <|vision_pad|>
-    d["board_tokens_per_position"] = 65
+    d["board_tokens_per_position"] = 1
     d["encoder_in_channels"] = 19
     d["encoder_hidden_size"] = 256      # actual running config (h=256 blocks=10)
     d["encoder_num_blocks"] = 10

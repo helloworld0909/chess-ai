@@ -53,6 +53,8 @@ from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import add_prefix
 
 BOARD_TOKEN_ID = 248055  # <|vision_pad|>, never appears in chess text
+BOARD_TOKENS_PER_POSITION = 65
+DEBUG_MM = os.environ.get("CHESS_DEBUG_MM", "0") == "1"
 
 
 class ChessQwen3ForCausalLM(nn.Module):
@@ -115,6 +117,55 @@ class ChessQwen3ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
 
+    def pad_input_ids(self, input_ids, image_inputs):
+        """Expand one board placeholder token into 65 hashed pad slots.
+
+        This mirrors the VLM scheduling flow: the tokenizer worker marks one
+        placeholder per board, and the scheduler expands it to the full number
+        of multimodal positions before the forward pass.
+        """
+        input_ids = list(input_ids)
+        shift = 0
+
+        image_inputs.image_pad_len = []
+        if DEBUG_MM:
+            print(
+                f"[ChessDebug] pad_input_ids start len={len(input_ids)} "
+                f"items={len(image_inputs.mm_items)}"
+                ,
+                flush=True,
+            )
+        for item in image_inputs.mm_items:
+            if not item.offsets:
+                if DEBUG_MM:
+                    print("[ChessDebug] mm_item missing offsets; skipping expansion", flush=True)
+                continue
+
+            start, end = item.offsets[0]
+            start += shift
+            end += shift
+            span_len = end - start
+
+            replacement = [item.pad_value] * BOARD_TOKENS_PER_POSITION
+            input_ids = input_ids[:start] + replacement + input_ids[end:]
+            item.offsets = [(start, start + BOARD_TOKENS_PER_POSITION)]
+            image_inputs.image_pad_len.append(BOARD_TOKENS_PER_POSITION)
+            if DEBUG_MM:
+                print(
+                    f"[ChessDebug] expanded item start={start} end={end} "
+                    f"span_len={span_len} pad_value={item.pad_value} "
+                    f"new_offset={item.offsets[0]}"
+                    ,
+                    flush=True,
+                )
+
+            shift += BOARD_TOKENS_PER_POSITION - span_len
+
+        if DEBUG_MM:
+            print(f"[ChessDebug] pad_input_ids end len={len(input_ids)}", flush=True)
+
+        return input_ids
+
     # ------------------------------------------------------------------
     # CNN embedding function — called by general_mm_embed_routine
     # ------------------------------------------------------------------
@@ -146,6 +197,23 @@ class ChessQwen3ForCausalLM(nn.Module):
         with torch.no_grad():
             # (N_boards, 65, hidden_size)
             cnn_out = self.cnn(board_batch)
+
+        if DEBUG_MM:
+            board_stats = board_batch.float()
+            out_stats = cnn_out.float()
+            print(
+                f"[ChessDebug] _cnn_embed boards={len(items)} "
+                f"board_batch_shape={tuple(board_batch.shape)} "
+                f"board_min={board_stats.min().item():.4f} "
+                f"board_max={board_stats.max().item():.4f} "
+                f"board_mean={board_stats.mean().item():.4f} "
+                f"cnn_out_shape={tuple(cnn_out.shape)} "
+                f"cnn_out_norm={out_stats.norm().item():.4f} "
+                f"cnn_out_mean={out_stats.mean().item():.4f} "
+                f"cnn_out_std={out_stats.std().item():.4f}"
+                ,
+                flush=True,
+            )
 
         # Flatten to (N_boards * 65, hidden_size) for splice routine
         N = cnn_out.shape[0]
@@ -210,6 +278,8 @@ class ChessQwen3ForCausalLM(nn.Module):
 
         # Load CNN weights from encoder_weights.pt
         self._load_cnn_weights()
+        if DEBUG_MM:
+            print("[ChessDebug] DEBUG_MM enabled in ChessQwen3ForCausalLM", flush=True)
 
         return loaded
 

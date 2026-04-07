@@ -21,7 +21,7 @@ class ChessLMConfig(PretrainedConfig):
     def __init__(
         self,
         board_token_id: int = 248055,
-        board_tokens_per_position: int = 65,
+        board_tokens_per_position: int = 1,
         encoder_in_channels: int = 19,
         encoder_hidden_size: int = 256,
         encoder_num_blocks: int = 10,

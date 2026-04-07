@@ -19,6 +19,8 @@ CHESS_AI_DIR="$(dirname "$SCRIPT_DIR")"
 
 MODEL_PATH="${1:-/tmp/chess-merged}"
 shift 2>/dev/null || true  # consume $1 so $@ only has extra flags
+LOG_PATH="${CHESS_LOG_PATH:-/tmp/chess-sglang.log}"
+DP="${CHESS_DP:-2}"  # data parallelism replicas; 2 = use both GPUs
 
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "ERROR: Model directory not found: $MODEL_PATH"
@@ -43,19 +45,30 @@ export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
 
 echo "Starting ChessQwen3ForCausalLM SGLang server..."
 echo "  Model:  $MODEL_PATH"
-echo "  GPU:    1 (CUDA_VISIBLE_DEVICES=1)"
+echo "  GPUs:   0,1 (dp=$DP)"
 echo "  Port:   8300"
+echo "  Log:    $LOG_PATH"
 
-CUDA_VISIBLE_DEVICES=1 \
+mkdir -p "$(dirname "$LOG_PATH")"
+
+CUDA_VISIBLE_DEVICES=0,1 \
+PYTHONUNBUFFERED=1 \
+CHESS_DEBUG_MM="${CHESS_DEBUG_MM:-0}" \
 SGLANG_EXTERNAL_MODEL_PACKAGE=chess_sglang \
+SGLANG_EXTERNAL_MM_MODEL_ARCH=ChessQwen3ForCausalLM \
+SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=chess_sglang \
+SGLANG_DISABLE_CUDNN_CHECK=1 \
 SGLANG_MODEL_PATH="$MODEL_PATH" \
 "$PYTHON" -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
     --host 0.0.0.0 \
     --port 8300 \
+    --skip-server-warmup \
     --tp 1 \
-    --mem-fraction-static 0.55 \
-    --tool-call-parser qwen25 \
+    --dp "$DP" \
+    --mem-fraction-static 0.85 \
+    --max-running-requests 128 \
+    --tool-call-parser qwen \
     --attention-backend triton \
     --trust-remote-code \
-    "$@"
+    "$@" 2>&1 | tee -a "$LOG_PATH"

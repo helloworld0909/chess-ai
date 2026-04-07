@@ -89,11 +89,8 @@ def _strip_fen_preamble(question: str, fen: str, add_context: bool) -> str:
     return question.lstrip()
 
 
-def _build_prompt(question: str, fen: str, format_examples: list[str], strip_fen: bool) -> str:
+def _build_prompt(question: str, fen: str, format_examples: list[str], strip_fen: bool, add_context: bool = False) -> str:
     """Match official CSSLab eval prompt building."""
-    # Official script injects context for all tasks; structural questions have empty
-    # CONTEXT_PLACEHOLDER in the dataset so it's a no-op for them.
-    add_context = not strip_fen
     question = _strip_fen_preamble(question, fen, add_context=add_context)
     if not strip_fen:
         question = f"You are given a chess position in FEN: {fen}.\n{question}"
@@ -151,7 +148,7 @@ def _post_json(base_url: str, path: str, payload: dict, timeout: int = 600) -> d
         return json.loads(resp.read().decode("utf-8"))
 
 
-def infer_one(base_url: str, model_name: str, ex: dict, thinking: bool, strip_fen: bool, max_new_tokens: int, temperature: float = 0.0) -> tuple[str, str, int]:
+def infer_one(base_url: str, model_name: str, ex: dict, thinking: bool, strip_fen: bool, max_new_tokens: int, temperature: float = 0.0, board_tokens: bool = True, add_context: bool = False) -> tuple[str, str, int]:
     """Send one example to SGLang server via /generate, return (full_output, answer).
 
     Uses /generate (not /v1/chat/completions) so image_data passes directly to
@@ -164,8 +161,9 @@ def infer_one(base_url: str, model_name: str, ex: dict, thinking: bool, strip_fe
     except Exception:
         return ("", "", 0)
 
-    user_content = _BOARD_BLOCK + "\n\n" + _build_prompt(
-        ex["question"], fen, ex.get("format_examples") or [], strip_fen
+    board_prefix = _BOARD_BLOCK + "\n\n" if board_tokens else ""
+    user_content = board_prefix + _build_prompt(
+        ex["question"], fen, ex.get("format_examples") or [], strip_fen, add_context
     )
 
     # Build prompt text using Qwen3 chat template manually
@@ -183,7 +181,7 @@ def infer_one(base_url: str, model_name: str, ex: dict, thinking: bool, strip_fe
 
     payload: dict = {
         "text": prompt,
-        "image_data": [{"format": "board_tensor", "fen": fen}],
+        **({"image_data": [{"format": "board_tensor", "fen": fen}]} if board_tokens else {}),
         "sampling_params": {
             "temperature": temperature,
             "max_new_tokens": max_new_tokens,
@@ -222,6 +220,10 @@ def main() -> None:
                         help="Concurrent requests (default: 32 no-thinking, 4 thinking)")
     parser.add_argument("--no-strip-fen", dest="strip_fen", action="store_false")
     parser.set_defaults(strip_fen=True)
+    parser.add_argument("--no-board-tokens", dest="board_tokens", action="store_false")
+    parser.set_defaults(board_tokens=True)
+    parser.add_argument("--add-context", action="store_true", default=False,
+                        help="Inject piece arrangement + UCI legal moves (CONTEXT_PLACEHOLDER)")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--system-prompt", default=None, help="Override system prompt")
     args = parser.parse_args()
@@ -294,7 +296,7 @@ def main() -> None:
             "task_type": ex.get("task_type", ""),
         }
         try:
-            full, answer, completion_tokens = infer_one(args.base_url, args.model, item, args.thinking, args.strip_fen, args.max_new_tokens, args.temperature)
+            full, answer, completion_tokens = infer_one(args.base_url, args.model, item, args.thinking, args.strip_fen, args.max_new_tokens, args.temperature, args.board_tokens, args.add_context)
         except Exception as e:
             _logger.warning("Request failed for FEN %s: %s", fen, e)
             full, answer, completion_tokens = "", "", 0
