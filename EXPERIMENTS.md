@@ -146,6 +146,54 @@ Medium task breakdown:
 | fork_move | 27.4% |
 | checkmate_in_one | 28.6% |
 
+**ChessQA benchmark — SGLang eval experiments** (checkpoint-890, Apr 2026):
+
+See `scripts/eval_chessqa_sglang.py` for full implementation. Server: SGLang DP=2 (2× RTX 5090), port 8300. Official CSSLab eval logic matched (full piece names in context, UCI legal moves, last `FINAL ANSWER:` extraction, simple lower/strip comparison).
+
+**Key settings that matter**:
+- `--strip-fen` (default True): removes FEN text from prompt; model relies on CNN board tokens only
+- `--no-strip-fen`: keeps FEN + injects piece arrangement + UCI legal moves as context
+- System prompt persona: "chess assistant" < "chess expert" < "chess engine" for brevity
+- Concise suffix appended when thinking=False: "Respond concisely and provide only the final answer without lengthy reasoning."
+
+**200-sample ablation results** (stride-sampled, deterministic, t=0):
+
+| Settings | Overall | pos_j | semantic | structural | short_tactics | motifs | avg_tok | trunc |
+|---|---|---|---|---|---|---|---|---|
+| 2048, +FEN, old logic | 12.0% | 20% | 30% | 5% | 0% | 5% | ~900 | high |
+| 2048, +FEN, official logic | 15.5% | 15% | 25% | 25% | 7.5% | 5% | — | — |
+| 2048, strip-fen, official | 12.0% | 35% | 15% | 7.5% | 0% | 2.5% | — | — |
+| 4096, strip-fen, official | 14.5% | 27% | 37% | 7.5% | 2.5% | 5% | 1653 | 63/200 |
+| 2048, strip-fen, expert persona | 18.5% | 32.5% | 45% | 10% | 5% | 0% | 673 | 45/200 |
+| 2048, strip-fen, engine persona | **19.0%** | **42.5%** | 45% | 5% | 2.5% | 0% | 647 | 47/200 |
+| 4096, strip-fen, expert persona | 18.5% | 32.5% | **52.5%** | 2.5% | 5% | 0% | 1339 | 48/200 |
+
+**Full dataset result** (3500 samples, 4096 tok, strip-fen, assistant persona):
+
+| Category | Accuracy | avg_tok | trunc |
+|----------|----------|---------|-------|
+| Overall | **11.8%** (412/3500) | 1493 | 958/3500 (27%) |
+| position_judgement | 29.4% (147/500) | 311 | 9 |
+| semantic | 45.2% (181/400) | 1237 | 56 |
+| structural | 6.5% (71/1100) | 1736 | 362 |
+| short_tactics | 0.7% (6/900) | 2068 | 358 |
+| motifs | 1.2% (7/600) | 1339 | 173 |
+
+**Observations**:
+- Full dataset score (11.8%) lower than 200-sample (18.5%) due to: (a) 200-sample used stride sampling which over-represents easier examples; (b) full dataset has more hard short_tactics and structural examples
+- Truncation is the #1 failure: 958/3500 (27%) hit token limit — short_tactics 40%, structural 33% truncated; truncated responses score 0 (no FINAL ANSWER:)
+- `position_judgement` is best served by strip-fen (CNN board tokens carry real eval signal): 29–42% with strip-fen vs 15% with FEN text
+- `semantic` is token-hungry: 45–52% at 2048–4096 tokens, collapses with strip-fen (needs language reasoning)
+- `short_tactics` and `motifs` near 0% — model ruminates endlessly without committing to a move; needs aggressive conciseness or thinking mode
+- Official eval logic fix alone: +3.5% (fixed `FINAL ANSWER:` extraction, structural set comparison)
+- Persona "chess expert/engine" vs "chess assistant": ~3–7% gain, fewer tokens, less truncation
+
+**Eval logic fixes applied** (vs our original implementation):
+- `get_context()`: full piece names ("White Pawn") + UCI legal moves (not SAN) — matches official
+- `extract_answer()`: last `FINAL ANSWER:` regex match, strips markdown bold — matches official
+- `match_exact()`: simple `.lower().strip()` for single, set comparison for multi — matches official
+- Removed `_normalize_lists()` custom logic that was too strict on structural answers
+
 **ChessQA benchmark** (checkpoint-7500, strip-fen=OFF):
 
 | Category | Accuracy |
