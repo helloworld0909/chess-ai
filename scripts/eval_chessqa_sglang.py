@@ -252,6 +252,7 @@ def main() -> None:
     # Load dataset
     _logger.info("Loading wieeii/ChessQA-Benchmark...")
     from datasets import load_dataset
+    from datasets.dataset_dict import DatasetDict
 
     subsets_to_load = [args.subset] if args.subset else sorted(_SUBSETS)
     per_subset: dict[str, list[dict]] = {}
@@ -259,8 +260,12 @@ def main() -> None:
         _logger.info("  Loading config: %s", config_name)
         ds = load_dataset("wieeii/ChessQA-Benchmark", config_name)
         rows = []
-        for split_data in ds.values():
-            for row in split_data:
+        if isinstance(ds, DatasetDict):
+            for split_data in ds.values():
+                for row in split_data:
+                    rows.append(dict(row))
+        else:
+            for row in ds:
                 rows.append(dict(row))
         # Sort by task_id for deterministic ordering regardless of HF cache order
         rows.sort(key=lambda r: r.get("task_id", ""))

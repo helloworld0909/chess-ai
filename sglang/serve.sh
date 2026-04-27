@@ -45,13 +45,13 @@ export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
 
 echo "Starting ChessQwen3ForCausalLM SGLang server..."
 echo "  Model:  $MODEL_PATH"
-echo "  GPUs:   0,1 (dp=$DP)"
+echo "  GPUs:   ${CUDA_VISIBLE_DEVICES:-0,1} (dp=$DP)"
 echo "  Port:   8300"
 echo "  Log:    $LOG_PATH"
 
 mkdir -p "$(dirname "$LOG_PATH")"
 
-CUDA_VISIBLE_DEVICES=0,1 \
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}" \
 PYTHONUNBUFFERED=1 \
 CHESS_DEBUG_MM="${CHESS_DEBUG_MM:-0}" \
 SGLANG_EXTERNAL_MODEL_PACKAGE=chess_sglang \
@@ -66,7 +66,7 @@ SGLANG_MODEL_PATH="$MODEL_PATH" \
     --skip-server-warmup \
     --tp 1 \
     --dp "$DP" \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.90 \
     --max-running-requests 128 \
     --tool-call-parser qwen \
     --attention-backend triton \

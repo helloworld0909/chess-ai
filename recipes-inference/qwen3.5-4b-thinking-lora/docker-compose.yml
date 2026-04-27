@@ -1,4 +1,4 @@
-services:
+  services:
   vllm:
     image: vllm/vllm-openai:qwen3_5-cu130
     container_name: chess-ai-vllm-4b-lora

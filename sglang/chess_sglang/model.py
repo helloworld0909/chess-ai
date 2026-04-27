@@ -38,6 +38,9 @@ _CHESS_AI_SRC = Path(__file__).parent.parent.parent / "src"
 if str(_CHESS_AI_SRC) not in sys.path:
     sys.path.insert(0, str(_CHESS_AI_SRC))
 
+import chess as _chess  # noqa: E402
+
+from encoder.board_tensor import board_to_tensor  # noqa: E402
 from encoder.cnn import ChessEncoder  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -171,28 +174,32 @@ class ChessQwen3ForCausalLM(nn.Module):
     # ------------------------------------------------------------------
 
     def _cnn_embed(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        """Run CNN on raw board tensors from the processor.
+        """Run CNN on board positions from the processor.
 
         Args:
-            items: List of MultimodalDataItem with .feature = (19, 8, 8) tensor
-                   (one item per board position in the batch).
+            items: List of MultimodalDataItem with .feature = FEN string.
+                   The tensor is built here on GPU to avoid SGLang's shm IPC path.
 
         Returns:
             (N_boards * 65, hidden_size) embedding tensor on the model's device.
         """
+        device = next(self.cnn.parameters()).device
+        dtype = next(self.cnn.parameters()).dtype
         tensors = []
         for item in items:
             feat = item.feature
-            if isinstance(feat, torch.Tensor):
-                tensors.append(feat)
+            if isinstance(feat, (str, bytes)):
+                # FEN stored as bytes (or str) — build tensor on GPU directly
+                fen_str = feat.decode() if isinstance(feat, bytes) else feat
+                board = _chess.Board(fen_str)
+                tensors.append(board_to_tensor(board).to(device=device, dtype=dtype))
+            elif isinstance(feat, torch.Tensor):
+                tensors.append(feat.to(device=device, dtype=dtype))
             else:
-                tensors.append(torch.tensor(feat))
+                tensors.append(torch.tensor(feat, device=device, dtype=dtype))
 
-        # Stack: (N_boards, 19, 8, 8)
+        # Stack: (N_boards, 19, 8, 8) — already on correct device/dtype
         board_batch = torch.stack(tensors, dim=0)
-        device = next(self.cnn.parameters()).device
-        dtype = next(self.cnn.parameters()).dtype
-        board_batch = board_batch.to(device=device, dtype=dtype)
 
         with torch.no_grad():
             # (N_boards, 65, hidden_size)

@@ -226,6 +226,15 @@ def main():
     print(f"  LoRA pairs: {len(lora_a)}")
 
     # ---- 6. Merge: base + LoRA delta ----
+    # Scaling: PEFT applies (lora_alpha / r) * lora_B @ lora_A when the adapter
+    # is NOT already merged. Our checkpoints save raw lora_A/lora_B weights
+    # (ChessLMWithEncoder saves state_dict directly, not via peft save_pretrained),
+    # so we must apply the scaling here. r=64, alpha=128 → scale=2.0.
+    lora_r = 64
+    lora_alpha = 128
+    lora_scale = lora_alpha / lora_r
+    print(f"  LoRA scale: alpha={lora_alpha} / r={lora_r} = {lora_scale}")
+
     merged: dict[str, torch.Tensor] = dict(base_weights)
     n_merged = 0
     for name in list(lora_a.keys()):
@@ -237,7 +246,7 @@ def main():
         w_base = merged[name]
         w_a = lora_a[name]  # (r, in)
         w_b = lora_b[name]  # (out, r)
-        delta = w_b @ w_a   # (out, in)
+        delta = lora_scale * (w_b @ w_a)  # (out, in)
         merged[name] = w_base + delta.to(w_base.dtype)
         n_merged += 1
 

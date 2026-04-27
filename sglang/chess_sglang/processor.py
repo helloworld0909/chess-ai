@@ -34,7 +34,6 @@ if str(_CHESS_AI_SRC) not in sys.path:
     sys.path.insert(0, str(_CHESS_AI_SRC))
 
 import chess  # noqa: E402
-from encoder.board_tensor import board_to_tensor  # noqa: E402
 
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     Modality,
@@ -108,17 +107,17 @@ class ChessBoardProcessor(BaseMultimodalProcessor):
                 continue
 
             try:
-                board = chess.Board(fen)
+                chess.Board(fen)  # validate FEN
             except Exception as e:
                 raise ValueError(f"Invalid FEN {fen!r}: {e}")
 
-            # Build raw board tensor on CPU — CNN runs on GPU inside the model
-            tensor = board_to_tensor(board)  # (19, 8, 8) float32
-
+            # Store FEN as bytes — the model builds the board tensor on GPU.
+            # Avoids SGLang's ShmPointerMMData IPC path (only triggered for CPU tensors).
+            # Bytes are hashable by SGLang's data_hash (sha256 requires bytes-like).
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
-                format=MultimodalInputFormat.NORMAL,  # feature path, not precomputed
-                feature=tensor,                        # (19, 8, 8), passed to _cnn_embed
+                format=MultimodalInputFormat.NORMAL,
+                feature=fen.encode(),  # bytes — no tensor, no shm wrapping
             )
             item.set_pad_value()
             mm_items.append(item)
