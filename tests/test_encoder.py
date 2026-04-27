@@ -31,7 +31,7 @@ def _load_module(path: str, name: str):
 
 
 _sft = _load_module(
-    os.path.join(_REPO, "recipes-train", "qwen3.5-4b-encoder-phase2-grpo", "train.py"),
+    os.path.join(_REPO, "recipes-train", "deprecated", "qwen3.5-4b-encoder-phase2-grpo", "train.py"),
     "encoder_sft_train",
 )
 _inject_move_tokens = _sft._inject_move_tokens
@@ -381,7 +381,7 @@ def _make_feature(tokenizer, text: str, fen: str, move_san: str, line_sans: list
     return feat
 
 
-_SENTINEL_BLOCK = " ".join([MOVE_TOKEN] * BOARD_TOKENS_PER_POSITION)  # 64 sentinels per position
+_SENTINEL_BLOCK = MOVE_TOKEN  # 1 sentinel per position; collator expands to BOARD_TOKENS_PER_POSITION
 
 
 def test_collator_single_move(mock_tokenizer, move_token_id):

@@ -178,13 +178,13 @@ def main() -> None:
 
     from transformers import AutoTokenizer
 
-    from src.encoder import BOARD_TOKEN, BOARD_TOKENS_PER_POSITION
+    from src.encoder import BOARD_TOKEN
 
     log.info("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B", trust_remote_code=True)
 
     sentinel = BOARD_TOKEN
-    n_sentinels = BOARD_TOKENS_PER_POSITION
+    n_sentinels = 1
 
     input_dir = Path(args.input_dir)
     txt_files = sorted(input_dir.glob("*.txt"))

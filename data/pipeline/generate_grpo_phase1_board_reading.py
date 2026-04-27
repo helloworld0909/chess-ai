@@ -46,10 +46,8 @@ Rules:
 """
 
 _BOARD_TOKEN = "<|vision_pad|>"
-_BOARD_TOKENS_PER_POSITION = 64  # one token per square, must match BOARD_TOKENS_PER_POSITION
-# 64 consecutive sentinel tokens represent one board position in the input sequence.
-# The CNN encoder replaces them with 64 per-square embeddings at training time.
-_BOARD_SENTINEL = _BOARD_TOKEN * _BOARD_TOKENS_PER_POSITION
+# Single sentinel token per board position; training scripts expand 1 → BOARD_TOKENS_PER_POSITION.
+_BOARD_SENTINEL = _BOARD_TOKEN
 
 _PIECE_NAMES = {
     chess.PAWN: "pawn",

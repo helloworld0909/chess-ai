@@ -21,10 +21,10 @@ _logger = logging.getLogger(__name__)
 class EncoderDataCollator:
     """Collates token IDs and computes board tensors for every board position.
 
-    Each training example contains one board position represented by
-    BOARD_TOKENS_PER_POSITION (65) consecutive <|vision_pad|> sentinel tokens
-    in the input. The collator builds one (19, 8, 8) board tensor per board
-    position; the CNN forward pass expands each to 65 tokens (64 per-square + 1 global).
+    Each training example contains one board position represented by exactly one
+    <|vision_pad|> sentinel token in the input. This collator expands each sentinel
+    1 → BOARD_TOKENS_PER_POSITION (65) consecutive sentinels before padding, so the
+    model's forward pass receives the full 65-token block it expects per board position.
 
     The collator produces:
       batch["board_tensors_flat"]: (N_boards, 19, 8, 8) — one tensor per board
@@ -60,8 +60,29 @@ class EncoderDataCollator:
                 line_sans_lists.append([])
             # Pop labels; tokenizer.pad() doesn't handle them correctly
             lbl = feat.pop("labels", None)
-            if lbl is not None:
-                labels_list.append(list(lbl))
+
+            # Expand each single sentinel token to BOARD_TOKENS_PER_POSITION tokens.
+            # Data and prompts use 1 <|vision_pad|> per board position; the model
+            # expects 65 consecutive sentinels (64 per-square + 1 global).
+            from src.encoder import BOARD_TOKENS_PER_POSITION
+
+            ids = feat["input_ids"]
+            expanded_ids: List[int] = []
+            expanded_lbl: List[int] = [] if lbl is not None else None  # type: ignore[assignment]
+            for i, tok in enumerate(ids):
+                if tok == self._board_token_id:
+                    expanded_ids.extend([self._board_token_id] * BOARD_TOKENS_PER_POSITION)
+                    if expanded_lbl is not None:
+                        expanded_lbl.extend([-100] * BOARD_TOKENS_PER_POSITION)
+                else:
+                    expanded_ids.append(tok)
+                    if expanded_lbl is not None:
+                        expanded_lbl.append(lbl[i])  # type: ignore[index]
+            feat["input_ids"] = expanded_ids
+            feat["attention_mask"] = [1] * len(expanded_ids)
+
+            if expanded_lbl is not None:
+                labels_list.append(expanded_lbl)
 
         # Pad input_ids + attention_mask only
         batch = self.tokenizer.pad(

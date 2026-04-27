@@ -127,6 +127,16 @@ class ChessLMWithEncoder(nn.Module):
         if hasattr(self.llm, "gradient_checkpointing_disable"):
             self.llm.gradient_checkpointing_disable()
 
+    def add_model_tags(self, tags):
+        """Proxy to inner LLM for TRL GRPOTrainer compatibility."""
+        if hasattr(self.llm, "add_model_tags"):
+            self.llm.add_model_tags(tags)
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        """Proxy to inner LLM for TRL compatibility."""
+        return getattr(self.llm, "is_gradient_checkpointing", False)
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -166,6 +176,11 @@ class ChessLMWithEncoder(nn.Module):
             # 3. N_boards = total sentinel tokens / tokens per board
             H = inputs_embeds.shape[-1]
             n_boards = n_sentinels // BOARD_TOKENS_PER_POSITION
+
+            # Allow board tensors to be stashed on the model (e.g. by GRPOTrainer)
+            # when they can't be passed as explicit kwargs through TRL's forward call.
+            if board_tensors_flat is None:
+                board_tensors_flat = getattr(self, "_board_tensors_flat", None)
 
             if board_tensors_flat is not None and board_tensors_flat.shape[0] > 0:
                 cnn_dtype = next(iter(self.cnn.parameters()), None)

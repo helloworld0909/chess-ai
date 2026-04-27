@@ -14,22 +14,14 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from src.encoder import BOARD_TOKEN, BOARD_TOKEN_ID, BOARD_TOKENS_PER_POSITION
+from src.encoder import BOARD_TOKEN, BOARD_TOKEN_ID, BOARD_TOKENS_PER_POSITION  # noqa: F401
 from src.encoder.board_tensor import board_to_tensor
 from src.model.encoder_model import ChessLMWithEncoder
 from src.model.lib import load_config
 
 _logger = logging.getLogger(__name__)
 
-_FILES = "abcdefgh"
-_ANCHORED_BOARD_LINES = []
-for _rank in range(0, 8):
-    _cells = []
-    for _file in range(8):
-        _sq = f"{_FILES[_file]}{_rank + 1}"
-        _cells.append(f"{_sq}{BOARD_TOKEN}")
-    _ANCHORED_BOARD_LINES.append(" ".join(_cells))
-_ANCHORED_BOARD = "\n".join(_ANCHORED_BOARD_LINES)
+_BOARD_BLOCK = BOARD_TOKEN
 
 
 def main():
@@ -142,11 +134,19 @@ def main():
             expected = next(m["content"] for m in ex["messages"] if m["role"] == "assistant")
 
             prompt_text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": _ANCHORED_BOARD + "\n\n" + q}],
+                [{"role": "user", "content": _BOARD_BLOCK + "\n\n" + q}],
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            input_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"].to("cuda:0")
+            raw_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"][0].tolist()
+            expanded = []
+            for tok in raw_ids:
+                if tok == model.move_token_id:
+                    expanded.extend([model.move_token_id] * BOARD_TOKENS_PER_POSITION)
+                else:
+                    expanded.append(tok)
+            input_ids = torch.tensor([expanded], device="cuda:0")
+            attn_mask = torch.ones_like(input_ids)
 
             try:
                 board = chess.Board(fen)
@@ -155,13 +155,10 @@ def main():
             board_tensor = board_to_tensor(board).unsqueeze(0).to(torch.bfloat16).to("cuda:0")
 
             with torch.no_grad():
-                cnn_tokens = model.cnn(board_tensor)  # (1, 64, hidden)
-                text_embeds = model.embed_tokens(input_ids)  # (1, L, hidden)
-                sentinel_mask = (input_ids == model.move_token_id)[0]
-                n_sentinels = sentinel_mask.sum().item()
-                text_embeds[0, sentinel_mask] = cnn_tokens[0, :n_sentinels]
-                out = model.llm.generate(
-                    inputs_embeds=text_embeds,
+                out = model.generate(
+                    input_ids=input_ids,
+                    board_tensors_flat=board_tensor,
+                    attention_mask=attn_mask,
                     max_new_tokens=48,
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id,
