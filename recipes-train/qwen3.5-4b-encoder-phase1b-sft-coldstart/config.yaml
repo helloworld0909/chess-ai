@@ -1,0 +1,66 @@
+# Phase 1b: SFT Cold-start on Lichess puzzle traces
+#
+# Goal: Teach the model to (1) read board vision tokens, (2) apply CCT reasoning,
+#       (3) output {"move": "..."} JSON format after </think>.
+#
+# Data: 100k puzzle SFT traces (piece descriptions + tactical explanation + move)
+# Base: checkpoint-9070 (phase1 alignment, board tokens established)
+# Frozen: CNN trunk
+# Trained: cnn.proj + cnn.global_proj + LoRA r=64
+# 2x GPU (DDP)
+
+model:
+  model_name: "Qwen/Qwen3.5-4B"
+  attn_implementation: "sdpa"
+  torch_dtype: bfloat16
+
+encoder:
+  in_channels: 19
+  hidden_size: 256
+  num_blocks: 10
+  pretrained_weights: checkpoints/qwen3.5-4b-encoder-phase1-alignment-medium/checkpoint-9070/encoder_weights.pt
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none
+
+training:
+  train_file: data/processed/board_reading_sft.jsonl
+  max_seq_length: 512  # p99=404, safe margin
+
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 2   # effective batch = 8 × 2 GPUs × 2 = 32
+
+  learning_rate: 5.0e-5         # proj/global_proj LR
+  lora_learning_rate: 5.0e-5    # LoRA LR
+  lr_scheduler_type: cosine
+  warmup_steps: 100
+  num_train_epochs: 1           # 100k examples / 32 effective batch = ~3125 steps
+
+  optim: adamw_torch
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  gradient_checkpointing: true
+  bf16: true
+  dataloader_num_workers: 2
+
+  logging_steps: 10
+  eval_strategy: "no"
+  save_strategy: steps
+  save_steps: 200
+  save_total_limit: 10
+
+  seed: 42
+
+output_dir: checkpoints/qwen3.5-4b-encoder-phase1b-sft-coldstart-100k
