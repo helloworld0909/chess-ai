@@ -1,10 +1,10 @@
-"""Phase 0: MLP Projector + LoRA Alignment
+"""Phase 1: MLP Projector + LoRA + CNN Trunk Alignment
 
-Trains cnn.proj + cnn.global_proj (2-layer MLPs + LayerNorm) + LoRA on LLM jointly.
-CNN trunk is frozen. LLM base weights are frozen; only LoRA adapters train.
-
-Asymmetric LRs: projector at 5e-5, LoRA at 5e-5 (same rate, different param groups).
-The projector establishes alignment; LoRA adapts the LLM's reading jointly.
+Three param groups:
+  - cnn.proj + cnn.global_proj at 5e-4 (random init → high LR, LLaVA-1.5 style)
+  - LoRA adapters at 1e-4 (community consensus for r=64)
+  - CNN trunk at 5e-5 (pretrained at 3e-4, fine-tune at ~6x lower)
+LLM base weights are frozen; only LoRA adapters train on the LLM side.
 
 Board is injected as a flat block of 65 sentinel tokens (64 per-square + 1 global).
 No square-label text anchors — the CNN (CLIP-trained) carries full semantic meaning.
@@ -31,7 +31,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from src.encoder import BOARD_TOKEN, BOARD_TOKEN_ID
+from src.encoder import BOARD_TOKEN, BOARD_TOKEN_ID, VISION_END_TOKEN, VISION_START_TOKEN
 from src.encoder.board_tensor import board_to_tensor
 from src.model.encoder_collator import EncoderDataCollator
 from src.model.encoder_model import ChessLMWithEncoder
@@ -57,15 +57,11 @@ def _resolve_checkpoint(resume_arg: str | bool | None, output_dir: str) -> str |
 
 _logger = logging.getLogger(__name__)
 
-# Single sentinel token representing one board position in the prompt.
-# The EncoderDataCollator expands this 1 token → BOARD_TOKENS_PER_POSITION (65)
+# Single sentinel token representing one board position in the prompt, wrapped in
+# <|vision_start|>...<|vision_end|> — the same single-token delimiters Qwen2-VL uses.
+# The EncoderDataCollator expands the 1 sentinel → BOARD_TOKENS_PER_POSITION (65)
 # consecutive sentinels before padding, matching what the model forward expects.
-_BOARD_BLOCK = BOARD_TOKEN
-
-_SYSTEM_PROMPT = (
-    "You are a chess assistant. The board position is encoded as a sequence of vision tokens. "
-    "Use them to identify pieces and answer questions about the position."
-)
+_BOARD_BLOCK = f"{VISION_START_TOKEN}{BOARD_TOKEN}{VISION_END_TOKEN}"
 
 
 def setup_model(config_path: str) -> tuple:
@@ -142,12 +138,9 @@ def setup_model(config_path: str) -> tuple:
     else:
         _logger.warning("No encoder.pretrained_weights set — encoder is randomly initialised!")
 
-    # Freeze CNN trunk. LoRA adapters + cnn.proj + cnn.global_proj are trainable.
+    # All CNN params trainable: proj/global_proj at high LR, trunk at low LR.
+    # LLM base weights stay frozen; only LoRA adapters train on the LLM side.
     for param in model.cnn.parameters():
-        param.requires_grad_(False)
-    for param in model.cnn.proj.parameters():
-        param.requires_grad_(True)
-    for param in model.cnn.global_proj.parameters():
         param.requires_grad_(True)
 
     model.print_trainable_parameters()
@@ -202,7 +195,7 @@ def main() -> None:
 
         board_before = random.random() < 0.5
 
-        patched_messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        patched_messages = []
         for msg in messages:
             if msg["role"] == "user":
                 q = msg["content"]
@@ -358,15 +351,14 @@ def main() -> None:
                 with open(state_file) as _f:
                     _state = _json_mod.load(_f)
                 _resumed_step = _state.get("global_step", 0)
+                # train_batch_size in trainer_state is per-device; multiply by world_size.
                 _ckpt_batch = _state.get("train_batch_size", 0)
+                _grad_accum = train_cfg.get("gradient_accumulation_steps", 8)
                 if _ckpt_batch:
-                    _grad_accum = train_cfg.get("gradient_accumulation_steps", 8)
-                    _effective = _ckpt_batch * _grad_accum
+                    _effective = _ckpt_batch * world_size * _grad_accum
                 else:
                     _effective = (
-                        train_cfg.get("per_device_train_batch_size", 8)
-                        * world_size
-                        * train_cfg.get("gradient_accumulation_steps", 8)
+                        train_cfg.get("per_device_train_batch_size", 8) * world_size * _grad_accum
                     )
                 train_dataset._resume_examples = _resumed_step * _effective
                 _logger.info(
@@ -415,21 +407,29 @@ def main() -> None:
 
     from transformers import Trainer
 
-    lora_lr = train_cfg.get("lora_learning_rate", 5e-6)
+    lora_lr = train_cfg.get("lora_learning_rate", 1e-4)
+    trunk_lr = train_cfg.get("cnn_trunk_learning_rate", 5e-5)
 
     class EncoderTrainer(Trainer):
         def create_optimizer(self):
-            """Two param groups: proj+global_proj at learning_rate (5e-5), LoRA at lora_lr (5e-5)."""
+            """Three param groups: proj at learning_rate, LoRA at lora_lr, trunk at trunk_lr."""
             proj_params = list(self.model.cnn.proj.parameters()) + list(
                 self.model.cnn.global_proj.parameters()
             )
             proj_ids = {id(p) for p in proj_params}
+            trunk_params = [
+                p for p in self.model.cnn.parameters() if p.requires_grad and id(p) not in proj_ids
+            ]
+            trunk_ids = {id(p) for p in trunk_params}
             lora_params = [
-                p for p in self.model.parameters() if p.requires_grad and id(p) not in proj_ids
+                p
+                for p in self.model.parameters()
+                if p.requires_grad and id(p) not in proj_ids and id(p) not in trunk_ids
             ]
             self.optimizer = torch.optim.AdamW(
                 [
                     {"params": proj_params, "lr": self.args.learning_rate},
+                    {"params": trunk_params, "lr": trunk_lr},
                     {"params": lora_params, "lr": lora_lr},
                 ],
                 betas=(self.args.adam_beta1, self.args.adam_beta2),
@@ -464,6 +464,16 @@ def main() -> None:
             if "loss" in logs and hasattr(self, "_pending_token_acc"):
                 logs = {**logs, "train/token_acc": round(self._pending_token_acc, 4)}
                 del self._pending_token_acc
+            # Log per-group LRs so trunk and LoRA are visible alongside proj.
+            if "loss" in logs and self.optimizer is not None:
+                groups = self.optimizer.param_groups
+                if len(groups) >= 3:
+                    logs = {
+                        **logs,
+                        "lr/proj": groups[0]["lr"],
+                        "lr/trunk": groups[1]["lr"],
+                        "lr/lora": groups[2]["lr"],
+                    }
             # For IterableDataset, Trainer computes epoch from iterator
             # exhaustion count.  Override state.epoch so super().log()
             # picks up step/max_steps as actual training progress.
@@ -542,15 +552,22 @@ def main() -> None:
                     _logger.info("--- %s", task)
                     prev_task = task
 
-                prompt_text = tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user", "content": _BOARD_BLOCK + "\n\n" + q},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
+                _eval_msgs = [
+                    {"role": "user", "content": _BOARD_BLOCK + "\n\n" + q},
+                ]
+                try:
+                    prompt_text = tokenizer.apply_chat_template(
+                        _eval_msgs,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                except TypeError:
+                    prompt_text = tokenizer.apply_chat_template(
+                        _eval_msgs,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
                 raw_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"][0].tolist()
                 from src.encoder import BOARD_TOKENS_PER_POSITION as _BTP
 
@@ -562,6 +579,8 @@ def main() -> None:
                         expanded.append(tok)
                 input_ids = torch.tensor([expanded], device=device)
                 attn_mask = torch.ones_like(input_ids)
+                im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+                stop_ids = [tokenizer.eos_token_id, im_end_id]
                 with torch.no_grad():
                     out = model.generate(
                         input_ids=input_ids,
@@ -570,8 +589,12 @@ def main() -> None:
                         max_new_tokens=120,
                         do_sample=False,
                         pad_token_id=tokenizer.eos_token_id,
+                        eos_token_id=stop_ids,
                     )
-                pred = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+                # generate() uses inputs_embeds internally → returns only new tokens (no input prefix)
+                pred = tokenizer.decode(out[0], skip_special_tokens=False)
+                # Strip any trailing <|im_end|> and whitespace
+                pred = pred.replace("<|im_end|>", "").strip()
                 correct = pred.strip() == expected.strip()
                 n_correct += int(correct)
                 n_total += 1

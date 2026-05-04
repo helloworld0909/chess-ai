@@ -1,18 +1,23 @@
-# Qwen3.5-4B + ChessEncoder — Phase 0: Alignment (projector + LoRA)
+# Qwen3.5-4B-Base + ChessEncoder — Phase 1: Alignment (projector + LoRA + trunk)
 #
 # Goal:   Align cnn.proj + cnn.global_proj into LLM embedding space.
-#         CNN trunk from encoder-clip (CLIP-trained, semantically aligned to Qwen).
+#         CNN trunk from encoder-clip (CLIP-trained at 3e-4, semantically aligned to Qwen).
 #         Flat 65-token sentinel block — no square-label text anchors.
 #
-# Frozen: CNN trunk + LLM base weights
-# Trained: cnn.proj + cnn.global_proj (~14M) + LoRA r=64 (~85M, at 5e-6 LR)
+# Frozen: LLM base weights only
+# Trained: cnn.proj + cnn.global_proj (~14M) at 5e-4 (random init, high LR)
+#          LoRA r=64 (~113M) at 1e-4
+#          CNN trunk (~3M) at 5e-5 (pretrained, low LR — preserve CLIP features)
+#          LoRA covers: full-attention (q/k/v/o_proj), MLP (gate/up/down_proj),
+#          AND DeltaNet recurrent (in_proj_a/b/qkv/z, out_proj) — 32 layers total
 #
+# Base model — projector and LoRA trained from scratch (no instruct tuning).
 # Prompt: system prompt + 65 sentinel tokens + question (position randomized 50/50)
-# Data:   LLaVA-style board description — 897k FENs × 14 tasks
-# DDP:    2× RTX 5090  |  effective batch = 256 (4 × 2 GPUs × 32 accum)
+# Data:   LLaVA-style board description — 5.27M records (easy+medium combined)
+# DDP:    2× RTX 5090  |  effective batch = 128 (8 × 2 GPUs × 8 accum)
 
 model:
-  model_name: "Qwen/Qwen3.5-4B"
+  model_name: "Qwen/Qwen3.5-4B-Base"
   attn_implementation: "sdpa"
 
 encoder:
@@ -33,23 +38,30 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
+    # DeltaNet recurrent projections (24/32 layers are GatedDeltaNet)
+    - in_proj_a
+    - in_proj_b
+    - in_proj_qkv
+    - in_proj_z
+    - out_proj
   bias: none
 
 training:
-  train_file: data/processed/alignment_board_description_medium.jsonl
-  eval_file:  data/processed/alignment_board_description_medium_eval.jsonl
-  max_seq_length: 300  # medium dataset (full sequence): p99=246, max=258
+  train_file: data/processed/alignment_board_description_combined.jsonl
+  eval_file:  data/processed/alignment_board_description_combined_eval.jsonl
+  max_seq_length: 256  # no system prompt: p99=147, max=196 pre-expansion (100k sample); post-expansion ceiling=319 (+64); 60-token headroom for unseen outliers
 
   per_device_train_batch_size: 8
   per_device_eval_batch_size: 8
   gradient_accumulation_steps: 8  # effective batch = 128 (8 × 2 GPUs × 8 accum)
 
-  learning_rate: 5.0e-5        # proj/global_proj LR — pretrained from CLIP, fine-tuning rate
-  lora_learning_rate: 5.0e-5  # LoRA LR — needs strong signal for alignment
+  learning_rate: 5.0e-4           # proj/global_proj LR — random init, LLaVA-1.5 alignment rate
+  lora_learning_rate: 1.0e-4     # LoRA LR — community consensus for r=64 alignment
+  cnn_trunk_learning_rate: 5.0e-5  # CNN trunk LR — pretrained at 3e-4, fine-tune at ~6x lower
   lr_scheduler_type: cosine
   warmup_steps: 200            # extended warmup for stable ramp with lm_head frozen
   num_train_epochs: 1
-  max_steps: 9070  # overrides epochs; Trainer stops at this step regardless — resume continues from last step
+  max_steps: 41149  # 1 epoch over combined easy+medium dataset (5.27M records, effective_batch=128)
 
   optim: adamw_torch  # overridden by create_optimizer (two param groups)
   weight_decay: 0.05
@@ -70,10 +82,10 @@ training:
 
   seed: 42
 
-output_dir: checkpoints/qwen3.5-4b-encoder-phase1-alignment-medium
+output_dir: checkpoints/qwen3.5-4b-base-encoder-phase1-alignment
 
 wandb:
   enabled: false
   project: "chess-tutor"
-  name: "qwen3.5-4b-encoder-phase1-alignment"
-  tags: ["encoder", "alignment", "projector"]
+  name: "qwen3.5-4b-base-encoder-phase1-alignment"
+  tags: ["encoder", "alignment", "projector", "base"]

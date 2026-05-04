@@ -14,14 +14,20 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from src.encoder import BOARD_TOKEN, BOARD_TOKEN_ID, BOARD_TOKENS_PER_POSITION  # noqa: F401
+from src.encoder import (
+    BOARD_TOKEN,
+    BOARD_TOKEN_ID,
+    BOARD_TOKENS_PER_POSITION,
+    VISION_END_TOKEN,
+    VISION_START_TOKEN,
+)  # noqa: F401
 from src.encoder.board_tensor import board_to_tensor
 from src.model.encoder_model import ChessLMWithEncoder
 from src.model.lib import load_config
 
 _logger = logging.getLogger(__name__)
 
-_BOARD_BLOCK = BOARD_TOKEN
+_BOARD_BLOCK = f"{VISION_START_TOKEN}{BOARD_TOKEN}{VISION_END_TOKEN}"
 
 
 def main():

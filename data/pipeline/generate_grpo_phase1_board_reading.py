@@ -46,8 +46,12 @@ Rules:
 """
 
 _BOARD_TOKEN = "<|vision_pad|>"
-# Single sentinel token per board position; training scripts expand 1 → BOARD_TOKENS_PER_POSITION.
-_BOARD_SENTINEL = _BOARD_TOKEN
+_VISION_START = "<|vision_start|>"
+_VISION_END = "<|vision_end|>"
+# Single sentinel token per board position, wrapped in <|vision_start|>...<|vision_end|>
+# (same single-token delimiters as Qwen2-VL). Training scripts expand the 1 sentinel
+# → BOARD_TOKENS_PER_POSITION (65) at collation time.
+_BOARD_SENTINEL = f"{_VISION_START}{_BOARD_TOKEN}{_VISION_END}"
 
 _PIECE_NAMES = {
     chess.PAWN: "pawn",
