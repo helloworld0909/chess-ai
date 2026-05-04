@@ -9,12 +9,25 @@ Documents training experiments, architecture decisions, and lessons learned.
 ```
 encoder-phase0 (CLIP alignment, InfoNCE) ✅ complete → checkpoint-9000
         ↓
-qwen3.5-4b-encoder-phase1-alignment (proj+LoRA, 30 tasks) ← ACTIVE (step 7500→9070)
+qwen3.5-4b-base-encoder-phase1-alignment (proj+LoRA+trunk, base model) ← ACTIVE (step ~2800)
         ↓
-qwen3.5-4b-encoder-phase2-grpo (puzzle RL — checkmate-in-one first) ← NEXT
+qwen3.5-4b-base-coldstart-sft (instruction format + short <think> traces)  ← NEXT
         ↓
-qwen3.5-4b-encoder-phase3-grpo (coaching quality RL)
+qwen3.5-4b-base-encoder-phase2-grpo (puzzle RL — checkmate-in-one)
+        ↓
+qwen3.5-4b-base-encoder-phase3-grpo (coaching quality RL)
 ```
+
+**Why switched from instruct → base model** (May 2026):
+
+Benchmark on 100 mate-in-1 puzzles revealed both models fail catastrophically:
+- `Qwen/Qwen3.5-4B-Base` (no thinking): **3/100 (3%)** — outputs board descriptions, rarely gives a move
+- `Qwen/Qwen3.5-4B` (instruct, no thinking): **5/100 (5%)** — always outputs a move but hallucinates `Qxg7#` regardless of position
+- `Qwen/Qwen3.5-4B` (instruct, thinking=True): **0/100 (0%)** — thinking trace fills all 256 tokens with analysis before ever outputting the move
+
+Root cause for instruct model's RL failure: the thinking traces are 500–2000 tokens long, making the reward signal too sparse and rollout too expensive. The model ruminates endlessly without committing to a move.
+
+**New pipeline**: Base model → encoder alignment → cold-start SFT (short `<think>` CoT) → GRPO. Mirrors DeepSeek-R1's cold-start approach: teach format first, then optimize with RL. Short thinking traces (50–150 tokens) make GRPO tractable.
 
 ---
 
@@ -214,7 +227,41 @@ Results saved in `results/chessqa_checkpoint7500_medium.json`.
 - ChessQA: semantic (39.8%) is the strongest — board reading feeds directly into piece listing tasks
 - Checkpoint-4000 vs 7500: nearly identical overall (73.2% vs 73.6%); model converged early; harder tasks (give_check, checkmate_in_one) still improving at 7500
 
-**Status**: ✅ Complete — checkpoint-7500 (resuming to 9070)
+**Status**: ✅ Complete — checkpoint-7500 (resuming to 9070). Superseded by base model pipeline.
+
+---
+
+### qwen3.5-4b-base-encoder-phase1-alignment (🔄 ACTIVE)
+
+**Goal**: LLaVA-style alignment from `Qwen/Qwen3.5-4B-Base`. Three-group optimizer: `cnn.proj` + `cnn.global_proj` (14M, 5e-4) + CNN trunk (12M, 5e-5) + LoRA r=64 covering attention/MLP/DeltaNet (103M, 1e-4). LLM base weights frozen.
+
+**Why base model**: Instruct model's thinking traces are too long (500–2000 tokens) for efficient RL. Base model trained with short CoT cold-start SFT will have tractable rollouts (~50–150 tokens) for GRPO.
+
+**Key changes vs instruct alignment run**:
+- **Model**: `Qwen/Qwen3.5-4B-Base` (not instruct)
+- **CNN trunk unfrozen**: trained at 5e-5 (pretrained at 3e-4; fine-tune at 6× lower). Needed because the CLIP-trained trunk wasn't perfectly trained and downstream tasks (en-passant, fork, give-check) need trunk features adapted.
+- **DeltaNet LoRA**: added `in_proj_a/b/qkv/z + out_proj` to target_modules — covers all 24/32 GatedDeltaNet layers, not just attention/MLP.
+- **Board block**: `<|vision_start|><|vision_pad|><|vision_end|>` single-token delimiters matching Qwen2-VL convention.
+- **No system prompt**: removed; alignment phase doesn't need it, consistent with LLaVA Stage 1.
+- **Combined dataset**: Easy (4.1M) + Medium (1.16M) → 5.27M records.
+
+**Hyperparameters**:
+- proj LR=5e-4, trunk LR=5e-5, LoRA LR=1e-4; cosine schedule, warmup=200 steps
+- Batch: 8 per device × 2 GPU × 8 grad_accum = 128 effective
+- max_steps=41149 (1 epoch over 5.27M records)
+- Output: `checkpoints/qwen3.5-4b-base-encoder-phase1-alignment`
+
+**Results so far** (converging ~4× faster than frozen-trunk run):
+| Step | train_loss | eval_loss | accuracy |
+|------|-----------|-----------|----------|
+| 200  | ~0.32     | 0.346     | 48.8%    |
+| 1000 | ~0.13     | 0.161     | 66.8%    |
+| 1800 | ~0.10     | 0.121     | 74.6%    |
+| 2800 | ~0.077    | 0.101     | ~76%     |
+
+Previous frozen-trunk run best: eval_loss=0.105 at step 4400, accuracy=78.4% at step ~3200.
+
+**Status**: 🔄 Active — step ~2800/41149
 
 ---
 
@@ -501,6 +548,8 @@ Projector LR=1e-3, LoRA LR=5e-6. Added "attend to vision token" system prompt. L
 | `alignment_board_description_eval.jsonl` | same script | phase1-alignment easy eval | **active** (103k records) |
 | `alignment_board_description_medium.jsonl` | same script (`--from-end --sf15-fens 50000`) | phase1-alignment medium run | **active** (1.16M records, 30 tasks, 73% medium) |
 | `alignment_board_description_medium_eval.jsonl` | same script | phase1-alignment medium eval | **active** (5903 records) |
+| `alignment_board_description_combined.jsonl` | `cat easy + medium \| shuf` | base model phase1-alignment | **active** (5.27M records, shuffled) |
+| `alignment_board_description_combined_eval.jsonl` | same | base model phase1-alignment eval | **active** (21.9k records, shuffled) |
 | `encoder_pretrain_sf15_eval.jsonl` | same script (1% split) | encoder-pretrain v2 eval | superseded |
 | `lines_joint_sft.jsonl` | `generate_phase2_data.py` | encoder-phase1-sft | superseded |
 | `grpo_joint_prompts_sf15.jsonl` | `generate_grpo_joint_prompts.py` | encoder-phase2-grpo | superseded |
