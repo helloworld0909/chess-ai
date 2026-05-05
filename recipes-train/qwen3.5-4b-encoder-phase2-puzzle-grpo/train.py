@@ -42,29 +42,6 @@ from src.encoder.board_tensor import board_to_tensor
 from src.model.encoder_model import ChessLMWithEncoder
 from src.verification.puzzle_rewards import compute_rewards
 
-_PIECE_NAMES = {
-    chess.PAWN: "pawn", chess.KNIGHT: "knight", chess.BISHOP: "bishop",
-    chess.ROOK: "rook", chess.QUEEN: "queen", chess.KING: "king",
-}
-
-
-def _describe_pieces(board: chess.Board) -> str:
-    """List all pieces by color and square — same format as board reading SFT."""
-    white, black = [], []
-    for sq in chess.SQUARES:
-        piece = board.piece_at(sq)
-        if piece is None:
-            continue
-        name = _PIECE_NAMES[piece.piece_type]
-        entry = f"{name} on {chess.SQUARE_NAMES[sq]}"
-        (white if piece.color == chess.WHITE else black).append(entry)
-    lines = []
-    if white:
-        lines.append("White: " + ", ".join(white) + ".")
-    if black:
-        lines.append("Black: " + ", ".join(black) + ".")
-    return "\n".join(lines)
-
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -147,7 +124,12 @@ def _sync_lora_to_sglang(model: ChessLMWithEncoder, url: str, step: int) -> None
 
     # Also copy the config so SGLang can identify the model
     src_model_dir = Path("/tmp/chess-merged")
-    for fname in ("config.json", "tokenizer_config.json", "tokenizer.json", "special_tokens_map.json"):
+    for fname in (
+        "config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+    ):
         src = src_model_dir / fname
         dst = sync_dir / fname
         if src.exists() and not dst.exists():
@@ -168,35 +150,24 @@ def _sync_lora_to_sglang(model: ChessLMWithEncoder, url: str, step: int) -> None
 
 
 PUZZLE_SYSTEM_PROMPT = (
-    "You are a chess assistant. The board position is encoded as a sequence of vision tokens "
-    "wrapped in <board> </board> tags. Use them to identify pieces and answer questions about the position."
+    "You are an expert chess analyst. You will be given a chess position. "
+    "Analyze it carefully and find the best move."
 )
 
 
 def build_messages(fen: str, themes: list[str], color: str) -> list[dict]:
-    """Two-turn prompt: pre-filled piece list, then ask for the move.
-
-    The piece list is computed from FEN so the model starts generation
-    directly at tactical analysis — no board-reading tokens wasted.
-    """
-    piece_list = _describe_pieces(chess.Board(fen))
+    """Single-turn prompt: board position + ask for best move."""
     return [
         {"role": "system", "content": PUZZLE_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
                 f"<board>{BOARD_TOKEN}</board>\n\n"
-                f"It's {color}'s turn. List all pieces on the board with their squares."
-            ),
-        },
-        {"role": "assistant", "content": piece_list},
-        {
-            "role": "user",
-            "content": (
-                f"Find the best move for {color}. "
-                f"Every puzzle has a forcing solution — check for checks, captures, and threats.\n"
-                f"Trust the piece list above. Be concise — think in 2-3 lines, then answer.\n\n"
-                f'Output your answer as a JSON object on the last line. Example: {{"move": "Nf3"}}'
+                f"It's {color}'s turn. Find the best move. "
+                f"Every puzzle has a forcing solution — check for checks, captures, and threats.\n\n"
+                f"First reason about the position inside <think>...</think> tags, "
+                f"then output your answer as a JSON object on the last line. "
+                f'Example: <think>reasoning here</think>{{"move": "Nf3"}}'
             ),
         },
     ]
@@ -246,10 +217,18 @@ class PuzzleDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
-def make_rollout_func(url: str, num_generations: int, max_new_tokens: int, temperature: float, sync_every: int, log_sample_every: int = 50, two_pass: bool = False):
+def make_rollout_func(
+    url: str,
+    num_generations: int,
+    max_new_tokens: int,
+    temperature: float,
+    sync_every: int,
+    log_sample_every: int = 50,
+    two_pass: bool = False,
+):
     """Build the rollout_func closure for GRPOTrainer."""
 
-    from src.verification.puzzle_rewards import compute_rewards, _extract_uci  # noqa: PLC0415
+    from src.verification.puzzle_rewards import _extract_uci, compute_rewards  # noqa: PLC0415
 
     def puzzle_rollout_func(prompts: list[dict], trainer: GRPOTrainer) -> dict:
         step = getattr(trainer.state, "global_step", 0)
@@ -304,7 +283,13 @@ def make_rollout_func(url: str, num_generations: int, max_new_tokens: int, tempe
                 return i, None, fen, solution_uci, prompt_text
 
             if not two_pass:
-                return i, resp if isinstance(resp, dict) else resp[0], fen, solution_uci, prompt_text
+                return (
+                    i,
+                    resp if isinstance(resp, dict) else resp[0],
+                    fen,
+                    solution_uci,
+                    prompt_text,
+                )
 
             # --- Two-pass: force JSON answer after </think> ---
             _r1 = resp if isinstance(resp, dict) else resp[0]
@@ -345,14 +330,19 @@ def make_rollout_func(url: str, num_generations: int, max_new_tokens: int, tempe
 
         # Send all prompts concurrently — SGLang batches them on GPU 1
         from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: PLC0415
+
         from tqdm import tqdm  # noqa: PLC0415
 
         futures_map = {}
         with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
             futures = {pool.submit(_generate_one, (i, m)): i for i, m in enumerate(prompts)}
             results_by_idx: dict[int, Any] = {}
-            for fut in tqdm(as_completed(futures), total=len(futures),
-                            desc=f"[step={step}] rollout", leave=False):
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"[step={step}] rollout",
+                leave=False,
+            ):
                 idx, resp, fen, solution_uci, prompt_text = fut.result()
                 results_by_idx[idx] = (resp, fen, solution_uci, prompt_text)
 
@@ -368,9 +358,11 @@ def make_rollout_func(url: str, num_generations: int, max_new_tokens: int, tempe
 
             # n=1: SGLang returns a single dict (not a list)
             completion = resp if isinstance(resp, dict) else resp[0]
-            raw_ids = tokenizer(
-                prompt_text, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0].tolist()
+            raw_ids = (
+                tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+                .input_ids[0]
+                .tolist()
+            )
             # SGLang's pad_input_ids expands each sentinel into BOARD_TOKENS_PER_POSITION
             # pad slots before the forward pass. Replicate that expansion here so the
             # trainer's forward pass sees the same 65-token sentinel block.
@@ -413,24 +405,35 @@ def make_rollout_func(url: str, num_generations: int, max_new_tokens: int, tempe
                 "[step=%d] rollout=%.1fs | %d completions (%d failed) | "
                 "correct=%d (%.0f%%) wrong=%d no_fmt=%d | "
                 "avg_reward=%.3f avg_tok=%.0f",
-                step, rollout_secs, n_total, n_failed,
-                n_correct, 100 * n_correct / n_total,
-                n_wrong, n_no_format,
-                avg_reward, avg_tokens,
+                step,
+                rollout_secs,
+                n_total,
+                n_failed,
+                n_correct,
+                100 * n_correct / n_total,
+                n_wrong,
+                n_no_format,
+                avg_reward,
+                avg_tokens,
             )
 
             # Write all completions to JSONL (full text)
             with open(_COMPLETIONS_LOG, "a") as _cf:
                 for _i, _txt in enumerate(completions_text):
-                    _cf.write(json.dumps({
-                        "step": step,
-                        "fen": all_fens[_i] if _i < len(all_fens) else "",
-                        "solution": solution_ucis[_i] if _i < len(solution_ucis) else "",
-                        "predicted": predicted_list[_i] if _i < len(predicted_list) else "",
-                        "reward": rewards[_i],
-                        "tokens": token_counts[_i],
-                        "completion": _txt,
-                    }) + "\n")
+                    _cf.write(
+                        json.dumps(
+                            {
+                                "step": step,
+                                "fen": all_fens[_i] if _i < len(all_fens) else "",
+                                "solution": solution_ucis[_i] if _i < len(solution_ucis) else "",
+                                "predicted": predicted_list[_i] if _i < len(predicted_list) else "",
+                                "reward": rewards[_i],
+                                "tokens": token_counts[_i],
+                                "completion": _txt,
+                            }
+                        )
+                        + "\n"
+                    )
 
             # Log best completion to training log (last 500 chars)
             if completions_text:
@@ -438,8 +441,12 @@ def make_rollout_func(url: str, num_generations: int, max_new_tokens: int, tempe
                 best_txt = completions_text[best_idx]
                 log.info(
                     "[step=%d] BEST | solution=%s predicted=%s reward=%.2f tok=%d\n%s",
-                    step, solution_ucis[best_idx], predicted_list[best_idx],
-                    rewards[best_idx], token_counts[best_idx], best_txt[-500:],
+                    step,
+                    solution_ucis[best_idx],
+                    predicted_list[best_idx],
+                    rewards[best_idx],
+                    token_counts[best_idx],
+                    best_txt[-500:],
                 )
 
         # Stash for reward_fn and _compute_loss override
@@ -482,7 +489,9 @@ def make_reward_fn(solution_ucis_ref: list[str]):
         completion_tokens = kwargs.get("completion_tokens", [0] * len(texts))
         log.info(
             "[reward_fn] completions=%d solution_ucis=%d completion_tokens=%d",
-            len(texts), len(solution_ucis), len(completion_tokens),
+            len(texts),
+            len(solution_ucis),
+            len(completion_tokens),
         )
         return compute_rewards(texts, solution_ucis, completion_tokens)
 
@@ -576,8 +585,9 @@ def main() -> None:
     tokenizer.padding_side = "left"
 
     # Base LLM
-    from transformers import AutoModelForCausalLM  # noqa: PLC0415
     from safetensors.torch import load_file as safetensors_load  # noqa: PLC0415
+    from transformers import AutoModelForCausalLM  # noqa: PLC0415
+
     torch_dtype = getattr(torch, model_cfg.get("torch_dtype", "bfloat16"))
     base_llm = AutoModelForCausalLM.from_pretrained(
         model_cfg["model_name"],
@@ -622,10 +632,14 @@ def main() -> None:
     if encoder_weights:
         state = torch.load(encoder_weights, map_location="cuda", weights_only=True)
         # encoder_weights.pt has "cnn.*" prefix — strip it for model.cnn
-        state = {k[len("cnn."):]: v for k, v in state.items() if k.startswith("cnn.")}
+        state = {k[len("cnn.") :]: v for k, v in state.items() if k.startswith("cnn.")}
         missing, unexpected = model.cnn.load_state_dict(state, strict=True)
-        log.info("CNN weights loaded from %s (missing=%d, unexpected=%d)",
-                 encoder_weights, len(missing), len(unexpected))
+        log.info(
+            "CNN weights loaded from %s (missing=%d, unexpected=%d)",
+            encoder_weights,
+            len(missing),
+            len(unexpected),
+        )
     else:
         log.warning("No pretrained CNN weights specified — encoder starts from random init")
 
@@ -700,10 +714,17 @@ def main() -> None:
                 texts.append(c)
         trainer_obj = _trainer_ref[0] if _trainer_ref else None
         solution_ucis = getattr(trainer_obj, "_pending_solution_ucis", None) or [""] * len(texts)
-        completion_tokens = [len(ids) for ids in getattr(trainer_obj, "_pending_completion_ids", None) or []] or [0] * len(texts)
+        completion_tokens = [
+            len(ids) for ids in getattr(trainer_obj, "_pending_completion_ids", None) or []
+        ] or [0] * len(texts)
         fens = getattr(trainer_obj, "_pending_fens", None) or [""] * len(texts)
-        log.info("[reward_fn] completions=%d texts=%d solution_ucis=%d completion_tokens=%d",
-                 len(completions), len(texts), len(solution_ucis), len(completion_tokens))
+        log.info(
+            "[reward_fn] completions=%d texts=%d solution_ucis=%d completion_tokens=%d",
+            len(completions),
+            len(texts),
+            len(solution_ucis),
+            len(completion_tokens),
+        )
         return compute_rewards(texts, solution_ucis, completion_tokens, fens)
 
     trainer = PuzzleGRPOTrainer(

@@ -47,9 +47,11 @@ def _resolve_checkpoint(resume_arg: str | bool | None, output_dir: str) -> str |
     if resume_arg is None:
         return None
     if resume_arg is True:
-        candidates = sorted(glob.glob(os.path.join(output_dir, "checkpoint-*")))
+        candidates = glob.glob(os.path.join(output_dir, "checkpoint-*"))
         if not candidates:
             return None
+        # Sort by step number (int), not lexicographically — "checkpoint-500" > "checkpoint-3500" lexically.
+        candidates.sort(key=lambda p: int(os.path.basename(p).split("-")[-1]))
         return candidates[-1]
     path = str(resume_arg)
     return path if os.path.isdir(path) else None
@@ -494,18 +496,6 @@ def main() -> None:
 
     # Pick 10 fixed examples per task type for eval logging
     _SAMPLES_PER_TASK = 10
-    _MEDIUM_TASKS = {
-        "hanging_pieces",
-        "capture_on_square",
-        "give_check",
-        "threaten_piece_with",
-        "fork_move",
-        "doubled_pawns",
-        "isolated_pawn_at",
-        "passed_pawn",
-        "checkmate_in_one",
-        "board_inventory",
-    }
     _log_samples: list[dict] = []
     task_counts: dict[str, int] = {}
     for ex in raw_eval:
@@ -513,6 +503,7 @@ def main() -> None:
         if task and task_counts.get(task, 0) < _SAMPLES_PER_TASK:
             task_counts[task] = task_counts.get(task, 0) + 1
             _log_samples.append(ex)
+    _log_samples.sort(key=lambda e: e.get("metadata", {}).get("task", ""))
 
     from transformers import TrainerCallback
 

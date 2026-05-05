@@ -217,6 +217,8 @@ def infer_batch(
     # Stack board tensors: (B, 19, 8, 8) — one per example
     boards_batch = torch.stack(board_tensors).to(device)
 
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    stop_ids = list({tokenizer.eos_token_id, im_end_id})
     with torch.no_grad():
         # encoder_model.generate receives input_ids for CNN injection, then calls
         # llm.generate with inputs_embeds only (no input_ids). Transformers therefore
@@ -228,6 +230,7 @@ def infer_batch(
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=stop_ids,
         )
 
     results = []

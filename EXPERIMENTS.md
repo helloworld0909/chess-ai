@@ -9,11 +9,9 @@ Documents training experiments, architecture decisions, and lessons learned.
 ```
 encoder-phase0 (CLIP alignment, InfoNCE) ✅ complete → checkpoint-9000
         ↓
-qwen3.5-4b-base-encoder-phase1-alignment (proj+LoRA+trunk, base model) ← ACTIVE (step ~2800)
+qwen3.5-4b-base-encoder-phase1-alignment (proj+LoRA+trunk, base model) ✅ complete → checkpoint-20000
         ↓
-qwen3.5-4b-base-coldstart-sft (instruction format + short <think> traces)  ← NEXT
-        ↓
-qwen3.5-4b-base-encoder-phase2-grpo (puzzle RL — checkmate-in-one)
+qwen3.5-4b-base-encoder-phase2-puzzle-grpo (puzzle RL — direct, no cold-start SFT) ← ACTIVE
         ↓
 qwen3.5-4b-base-encoder-phase3-grpo (coaching quality RL)
 ```
@@ -27,7 +25,7 @@ Benchmark on 100 mate-in-1 puzzles revealed both models fail catastrophically:
 
 Root cause for instruct model's RL failure: the thinking traces are 500–2000 tokens long, making the reward signal too sparse and rollout too expensive. The model ruminates endlessly without committing to a move.
 
-**New pipeline**: Base model → encoder alignment → cold-start SFT (short `<think>` CoT) → GRPO. Mirrors DeepSeek-R1's cold-start approach: teach format first, then optimize with RL. Short thinking traces (50–150 tokens) make GRPO tractable.
+**Why skipping cold-start SFT**: No high-quality thinking trace data available. Going direct to GRPO from alignment checkpoint — the base model's chat template injects `<think>\n` at generation time (via `enable_thinking=True`), and the prompt explicitly shows the `<think>...</think>{"move": "Nf3"}` format. The RL reward signal (-1.0 format failure, +1.0 correct) will bootstrap the format from scratch.
 
 ---
 
@@ -251,17 +249,61 @@ Results saved in `results/chessqa_checkpoint7500_medium.json`.
 - max_steps=41149 (1 epoch over 5.27M records)
 - Output: `checkpoints/qwen3.5-4b-base-encoder-phase1-alignment`
 
-**Results so far** (converging ~4× faster than frozen-trunk run):
-| Step | train_loss | eval_loss | accuracy |
-|------|-----------|-----------|----------|
-| 200  | ~0.32     | 0.346     | 48.8%    |
-| 1000 | ~0.13     | 0.161     | 66.8%    |
-| 1800 | ~0.10     | 0.121     | 74.6%    |
-| 2800 | ~0.077    | 0.101     | ~76%     |
+**Results** (converging ~4× faster than frozen-trunk run):
+| Step  | train_loss | eval_loss | Notes |
+|-------|-----------|-----------|-------|
+| 200   | ~0.32     | 0.346     | |
+| 1000  | ~0.13     | 0.161     | |
+| 1800  | ~0.10     | 0.121     | |
+| 2800  | ~0.077    | 0.101     | |
+| 16700 | ~0.035    | **0.0508** | best eval_loss |
+| 20000 | ~0.035    | ~0.053    | plateau; stopped here |
 
-Previous frozen-trunk run best: eval_loss=0.105 at step 4400, accuracy=78.4% at step ~3200.
+Eval loss plateaued ~0.050–0.056 from step ~17000 onward. Stopped at step 20000 to move to GRPO.
+Previous frozen-trunk run best for comparison: eval_loss=0.105 at step 4400.
 
-**Status**: 🔄 Active — step ~2800/41149
+**ChessQA eval** (200-sample subset, strip-FEN format, after eos fix):
+- base-16500: **9.0%** (structural 17.9%, semantic 17.4%, short_tactics 6.8%)
+- vs instruct-23k: 6.0% (semantic 46.2%, others ~0% — pure format following, no board reading)
+
+Base model beats instruct on spatial tasks (structural/tactics) despite weaker instruction following.
+
+**Status**: ✅ Complete — checkpoint-20000 extracted to `/tmp/chess-grpo-init/` for GRPO init
+
+---
+
+### qwen3.5-4b-base-encoder-phase2-puzzle-grpo (🔄 ACTIVE)
+
+**Goal**: Pure RL from alignment checkpoint. Teach the base model to (1) adopt `<think>...</think>` format and (2) find correct puzzle moves, using reward signal alone — no cold-start SFT.
+
+**Why no cold-start SFT**: No high-quality thinking trace data. The RL reward bootstraps the format: format failure → −1.0, correct move → +1.0. Prompt explicitly shows the expected format as an example.
+
+**Architecture**:
+- Base: `Qwen/Qwen3.5-4B-Base` + alignment checkpoint-20000 (LoRA merged)
+- CNN encoder frozen (trunk), proj/global_proj trainable
+- LoRA r=64 on LLM (attention + MLP + DeltaNet layers), fresh init
+- `enable_thinking=True` in chat template → `<think>\n` injected at generation start
+- `beta=0.0` (pure REINFORCE, no KL reference model)
+
+**Prompt** (single-turn):
+```
+System: You are an expert chess analyst. You will be given a chess position. Analyze it carefully and find the best move.
+User: <board>...</board>
+
+It's {color}'s turn. Find the best move. Every puzzle has a forcing solution — check for checks, captures, and threats.
+
+First reason about the position inside <think>...</think> tags, then output your answer as a JSON object on the last line. Example: <think>reasoning here</think>{"move": "Nf3"}
+```
+
+**Reward**: gated — format missing → −1.0; format ok + wrong move → 0.0 + length penalty; correct → 1.0 + length penalty
+
+**Hyperparameters**:
+- LR=5e-5, cosine, warmup=0, max_steps=5000
+- num_generations=8, effective batch=8
+- temperature=0.8, max_completion_length=4096
+- Data: `puzzle_grpo/train.jsonl` (8.8M Lichess puzzles, depth-1 solutions)
+
+**Status**: 🔄 Active — starting now
 
 ---
 

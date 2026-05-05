@@ -4,9 +4,9 @@
 # Reward: did the model find the correct Lichess puzzle move?
 
 model:
-  model_name: "Qwen/Qwen3.5-4B"
-  # Merged board reading SFT weights
-  merged_weights: /tmp/chess-merged-board-reading/model.safetensors
+  model_name: "Qwen/Qwen3.5-4B-Base"
+  # Alignment checkpoint-20000 (LoRA merged, re-keyed) — see scripts/extract_alignment_checkpoint.py
+  merged_weights: /tmp/chess-grpo-init/model.safetensors
   attn_implementation: "sdpa"
   torch_dtype: bfloat16
 
@@ -14,7 +14,7 @@ encoder:
   hidden_size: 256
   num_blocks: 10
   in_channels: 19
-  pretrained_weights: /tmp/chess-merged-board-reading/encoder_weights.pt
+  pretrained_weights: /tmp/chess-grpo-init/encoder_weights.pt
 
 lora:
   r: 64
